@@ -1,0 +1,14 @@
+// 前向声明
+namespace asio {
+    class io_context;
+    namespace ip {
+        class tcp;
+        template <typename Protocol, typename Executor> class basic_socket;
+        class tcp {
+        public:
+            class socket;
+            class endpoint;
+            class resolver;
+        };
+    }
+}
