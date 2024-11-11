@@ -79,7 +79,14 @@ std::vector<uint8_t> parseInputString(const std::string &input) {
 
     // 解析每个图像索引的识别数据
     for (size_t i = 0; i < imageIndices.size(); ++i) {
-        std::getline(ss, segment, ';');
+        std::string recognitionGroup;
+
+        // 将完整的三部分识别数据（例如 "黄疸@1+@94.410004;null;null;"）作为一个段读取
+        for (int j = 0; j < 3; ++j) {
+            if (j > 0) recognitionGroup += ";";
+            std::getline(ss, segment, ';');
+            recognitionGroup += segment;
+        }
 
         // 每组数据开头的标识符
         buf.push_back(0x85);
@@ -89,7 +96,7 @@ std::vector<uint8_t> parseInputString(const std::string &input) {
         buf.push_back(static_cast<uint8_t>(imageIndices[i]));
 
         // 解析并插入该图像的识别结果
-        std::vector<uint8_t> recognitionData = parseRecognitionResult(segment);
+        std::vector<uint8_t> recognitionData = parseRecognitionResult(recognitionGroup);
         buf.insert(buf.end(), recognitionData.begin(), recognitionData.end());
 
         // 每组数据的结束标识符
