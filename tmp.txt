@@ -1,154 +1,106 @@
-@startuml
-title Collect模块插件体系类图（支持双向插件）
+以下是按时间顺序罗列的整个问题的演进过程，涵盖了问题描述、分析步骤、尝试的解决方案、调试过程以及最终的解决方案。
 
-' 抽象基类，所有插件都必须实现这些接口
-abstract class Plugin {
-    +virtual bool init() = 0
-    +virtual bool shutdown() = 0
+问题的演进过程
+
+1. 问题描述
+
+最开始的问题是，在应用程序（APP）中动态加载 libolclassify.so 时，发生了 symbol 'HKANN_Scheduler_Done': can't resolve symbol 错误。HKANN_Scheduler_Done 是一个在静态库 mvbcnn_cbir.a 中定义的符号，实际在运行时链接时无法找到。
+
+通过进一步的分析，问题可以归结为静态库和动态库符号解析的顺序与链接顺序问题。具体来说，mvbcnn_cbir.a 中的某些符号没有被直接引用，导致链接器没有拉入包含这些符号的目标文件，最终导致符号未解析。
+
+2. 分析步骤
+
+2.1 初步分析
+
+在最开始，我们回顾了以下几个方面：
+	•	代码正确性：首先检查了是否是代码层面的问题，发现代码中的调用没有错误。
+	•	符号来源：确认 HKANN_Scheduler_Done 符号来自 mvbcnn_cbir.a 中，但由于它没有在 APP 中显式引用，链接器没有拉入相关目标文件。
+
+2.2 符号链接过程
+
+我们进一步分析了静态库和动态库的链接机制：
+	•	静态库：链接静态库时，链接器只会将实际引用的符号从静态库中拉入到最终的共享库或可执行文件中。如果某个符号没有被引用，链接器不会自动将其拉入。
+	•	动态库：动态库 libhkann_nt_9856x_encrypt.so 内部引用了 HKANN_Scheduler_Done，但由于 mvbcnn_cbir.a 中该符号没有被引用，因此链接器无法在 libcbir.so 中找到该符号。
+
+2.3 其他库的影响
+
+同时，我们也考虑了其他库的影响：
+	•	链接顺序问题：分析了 -lhkann_nt_9856x_encrypt 和 -lscheduler_g6 库的链接顺序，确保它们没有影响符号解析。
+	•	符号覆盖问题：如果多个库中有同名符号，动态链接器可能会优先选择其中一个，因此确保没有符号冲突也很重要。
+
+3. 尝试的解决方案
+
+3.1 解决方案1：使用 --whole-archive 强制链接
+
+最初，我们尝试使用 -Wl,--whole-archive 参数强制链接静态库 mvbcnn_cbir.a，以确保所有符号都被拉入。这成功解决了符号解析问题，但它将整个库中的所有符号都引入到了全局符号表中，这可能会引发不必要的符号冲突或性能问题。
+
+3.2 解决方案2：调整链接顺序
+
+我们尝试调整 -lscheduler_g6 和 -lhkann_nt_9856x_encrypt 的链接顺序。无论顺序如何调整，问题依然存在，因为 libhkann_nt_9856x_encrypt.so 的未解析符号依赖会覆盖静态库中的实现，导致符号解析失败。
+
+3.3 解决方案3：使用预加载库
+
+接下来，我们尝试在 APP 中预加载 libscheduler_g6.so 动态库，并使用 RTLD_GLOBAL 标志。这样做的目的是确保 scheduler_g6.so 中的符号进入全局符号表，从而解决符号解析问题。这个方案成功解决了符号解析失败的问题。
+
+4. 调试过程
+
+4.1 使用 nm 工具
+
+我们使用 nm 和 readelf 工具检查了符号表和动态依赖，确认了 HKANN_Scheduler_Done 是否存在于相应的库中：
+
+nm -g mvbcnn_cbir.a | grep HKANN_Scheduler_Done
+nm -D libcbir.so | grep HKANN_Scheduler_Done
+
+通过这些命令确认了 HKANN_Scheduler_Done 确实存在于 mvbcnn_cbir.a 中，但由于符号未被直接引用，链接器没有拉入。
+
+4.2 使用 readelf 查看 DT_NEEDED
+
+我们使用 readelf -d 查看了 libcbir.so 和 libolclassify.so 的 DT_NEEDED 列表，确认了库的依赖关系，确保 libscheduler_g6.so 被正确加载。
+
+4.3 使用 strace 调试
+
+我们还使用了 strace 来追踪动态库加载过程，进一步确认了符号解析顺序和依赖加载的情况。
+
+5. 最终解决方案
+
+5.1 显式引用符号
+
+最终的解决方案是通过显式调用符号，确保链接器将需要的符号从 mvbcnn_cbir.a 中拉入。我们通过在 APP 中添加一个 dummy 函数来显式调用 HKANN_Scheduler_Done：
+
+extern void HKANN_Scheduler_Done(void);  // 声明外部符号
+
+void dummy_HKANN_Scheduler_Done(void) {
+    HKANN_Scheduler_Done();  // 显式调用
 }
 
-' 输入插件接口：主要负责采集数据
-abstract class InputPlugin {
-    +virtual bool init() override
-    +virtual bool read() = 0
-    +virtual bool shutdown() override
-}
+通过显式引用符号，链接器成功拉入相关目标文件，解决了符号未解析的问题。
 
-' 输出插件接口：主要负责将数据输出到目标（日志、文件、网络等）
-abstract class OutputPlugin {
-    +virtual bool init() override
-    +virtual bool write(const DataSet& ds, const ValueList& vl) = 0
-    +virtual bool flush() = 0
-    +virtual bool shutdown() override
-}
+5.2 避免 --whole-archive 引入所有符号
 
-' 双向插件接口：既能采集数据又能输出数据
-abstract class BidirectionalPlugin {
-    +virtual bool init() override
-    +virtual bool read() = 0
-    +virtual bool write(const DataSet& ds, const ValueList& vl) = 0
-    +virtual bool flush() = 0
-    +virtual bool shutdown() override
-}
+通过显式引用符号，避免使用 --whole-archive 强制将所有符号引入全局符号表，从而避免了不必要的符号暴露和可能的冲突。
 
-Plugin <|-- InputPlugin
-Plugin <|-- OutputPlugin
-Plugin <|-- BidirectionalPlugin
-InputPlugin <|-- BidirectionalPlugin
-OutputPlugin <|-- BidirectionalPlugin
+5.3 确保正确的链接顺序
 
-' 数据结构部分
+确保在 libcbir.so 中，libscheduler_g6.so 和 libhkann_nt_9856x_encrypt.so 的依赖关系正确，避免了符号覆盖和链接顺序问题。
 
-class DataSource {
-    -string name
-    -int type
-    -double min
-    -double max
-}
+6. 总结与经验教训
 
-class DataSet {
-    -string type
-    -int ds_num
-    -vector<DataSource> ds
-}
+6.1 理解静态库和动态库的符号解析机制
+	•	静态库：静态库中的符号只有在被显式引用时才会被链接到最终的可执行文件中。未引用的符号会被链接器跳过。
+	•	动态库：动态库中的未解析符号依赖会被加载时解决。如果某个动态库依赖的符号未在全局符号表中找到，就会导致符号解析失败。
 
-class Value {
-    <<union>>
-    +counter_t counter
-    +gauge_t gauge
-    +derive_t derive
-    +absolute_t absolute
-}
+6.2 显式引用符号是解决符号解析问题的最佳方式
 
-class ValueList {
-    -vector<Value> values
-    -int values_len
-    -cdtime_t time
-    -cdtime_t interval
-    -string host
-    -string plugin
-    -string plugin_instance
-    -string type
-    -string type_instance
-    -MetaData* meta
-}
+通过显式引用静态库中的符号，可以确保链接器将这些符号和目标文件拉入，从而解决未解析符号的问题，而不是依赖 --whole-archive 等方法。
 
-class NotificationMeta {
-    -string name
-    -enum meta_type
-    -string value_string
-    -int64_t value_signed
-    -uint64_t value_unsigned
-    -double value_double
-    -bool value_boolean
-    -NotificationMeta* next
-}
+6.3 避免使用 --whole-archive 强制引入所有符号
 
-class Notification {
-    -int severity
-    -cdtime_t time
-    -string message
-    -string host
-    -string plugin
-    -string plugin_instance
-    -string type
-    -string type_instance
-    -NotificationMeta* meta
-}
+尽量避免使用 --whole-archive 参数来强制链接整个静态库。这样会将所有符号暴露到全局符号表中，可能导致符号冲突和性能问题。显式调用需要的符号是更优的解决方案。
 
-DataSet "1" o-- "many" DataSource : 包含
-ValueList "1" o-- "many" Value : 拥有
-Notification "1" o-- "many" NotificationMeta : 包含
+6.4 链接顺序与依赖关系的重要性
 
-' 插件与数据的关联（输入插件产生 ValueList；输出插件消费 ValueList）
-InputPlugin "1" --> "0..*" ValueList : 采集数据生成
-OutputPlugin "1" --> "0..*" ValueList : 输出数据
-BidirectionalPlugin "1" --> "0..*" ValueList : 双向数据处理
+在多库依赖的情况下，确保符号解析的顺序正确非常重要。适当调整链接顺序，确保符号不被覆盖或丢失，可以避免类似的问题。
 
-' 具体插件类定义
+结论
 
-class CPUPlugin {
-    +bool init() override
-    +bool read() override
-    +bool shutdown() override
-}
-InputPlugin <|-- CPUPlugin
-
-class NetPlugin {
-    +bool init() override
-    +bool read() override
-    +bool shutdown() override
-}
-InputPlugin <|-- NetPlugin
-
-class MemPlugin {
-    +bool init() override
-    +bool read() override
-    +bool shutdown() override
-}
-InputPlugin <|-- MemPlugin
-
-class AppPlugin {
-    +bool init() override
-    +bool read() override
-    +bool shutdown() override
-}
-InputPlugin <|-- AppPlugin
-
-class LogOutputPlugin {
-    +bool init() override
-    +bool write(const DataSet& ds, const ValueList& vl) override
-    +bool flush() override
-    +bool shutdown() override
-}
-OutputPlugin <|-- LogOutputPlugin
-
-class CSVOutputPlugin {
-    +bool init() override
-    +bool write(const DataSet& ds, const ValueList& vl) override
-    +bool flush() override
-    +bool shutdown() override
-}
-OutputPlugin <|-- CSVOutputPlugin
-
-@enduml
+最终，通过显式引用静态库中的符号，我们成功解决了 HKANN_Scheduler_Done 符号解析失败的问题。这个问题的核心是静态库符号未显式引用导致的符号未被拉入，显式引用符号是解决这类问题的有效方法。
