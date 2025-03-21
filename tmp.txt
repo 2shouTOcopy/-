@@ -1,115 +1,106 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dlfcn.h>
-#include <libunwind.h>
-#include "hlist.h"
-#include "jhash.h"
+#include <time.h>
 
-#define STACK_DEPTH_MAX 16
+/* 假设 mem_leak.h 中已经声明了以下结构和全局变量：
+   struct mh_entry {
+       struct cds_hlist_node hlist ;
+       void *ptr ;
+       size_t alloc_size ;
+       void *alloc_caller_stack[STACK_DEPTH_MAX] ;
+       int stack_depth ;
+       char *caller_symbol ;
+   } ;
+   extern struct cds_hlist_head mh_table[MH_TABLE_SIZE] ;
+*/
 
-struct mh_entry
+void print_leaks(void)
 {
 {
-    struct cds_hlist_node hlist ;
-    void *ptr ;
-    size_t alloc_size ;
-    // 用于保存完整调用栈的地址
-    void *alloc_caller_stack[STACK_DEPTH_MAX] ;
-    // 保存实际捕获到的调用帧数
-    int stack_depth ;
-    // 存储调用者符号，取第一个捕获到的调用帧
-    char *caller_symbol ;
-}
-} ;
-
-/* 注意：mh_table 和 MH_TABLE_SIZE 在项目中已定义，此处不再重复定义 */
-
-static void
-add_mh(void *ptr, size_t alloc_size, const void *caller)
-{
-{
-    struct cds_hlist_head *head ;
-    struct cds_hlist_node *node ;
-    struct mh_entry *e ;
-    uint32_t hash ;
-    Dl_info info ;
-    unw_cursor_t cursor ;
-    unw_context_t uc ;
-    unw_word_t ip ;
-    int ret = 0 ;
-    int count = 0 ;
-
-    if (! ptr)
+    FILE *fp = fopen("/mnt/leak_log", "a") ;
+    if (!fp)
     {
     {
+        perror("fopen") ;
         return ;
     }
     }
 
-    hash = jhash(&ptr, sizeof(ptr), 0) ;
-    head = &mh_table[hash & (MH_TABLE_SIZE - 1)] ;
+    static int show_cnt = 0 ;
+    show_cnt++ ;
 
-    cds_hlist_for_each_entry(e, node, head, hlist)
+    time_t now = time(NULL) ;
+    struct tm *tm_now = localtime(&now) ;
+    char time_str[64] ;
+    strftime(time_str, sizeof(time_str), "%m-%d %H:%M:%S", tm_now) ;
+
+    unsigned long total_leak = 0 ;
+    unsigned long total_mem = 0 ;
+    unsigned long i ;
+    char stack_str[512] ;
+
+    /* 先计算总泄露内存（此处 total_mem 也用泄露内存作为示例） */
+    for (i = 0 ; i < MH_TABLE_SIZE ; i++)
     {
     {
-        if (ptr == e->ptr)
+        struct cds_hlist_head *head = &mh_table[i] ;
+        struct cds_hlist_node *node ;
+        struct mh_entry *e ;
+        cds_hlist_for_each_entry(e, node, head, hlist)
         {
         {
-            fprintf(stderr, "[warning] add_mh pointer %p is already there\n", ptr) ;
-            // assert(0);  /* already there */
+            total_leak += e->alloc_size ;
+            total_mem += e->alloc_size ;
         }
         }
     }
     }
 
-    e = malloc(sizeof(*e)) ;
-    e->ptr = ptr ;
-    e->alloc_size = alloc_size ;
-    e->stack_depth = 0 ;
+    /* 写入头部信息 */
+    fprintf(fp, "********************show_cnt: %d********************\n", show_cnt) ;
+    fprintf(fp, "record time: [%s]\n", time_str) ;
+    fprintf(fp, "memleak use memory: (%lu) %luM\n\n", total_leak, total_leak / (1024 * 1024)) ;
 
-    /* 捕获完整调用栈 */
-    unw_getcontext(&uc) ;
-    unw_init_local(&cursor, &uc) ;
-
-    // 可选：跳过当前函数（add_mh）的调用帧
-    // unw_step(&cursor) ;
-
-    while (count < STACK_DEPTH_MAX && (ret = unw_step(&cursor)) > 0)
+    /* 写入泄露记录 */
+    for (i = 0 ; i < MH_TABLE_SIZE ; i++)
     {
     {
-        unw_get_reg(&cursor, UNW_REG_IP, &ip) ;
-        e->alloc_caller_stack[count] = (void *) ip ;
-        count++ ;
-    }
-    }
-    e->stack_depth = count ;
-
-    /* 使用第一个捕获到的地址解析符号 */
-    if (count > 0)
-    {
-    {
-        if (dladdr(e->alloc_caller_stack[0], &info) && info.dli_sname)
+        struct cds_hlist_head *head = &mh_table[i] ;
+        struct cds_hlist_node *node ;
+        struct mh_entry *e ;
+        cds_hlist_for_each_entry(e, node, head, hlist)
         {
         {
-            e->caller_symbol = strdup(info.dli_sname) ;
+            int j ;
+            int offset = 0 ;
+            memset(stack_str, 0, sizeof(stack_str)) ;
+            for (j = 0 ; j < e->stack_depth ; j++)
+            {
+            {
+                offset += snprintf(stack_str + offset,
+                    sizeof(stack_str) - offset,
+                    " %p",
+                    e->alloc_caller_stack[j]) ;
+            }
+            }
+            fprintf(fp, "[leak] ptr: %p size: %zu caller:%s <%s>\n",
+            {
+                e->ptr,
+                e->alloc_size,
+                stack_str,
+                e->caller_symbol ? e->caller_symbol : "unknown"
+            }) ;
         }
         }
-        else
-        {
-        {
-            e->caller_symbol = NULL ;
-        }
-        }
-    }
-    }
-    else
-    {
-    {
-        e->caller_symbol = NULL ;
     }
     }
 
-    cds_hlist_add_head(&e->hlist, head) ;
+    /* 写入尾部信息 */
+    fprintf(fp, "\n") ;
+    fprintf(fp, "total mem: %lu (%luM)\n", total_mem, total_mem / (1024 * 1024)) ;
+    fprintf(fp, "********************show end********************\n\n") ;
+
+    fclose(fp) ;
 }
 }
