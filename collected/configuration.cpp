@@ -2,54 +2,49 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include <filesystem> // C++17 读取目录功能
-#include <chrono>
+#include <dirent.h>     // POSIX目录函数(opendir, readdir, closedir)
+#include <sys/stat.h>   // stat用来判断是否是目录
+#include <errno.h>
+#include <cstring>      // strerror
+#include <cstdio>       // printf (仅作演示)
+#include <cstdlib>      // std::stod in c++11/c++14
 
 #include "config_global.h"         // CfGlobalConfig
 #include "config_callbacks.h"      // CfCallbackRegistry, CfComplexCallbackRegistry, CfValueMapper
 #include "oconfig.h"               // OConfigItem
 
-// 全局静态对象，用来模拟原 configfile.c 里的全局变量
+// -----------------------
+// 全局管理对象 (模拟原 configfile.c 的全局)
+// -----------------------
 static CfGlobalConfig g_global_config;                // 全局选项管理
 static CfCallbackRegistry g_callback_registry;        // 简单回调管理
 static CfComplexCallbackRegistry g_complex_registry;  // 复杂回调管理
 static CfValueMapper g_value_mapper;                  // Key -> 回调函数映射
 
 // ----------------------------------------------------------------------
-// 1. 原 configfile.c 中对应的全局选项数组/结构的替代，用 CfGlobalConfig 管理
+// 1. 初始化全局选项 (示例)
 // ----------------------------------------------------------------------
-
-/* 
- * 例如，原先 collectd 代码中：
- *   static cf_global_option_t cf_global_options[] = { ... };
- *   static int cf_global_options_num = ...
- * 这里可以改成初始化 CfGlobalConfig (g_global_config) 中的默认选项。
- */
 static void init_global_options()
 {
-    // 示例：可仿照原 cf_global_options 初始化
+    // 模拟 collectd 中 cf_global_options 的默认值
     g_global_config.setOption("BaseDir", "/var/lib/collectd");
     g_global_config.setOption("PIDFile", "/var/run/collectd.pid");
     g_global_config.setOption("Hostname", "");
     g_global_config.setOption("FQDNLookup", "true");
     g_global_config.setOption("Interval", "10");  // 默认10秒
     g_global_config.setOption("Timeout", "2");
-    // ...根据需要继续
+    // ... 可以继续添加
 }
 
 // ----------------------------------------------------------------------
-// 2. 简单回调与复杂回调的示例性注册
+// 2. 示例回调函数：对应 dispatch_value_plugindir, dispatch_loadplugin, 等
 // ----------------------------------------------------------------------
-
-// 下面模拟 dispatch_value_plugindir / dispatch_loadplugin / dispatch_block_plugin 等
-// 在 CfValueMapper 中注册。
 static int dispatch_value_plugindir(OConfigItem &ci)
 {
-    // 例如处理 PluginDir 的值
     if (!ci.values.empty()) {
         std::string dir = ci.values[0].getString();
         std::cout << "[dispatch_value_plugindir] plugin dir: " << dir << std::endl;
-        // 实际可以将此值写到全局配置
+        // 写入全局配置
         g_global_config.setOption("PluginDir", dir);
     }
     return 0;
@@ -57,11 +52,10 @@ static int dispatch_value_plugindir(OConfigItem &ci)
 
 static int dispatch_loadplugin(OConfigItem &ci)
 {
-    // 例如处理 LoadPlugin 的逻辑
     if (!ci.values.empty()) {
         std::string pluginName = ci.values[0].getString();
         std::cout << "[dispatch_loadplugin] load plugin: " << pluginName << std::endl;
-        // 此处可调用插件管理逻辑
+        // 在此可以调用真正的插件加载逻辑
         // ...
     }
     return 0;
@@ -69,92 +63,71 @@ static int dispatch_loadplugin(OConfigItem &ci)
 
 static int dispatch_block_plugin(OConfigItem &ci)
 {
-    // 例如处理 <Plugin "xx"> ... </Plugin> 块
     std::cout << "[dispatch_block_plugin] plugin block key: " << ci.key << std::endl;
-    // 可以遍历 children 做进一步处理
-    for (auto &child : ci.children) {
+    for (size_t i = 0; i < ci.children.size(); ++i) {
+        OConfigItem *child = ci.children[i].get();
         std::cout << "   child key: " << child->key << std::endl;
         // ...
     }
     return 0;
 }
 
-// 此函数在初始化时，将上述函数映射到 CfValueMapper
+// 将上述回调注册到 CfValueMapper
 static void init_value_mapper()
 {
     g_value_mapper.addMapping("PluginDir", dispatch_value_plugindir);
     g_value_mapper.addMapping("LoadPlugin", dispatch_loadplugin);
     g_value_mapper.addMapping("Plugin", dispatch_block_plugin);
-    // 如果还有其他 key -> 回调函数，可以继续添加
+    // 如还有其它键 -> 回调函数，也可添加
 }
 
 // ----------------------------------------------------------------------
-// 3. 对应原 configfile.c 中的函数接口示例
-//    以下函数为示例性、最小化的伪实现，展示如何利用新的类来完成相同功能
+// 3. 与原 configfile.c 类似的函数接口示例
 // ----------------------------------------------------------------------
 
-/**
- * cf_search:
- * 原先可能是搜索全局 option / 回调等，这里仅示例如何在 CfValueMapper 和 GlobalConfig 中“搜索” 
- */
 static int cf_search(const std::string &key)
 {
-    // 如果 CfValueMapper 里存在这个 key，就返回 0 表示找到
+    // 在 CfValueMapper 里检查
     OConfigItem dummy("dummy");
     bool foundInMapper = g_value_mapper.execute(key, dummy);
     if (foundInMapper)
         return 0;
 
-    // 或者检查 global_config 里是否存在
+    // 或检查 GlobalConfig
     std::string val = g_global_config.getOption(key);
     if (!val.empty())
         return 0;
 
-    // 没找到
     return -1;
 }
 
-/**
- * cf_dispatch_option:
- * 原先是尝试把一个 key/value 分发到对应的 handler（可能是全局选项，也可能是回调）
- */
 static int cf_dispatch_option(const std::string &key, const std::string &value)
 {
-    // 先试试在 CfValueMapper 有无对应回调（这里需要稍微改造一下：临时构造一个 OConfigItem）
+    // 先尝试在 CfValueMapper 中执行
     OConfigItem ci(key);
-    ci.addValue(OConfigValue(value)); // 当做 string
+    ci.addValue(OConfigValue(value));
 
     bool executed = g_value_mapper.execute(key, ci);
     if (executed) {
         return 0;
     }
 
-    // 如果 mapper 没处理，则当成全局选项
+    // 否则视为全局选项
     g_global_config.setOption(key, value);
     return 0;
 }
 
-/**
- * dispatch_global_option:
- * 原先将 key/value 写入全局，这里直接使用 CfGlobalConfig
- */
 static int dispatch_global_option(const std::string &key, const std::string &value)
 {
     g_global_config.setOption(key, value);
     return 0;
 }
 
-/**
- * dispatch_value:
- * 原先 configfile.c 里有 dispatch_value 之类，这里示例把 OConfigItem 的 key 当映射键
- */
 static int dispatch_value(OConfigItem &ci)
 {
-    // 根据 ci.key 查 CfValueMapper
     bool ok = g_value_mapper.execute(ci.key, ci);
     if (!ok) {
-        // 如果 mapper 没有对应处理器，看看是不是要存到 global config
-        // 也可能是别的逻辑，这里简单示例
+        // 如果没有回调，就简单地写入 GlobalConfig (仅示例)
         if (!ci.values.empty() && ci.values[0].type == OConfigType::STRING) {
             g_global_config.setOption(ci.key, ci.values[0].getString());
         }
@@ -162,119 +135,137 @@ static int dispatch_value(OConfigItem &ci)
     return 0;
 }
 
-/**
- * dispatch_block:
- * 原先处理大块 `<Block "..."> ... </Block>`，此处仅示例
- */
 static int dispatch_block(OConfigItem &parentBlock)
 {
-    // 可能会遍历子节点做处理
-    for (auto &child : parentBlock.children) {
-        dispatch_value(*child);
-        // 若还有嵌套 children，则递归
-        if (!child->children.empty()) {
-            dispatch_block(*child);
+    // 递归分发
+    for (size_t i = 0; i < parentBlock.children.size(); ++i) {
+        OConfigItem &child = *parentBlock.children[i];
+        dispatch_value(child);
+        if (!child.children.empty()) {
+            dispatch_block(child);
         }
     }
     return 0;
 }
 
 // ----------------------------------------------------------------------
-// 4. OConfigItem 的辅助操作
+// 4. OConfigItem 帮助操作
 // ----------------------------------------------------------------------
-
 static OConfigItem* cf_ci_replace_child(OConfigItem *parent, OConfigItem *old_child, OConfigItem *new_child)
 {
-    if (!parent || !old_child || !new_child) return nullptr;
+    if (!parent || !old_child || !new_child) return NULL;
 
-    for (auto &childPtr : parent->children) {
-        if (childPtr.get() == old_child) {
-            // 替换为 new_child
-            childPtr = std::make_unique<OConfigItem>(*new_child);
-            childPtr->parent = parent;
-            return childPtr.get();
+    for (size_t i = 0; i < parent->children.size(); ++i) {
+        if (parent->children[i].get() == old_child) {
+            parent->children[i] = std::make_unique<OConfigItem>(*new_child);
+            parent->children[i]->parent = parent;
+            return parent->children[i].get();
         }
     }
-    return nullptr;
+    return NULL;
 }
 
 static void cf_ci_append_children(OConfigItem *dest, OConfigItem *src)
 {
     if (!dest || !src) return;
-    for (auto &child : src->children) {
+    for (size_t i = 0; i < src->children.size(); ++i) {
+        OConfigItem *child = src->children[i].get();
         OConfigItem *added = dest->addChild(child->key);
         // 拷贝 values
         added->values = child->values;
-        // 如果还有 children，可递归
-        cf_ci_append_children(added, child.get());
+        // 递归
+        cf_ci_append_children(added, child);
     }
 }
 
 // ----------------------------------------------------------------------
-// 5. 文件、目录读取相关 (示例化)
+// 5. 读取文件/目录 (使用 POSIX + C++14)
 // ----------------------------------------------------------------------
+static bool is_directory(const std::string &path)
+{
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode) != 0;
+    }
+    return false;
+}
+
 static bool cf_compare_string(const std::string &a, const std::string &b)
 {
     return (a == b);
 }
 
-// 简化版，递归包含文件
-static int cf_include_all(const std::string &pattern)
-{
-    // 这里仅示例，真正实现可能要做 glob 匹配
-    std::cout << "[cf_include_all] pattern: " << pattern << std::endl;
-    return 0;
-}
-
-// 读单个文件，解析后存入 OConfigItem
 static int cf_read_file(const std::string &file, OConfigItem &root)
 {
-    std::ifstream ifs(file);
+    std::ifstream ifs(file.c_str());
     if (!ifs.is_open()) {
-        std::cerr << "[cf_read_file] cannot open file: " << file << std::endl;
+        std::cerr << "[cf_read_file] cannot open file: " << file << " (" << strerror(errno) << ")\n";
         return -1;
     }
-    // 简化演示：假设文件中每一行 `Key Value`
     std::string line;
     while (std::getline(ifs, line)) {
-        // 简陋解析
-        if (line.empty()) continue;
-        auto pos = line.find(' ');
-        if (pos == std::string::npos) continue;
+        // 简易的“Key Value”解析
+        if (line.empty()) 
+            continue;
+        std::string::size_type pos = line.find(' ');
+        if (pos == std::string::npos) 
+            continue;
         std::string key = line.substr(0, pos);
         std::string val = line.substr(pos + 1);
         OConfigItem *child = root.addChild(key);
         child->addValue(OConfigValue(val));
     }
+    ifs.close();
     return 0;
 }
 
 static int cf_read_dir(const std::string &dir, OConfigItem &root)
 {
-    std::error_code ec;
-    for (auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (entry.is_regular_file()) {
-            cf_read_file(entry.path().string(), root);
+    DIR *dp = opendir(dir.c_str());
+    if (!dp) {
+        std::cerr << "[cf_read_dir] opendir failed: " << dir << " (" << strerror(errno) << ")\n";
+        return -1;
+    }
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dp)) != NULL) {
+        // 忽略 . 和 ..
+        if (cf_compare_string(entry->d_name, ".") || cf_compare_string(entry->d_name, "..")) {
+            continue;
+        }
+        // 构造路径
+        std::string path = dir + "/" + entry->d_name;
+        // 如果是目录，则可递归或直接跳过；这里为了示例，都当文件处理
+        if (is_directory(path)) {
+            // 也可调用： cf_read_dir(path, root);
+            cf_read_file(path, root);
+        } else {
+            cf_read_file(path, root);
         }
     }
+    closedir(dp);
     return 0;
 }
 
-// 可能是对文件或目录做统一处理
 static int cf_read_generic(const std::string &path, OConfigItem &root)
 {
-    std::error_code ec;
-    if (std::filesystem::is_directory(path, ec)) {
+    if (is_directory(path)) {
         return cf_read_dir(path, root);
     } else {
         return cf_read_file(path, root);
     }
 }
 
-/**
- * cf_read:
- * 对外暴露的读取入口，可读取一个 config 文件或目录，然后 dispatch
- */
+static int cf_include_all(const std::string &pattern)
+{
+    // 如果需要支持 glob pattern，可使用 fnmatch + opendir 进行遍历匹配
+    // 这里仅示例输出
+    std::cout << "[cf_include_all] pattern: " << pattern << std::endl;
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// 6. 对外暴露的核心读取函数
+// ----------------------------------------------------------------------
 static int cf_read(const std::string &path)
 {
     OConfigItem root("Root");
@@ -282,16 +273,14 @@ static int cf_read(const std::string &path)
     if (status != 0) {
         return status;
     }
-
-    // 读完后，把 root 递归分发
+    // 递归分发
     dispatch_block(root);
     return 0;
 }
 
 // ----------------------------------------------------------------------
-// 6. 全局选项接口
+// 7. 全局选项接口
 // ----------------------------------------------------------------------
-
 static void global_option_set(const std::string &key, const std::string &value)
 {
     g_global_config.setOption(key, value);
@@ -304,7 +293,6 @@ static std::string global_option_get(const std::string &key)
 
 static double global_option_get_time(const std::string &key, double default_val)
 {
-    // 从 global_config 取值，如果为空或不是数字则用 default_val
     std::string val = g_global_config.getOption(key);
     if (val.empty()) {
         return default_val;
@@ -318,16 +306,13 @@ static double global_option_get_time(const std::string &key, double default_val)
 
 static double cf_get_default_interval()
 {
-    // 原 collectd 里默认 Interval 可能是 10s (或全局选项)
-    // 这里做个简单封装
     double interval = global_option_get_time("Interval", 10.0);
     return interval;
 }
 
 // ----------------------------------------------------------------------
-// 7. 回调注册与注销 (cf_register / cf_unregister 等)
+// 8. 回调的注册与注销
 // ----------------------------------------------------------------------
-
 static int cf_register(const std::string &type,
                        std::function<int(const std::string &, const std::string &)> cb,
                        const std::vector<std::string> &keys,
@@ -339,9 +324,7 @@ static int cf_register(const std::string &type,
 
 static int cf_unregister(const std::string &type)
 {
-    // 这里示例中 CfCallbackRegistry 没有提供注销接口
-    // 若要支持，需在 CfCallbackRegistry 中添加对应的 remove 方法
-    // 这里只是展示如何改写
+    // 需要在 CfCallbackRegistry 中实现 remove/erase 才能真正卸载
     return 0;
 }
 
@@ -355,29 +338,24 @@ static int cf_register_complex(const std::string &type,
 
 static int cf_unregister_complex(const std::string &type)
 {
-    // 同样的，示例中 CfComplexCallbackRegistry 没有注销接口
-    // 在实际项目中可自行扩展
+    // 同上，需要 CfComplexCallbackRegistry 提供相应卸载功能
     return 0;
 }
 
 // ----------------------------------------------------------------------
-// 主入口示例：
+// main 函数示例（非必须，仅演示用）
 // ----------------------------------------------------------------------
 int main()
 {
-    // 初始化全局选项 & ValueMapper
     init_global_options();
     init_value_mapper();
 
-    // 可以模拟往 CfCallbackRegistry / CfComplexCallbackRegistry 注册一些回调
-    // 举例：cf_register("ExampleType", someCallback, {"Key1","Key2"}, ...);
+    // 读取配置文件/目录 (你可根据实际情况传入有效路径)
+    cf_read("/tmp/myconfig");
 
-    // 读取配置文件（或目录）
-    cf_read("/path/to/config/file_or_dir");
-
-    // 检查 global_option
-    std::cout << "Global Option BaseDir = " << global_option_get("BaseDir") << std::endl;
-    std::cout << "Global Option Interval = " << cf_get_default_interval() << std::endl;
+    // 测试全局选项
+    std::cout << "[main] BaseDir=" << global_option_get("BaseDir") << std::endl;
+    std::cout << "[main] Interval=" << cf_get_default_interval() << std::endl;
 
     return 0;
 }
