@@ -1,106 +1,127 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
+#include <iostream>
+#include <string>
+#include "oconfig.h" // 包含 OConfigItem 等定义，以及 parse 函数声明
 
-/* 假设 mem_leak.h 中已经声明了以下结构和全局变量：
-   struct mh_entry {
-       struct cds_hlist_node hlist ;
-       void *ptr ;
-       size_t alloc_size ;
-       void *alloc_caller_stack[STACK_DEPTH_MAX] ;
-       int stack_depth ;
-       char *caller_symbol ;
-   } ;
-   extern struct cds_hlist_head mh_table[MH_TABLE_SIZE] ;
-*/
+// 声明与 oconfig.cpp 中的 C++14 接口函数（若 oconfig.h 已声明则可省略）
+extern int oconfig_parse_string_cxx14(const char *buffer, OConfigItem *root);
 
-void print_leaks(void)
+// 递归打印配置树的工具函数
+void printConfigItem(const OConfigItem &item, int indent = 0)
 {
-{
-    FILE *fp = fopen("/mnt/leak_log", "a") ;
-    if (!fp)
-    {
-    {
-        perror("fopen") ;
-        return ;
-    }
-    }
+    // 缩进
+    std::string prefix(indent, ' ');
 
-    static int show_cnt = 0 ;
-    show_cnt++ ;
-
-    time_t now = time(NULL) ;
-    struct tm *tm_now = localtime(&now) ;
-    char time_str[64] ;
-    strftime(time_str, sizeof(time_str), "%m-%d %H:%M:%S", tm_now) ;
-
-    unsigned long total_leak = 0 ;
-    unsigned long total_mem = 0 ;
-    unsigned long i ;
-    char stack_str[512] ;
-
-    /* 先计算总泄露内存（此处 total_mem 也用泄露内存作为示例） */
-    for (i = 0 ; i < MH_TABLE_SIZE ; i++)
-    {
-    {
-        struct cds_hlist_head *head = &mh_table[i] ;
-        struct cds_hlist_node *node ;
-        struct mh_entry *e ;
-        cds_hlist_for_each_entry(e, node, head, hlist)
-        {
-        {
-            total_leak += e->alloc_size ;
-            total_mem += e->alloc_size ;
-        }
-        }
-    }
-    }
-
-    /* 写入头部信息 */
-    fprintf(fp, "********************show_cnt: %d********************\n", show_cnt) ;
-    fprintf(fp, "record time: [%s]\n", time_str) ;
-    fprintf(fp, "memleak use memory: (%lu) %luM\n\n", total_leak, total_leak / (1024 * 1024)) ;
-
-    /* 写入泄露记录 */
-    for (i = 0 ; i < MH_TABLE_SIZE ; i++)
-    {
-    {
-        struct cds_hlist_head *head = &mh_table[i] ;
-        struct cds_hlist_node *node ;
-        struct mh_entry *e ;
-        cds_hlist_for_each_entry(e, node, head, hlist)
-        {
-        {
-            int j ;
-            int offset = 0 ;
-            memset(stack_str, 0, sizeof(stack_str)) ;
-            for (j = 0 ; j < e->stack_depth ; j++)
-            {
-            {
-                offset += snprintf(stack_str + offset,
-                    sizeof(stack_str) - offset,
-                    " %p",
-                    e->alloc_caller_stack[j]) ;
+    // 打印本节点
+    std::cout << prefix << "Key: " << item.key << std::endl;
+    // 如果有 values
+    if (!item.values.empty()) {
+        std::cout << prefix << "  Values:" << std::endl;
+        for (size_t i = 0; i < item.values.size(); ++i) {
+            const OConfigValue &val = item.values[i];
+            switch (val.type) {
+                case OConfigType::STRING:
+                    std::cout << prefix << "    [STRING] " << val.getString() << std::endl;
+                    break;
+                case OConfigType::NUMBER:
+                    std::cout << prefix << "    [NUMBER] " << val.getNumber() << std::endl;
+                    break;
+                case OConfigType::BOOLEAN:
+                    std::cout << prefix << "    [BOOLEAN] " << (val.getBoolean() ? "true" : "false") << std::endl;
+                    break;
             }
-            }
-            fprintf(fp, "[leak] ptr: %p size: %zu caller:%s <%s>\n",
-            {
-                e->ptr,
-                e->alloc_size,
-                stack_str,
-                e->caller_symbol ? e->caller_symbol : "unknown"
-            }) ;
-        }
         }
     }
+
+    // 递归打印所有子节点
+    if (!item.children.empty()) {
+        std::cout << prefix << "  Children:" << std::endl;
+        for (size_t i = 0; i < item.children.size(); ++i) {
+            printConfigItem(*item.children[i], indent + 4);
+        }
     }
-
-    /* 写入尾部信息 */
-    fprintf(fp, "\n") ;
-    fprintf(fp, "total mem: %lu (%luM)\n", total_mem, total_mem / (1024 * 1024)) ;
-    fprintf(fp, "********************show end********************\n\n") ;
-
-    fclose(fp) ;
 }
+
+// 在此写上示例配置内容：与 “上面是配置文件的实例” 中相同
+static const char *demo_config = R"CONF(
+##############################################################################
+# Global                                                                     #
+#----------------------------------------------------------------------------#
+# Global settings for the daemon.                                            #
+##############################################################################
+
+#Hostname    "localhost"
+FQDNLookup   false
+#BaseDir     "${prefix}/var/lib/collectd"
+#PIDFile     "${prefix}/var/run/collectd.pid"
+#PluginDir   "${exec_prefix}/lib/collectd"
+#TypesDB     "/opt/collectd/share/collectd/types.db"
+
+#----------------------------------------------------------------------------#
+# When enabled, plugins are loaded automatically with the default options    #
+# when an appropriate <Plugin ...> block is encountered.                     #
+# Disabled by default.                                                       #
+#----------------------------------------------------------------------------#
+#AutoLoadPlugin false
+
+#MaxReadInterval 86400
+#Timeout         2
+#ReadThreads     5
+#WriteThreads    5
+
+
+# Limit the size of the write queue. Default is no limit. Setting up a limit is
+# recommended for servers handling a high volume of traffic.
+#WriteQueueLimitHigh 1000000
+#WriteQueueLimitLow   800000
+
+##############################################################################
+# Logging                                                                    #
+#----------------------------------------------------------------------------#
+# Plugins which provide logging functions should be loaded first, so log     #
+# messages generated when loading or configuring other plugins can be        #
+# accessed.                                                                  #
+##############################################################################
+
+#LoadPlugin syslog
+LoadPlugin logfile
+LoadPlugin log_logstash
+
+<Plugin logfile>
+	LogLevel debug
+	File "/mnt/data/collect/log"
+	Timestamp true
+	PrintSeverity false
+</Plugin>
+
+<Plugin log_logstash>
+	LogLevel debug
+	File "${prefix}/var/log/collectd.json.log"
+</Plugin>
+
+#<Plugin syslog>
+#	LogLevel debug
+#</Plugin>
+)CONF";
+
+
+int main()
+{
+    // 准备一个顶层的 OConfigItem（相当于根节点）
+    OConfigItem root("root");
+
+    // 调用我们改写的解析函数（从字符串解析）
+    int status = oconfig_parse_string_cxx14(demo_config, &root);
+    if (status != 0) {
+        std::cerr << "[ERROR] Failed to parse config from string." << std::endl;
+        return 1;
+    }
+
+    // 解析成功后，打印结果
+    std::cout << "===== Parsed Config Tree =====" << std::endl;
+    printConfigItem(root, 0);
+
+    // root 在栈上，不需要手动释放。其子节点由 unique_ptr 管理
+    // 如果你是用 oconfig_new_item_cxx14() 动态分配的，则可调用 oconfig_free_cxx14(rootPtr)
+
+    return 0;
 }
