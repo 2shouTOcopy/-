@@ -1,340 +1,212 @@
 /*
- * A simplified parser for Collectd-style config files using:
+ * configfile.cpp - A C++14 version emulating Collectd's cf_read, dispatch_value, etc.
  *
- *   # comment
- *   key value1 value2 ...
- *   <BlockName arg1 arg2 ...>
- *       ...
- *   </BlockName>
- *
- * The result is stored in an OConfigItem tree (as defined in your oconfig.h).
- *
- * Build with: g++ -std=c++14 -I. -c oconfig.cpp
+ * Requires:
+ *   - oconfig.h / oconfig.cpp (C++14 parser for Collectd-style configs)
+ *   - Implementation for dispatch_loadplugin, dispatch_block_plugin, fc_configure, etc.
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cctype>
-#include <cerrno>
-#include <string>
-#include <vector>
-#include <memory>
-#include <sstream>
 #include <iostream>
+#include <string>
+#include <cstring>   // strcasecmp
+#include <vector>
+#include <functional>
 
-#include "oconfig.h"
+// 你的解析库
+#include "oconfig.h" // for OConfigItem, oconfig_parse_file_cxx14
 
-//---------------------------------------------------------
-// 工具函数：去掉字符串首尾的空白字符
-//---------------------------------------------------------
-static std::string trim(const std::string &s)
+// ----------------------------------------------------------------------
+// 结构体 / 函数声明：为 mimic Collectd
+// ----------------------------------------------------------------------
+struct CfValueMap {
+    std::string key;
+    std::function<int(OConfigItem &)> func;
+};
+
+struct CfGlobalOption {
+    std::string key;
+    // 可能还需要默认值等
+};
+
+// 声明要用到的函数(可在本文件或其他文件里实现)
+static int dispatch_global_option(OConfigItem &ci);
+static int dispatch_loadplugin(OConfigItem &ci);
+static int dispatch_block_plugin(OConfigItem &ci);
+static int fc_configure(OConfigItem &ci); // 例如 "Chain"
+
+// ----------------------------------------------------------------------
+// 1) 模仿 Collectd: cf_value_map[] 
+//    (如同 "PluginDir" -> dispatch_value_plugindir, etc.)
+// ----------------------------------------------------------------------
+static int dispatch_value_plugindir(OConfigItem &ci)
 {
-    size_t start = 0;
-    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start])))
-        ++start;
-
-    if (start == s.size())
-        return "";
-
-    size_t end = s.size() - 1;
-    while (end > start && std::isspace(static_cast<unsigned char>(s[end])))
-        --end;
-
-    return s.substr(start, end - start + 1);
+    // 简易示例
+    std::cout << "[dispatch_value_plugindir] key=" << ci.key << "\n";
+    if (!ci.values.empty()) {
+        std::string dir = ci.values[0].getString();
+        std::cout << "  plugin dir: " << dir << "\n";
+    }
+    return 0;
 }
-
-//---------------------------------------------------------
-// 工具函数：若字符串带引号，去掉最外层引号
-//---------------------------------------------------------
-static std::string stripQuotes(const std::string &s)
+static int dispatch_value_timeout(OConfigItem &ci)
 {
-    if (s.size() >= 2) {
-        if ((s.front() == '"'  && s.back() == '"') ||
-            (s.front() == '\'' && s.back() == '\''))
-        {
-            return s.substr(1, s.size() - 2);
-        }
-    }
-    return s;
-}
-
-//---------------------------------------------------------
-// 解析一行：将其按空格分割成 tokens（支持简单的 "..."）
-// - 若行中包含带引号的参数，会保留它作为一个整体再 stripQuotes
-//---------------------------------------------------------
-static std::vector<std::string> tokenizeLine(const std::string &line)
-{
-    std::vector<std::string> tokens;
-    // 这里我们做一个最简易的 "按空格分割 + 引号 合并" 逻辑
-    // 若需要更复杂的转义，可加额外解析
-    bool inQuotes = false;
-    char quoteChar = 0;
-    std::ostringstream current;
-    
-    for (size_t i = 0; i < line.size(); ++i) {
-        char c = line[i];
-        if (!inQuotes) {
-            // 如果还没进入引号
-            if ((c == '"' || c == '\'') && !std::isspace(static_cast<unsigned char>(c))) {
-                inQuotes = true;
-                quoteChar = c;
-                current << c;  // 保留
-            }
-            else if (std::isspace(static_cast<unsigned char>(c))) {
-                // token 分割
-                if (current.tellp() > 0) {
-                    tokens.push_back(current.str());
-                    current.str("");
-                    current.clear();
-                }
-            } 
-            else {
-                current << c;
-            }
-        }
-        else {
-            // 在引号里
-            current << c;
-            if (c == quoteChar) {
-                // 引号关闭
-                inQuotes = false;
-            }
-        }
-    }
-
-    if (current.tellp() > 0) {
-        tokens.push_back(current.str());
-    }
-
-    // 去除外层引号
-    for (auto &t : tokens) {
-        t = trim(t);
-        t = stripQuotes(t);
-    }
-    return tokens;
-}
-
-//---------------------------------------------------------
-// 解析配置的核心递归：
-// - readLine 循环
-// - 如果遇到 <BlockName ...> => 新子节点
-// - 如果遇到 </BlockName> => return
-// - 否则解析 key + values
-//---------------------------------------------------------
-static int parseBlock(FILE *fh, OConfigItem &parent, const std::string &blockName, bool isRoot, int &lineNum)
-{
-    // blockName 对 <BlockName> 是仅供提示
-    // isRoot 表示是否顶层 parse
-    char buf[1024];
-
-    while (true) {
-        if (!std::fgets(buf, sizeof(buf), fh)) {
-            // EOF
-            return 0; 
-        }
-        lineNum++;
-        std::string line = trim(buf);
-        if (line.empty()) {
-            continue; // skip blank
-        }
-        if (line[0] == '#') {
-            continue; // skip comment
-        }
-        // 若检测到 block 结束
-        if (line.size() >= 2 && line[0] == '<' && line[1] == '/') {
-            // 例如 </Plugin>
-            // 提取 block 名称
-            // 形如 </Plugin logfile> 也可能出现，但 collectd 常见是 </Plugin>
-            // 我们做最小假设： `</BlockName>`
-            // 直接返回
-            return 0;
-        }
-        // 若检测到 block 开始
-        if (line[0] == '<' && line[1] != '/') {
-            // 形如 `<Plugin logfile>`
-            // 先去除首尾 < >
-            // 解析 tokens
-            if (line.back() == '>') {
-                line = line.substr(1, line.size() - 2); // 去掉 < >
-                line = trim(line);
-            } else {
-                // 行末没 '>'，简单处理：把最后一个 '>'忽略之类
-                // 这里简化
-                size_t pos = line.rfind('>');
-                if (pos != std::string::npos && pos > 0) {
-                    line = line.substr(1, pos - 1); 
-                }
-            }
-            std::vector<std::string> tokens = tokenizeLine(line);
-            if (tokens.empty()) {
-                // 语法错误
-                std::cerr << "Parse error at line " << lineNum 
-                          << ": empty block start\n";
-                return -1;
-            }
-            // 第一个是 blockName
-            std::string blockKey = tokens[0];
-            // 创建 <blockKey> 子节点
-            OConfigItem *child = parent.addChild(blockKey);
-            // 把剩余 tokens 存成 child 的 values (类似 <Plugin "logfile"> => Key="Plugin", Value="logfile")
-            for (size_t i = 1; i < tokens.size(); ++i) {
-                child->addValue(OConfigValue(tokens[i]));
-            }
-            // 递归解析子块
-            int status = parseBlock(fh, *child, blockKey, false, lineNum);
-            if (status != 0) {
-                return status;
-            }
-            // 继续下一个行
-            continue;
-        }
-
-        // 否则就是普通行: 形如 `Key value1 value2 ...`
-        std::vector<std::string> tokens = tokenizeLine(line);
-        if (!tokens.empty()) {
-            std::string key = tokens[0];
-            OConfigItem *child = parent.addChild(key);
-            // 其余tokens存为值
-            for (size_t i = 1; i < tokens.size(); ++i) {
-                child->addValue(OConfigValue(tokens[i]));
-            }
-        }
-    } // while
-
+    std::cout << "[dispatch_value_timeout] key=" << ci.key << "\n";
+    // ...
     return 0;
 }
 
-//---------------------------------------------------------
-// 对外：解析文件
-//---------------------------------------------------------
-static int oconfig_parse_file_internal(const char *filename, OConfigItem &root)
+// 这里是一个示例 array，模仿 Collectd 原先的 cf_value_map[] = {{"PluginDir", ...}, ...}
+static CfValueMap cf_value_map[] = {
+    {"PluginDir", dispatch_value_plugindir},
+    {"Timeout",   dispatch_value_timeout},
+    // ...  你可以继续添加
+};
+static const int cf_value_map_num = sizeof(cf_value_map) / sizeof(cf_value_map[0]);
+
+// ----------------------------------------------------------------------
+// 2) 模仿 Collectd: cf_global_options[]
+// ----------------------------------------------------------------------
+static CfGlobalOption cf_global_options[] = {
+    {"BaseDir"},
+    {"PIDFile"},
+    {"Hostname"},
+    {"FQDNLookup"},
+    {"Interval"},
+    {"ReadThreads"},
+    // ...
+};
+static const int cf_global_options_num = sizeof(cf_global_options) / sizeof(cf_global_options[0]);
+
+// ----------------------------------------------------------------------
+// 3) dispatch_global_option
+//    在 Collectd 中它会把 "key=value" 保存到全局选项数组
+//    我们这里做个示例
+// ----------------------------------------------------------------------
+static int dispatch_global_option(OConfigItem &ci)
 {
-    FILE *fh = std::fopen(filename, "r");
-    if (!fh) {
-        std::cerr << "[Error] Cannot open file: " << filename 
-                  << " (" << std::strerror(errno) << ")\n";
+    // 简易示例：打印 + 模拟“写全局配置”
+    std::cout << "[dispatch_global_option] key=" << ci.key << "\n";
+    if (!ci.values.empty()) {
+        std::cout << "  value=" << ci.values[0].getString() << "\n";
+    }
+    // ...
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// 4) dispatch_block: 类似 collectd: if key==LoadPlugin => dispatch_loadplugin
+//    else if key==Plugin => dispatch_block_plugin, else if Chain => fc_configure
+// ----------------------------------------------------------------------
+static int dispatch_block(OConfigItem &ci)
+{
+    if (strcasecmp(ci.key.c_str(), "LoadPlugin") == 0) {
+        return dispatch_loadplugin(ci);
+    }
+    else if (strcasecmp(ci.key.c_str(), "Plugin") == 0) {
+        return dispatch_block_plugin(ci);
+    }
+    else if (strcasecmp(ci.key.c_str(), "Chain") == 0) {
+        return fc_configure(ci);
+    }
+    return 0;
+}
+
+// 示例: dispatch_loadplugin
+static int dispatch_loadplugin(OConfigItem &ci)
+{
+    std::cout << "[dispatch_loadplugin] key=" << ci.key << "\n";
+    // ...
+    return 0;
+}
+// 示例: dispatch_block_plugin
+static int dispatch_block_plugin(OConfigItem &ci)
+{
+    std::cout << "[dispatch_block_plugin] key=" << ci.key << "\n";
+    // ...
+    return 0;
+}
+// 示例: fc_configure (for "Chain")
+static int fc_configure(OConfigItem &ci)
+{
+    std::cout << "[fc_configure] key=" << ci.key << "\n";
+    // ...
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// 5) dispatch_value: 类似 collectd: 
+//    1) 在 cf_value_map[] 中找到 key => 执行对应函数
+//    2) 若 ret=0, 在 cf_global_options[] 中找 => dispatch_global_option(ci)
+// ----------------------------------------------------------------------
+static int dispatch_value(OConfigItem &ci)
+{
+    int ret = 0;
+
+    // 先在 cf_value_map[] 中匹配
+    for (int i = 0; i < cf_value_map_num; i++) {
+        if (strcasecmp(cf_value_map[i].key.c_str(), ci.key.c_str()) == 0) {
+            ret = cf_value_map[i].func(ci);
+            break;
+        }
+    }
+    if (ret != 0)
+        return ret;
+
+    // 如果还没处理 (ret=0)，再看看 cf_global_options
+    for (int i = 0; i < cf_global_options_num; i++) {
+        if (strcasecmp(cf_global_options[i].key.c_str(), ci.key.c_str()) == 0) {
+            ret = dispatch_global_option(ci);
+            break;
+        }
+    }
+    return ret;
+}
+
+// ----------------------------------------------------------------------
+// 6) 主接口: cf_read(const char *filename)
+//    1) 用 oconfig_parse_file_cxx14 解析 => OConfigItem root
+//    2) 判断 root 是否有 children
+//    3) 遍历 children: 若无子节点 => dispatch_value; 否则 => dispatch_block
+//    4) 返回结果
+// ----------------------------------------------------------------------
+int cf_read(const char *filename)
+{
+    if (!filename) {
+        std::cerr << "[cf_read] invalid filename (NULL)\n";
         return -1;
     }
-    int lineNum = 0;
-    int status = parseBlock(fh, root, "root", true, lineNum);
-    std::fclose(fh);
-    return status;
-}
 
-//---------------------------------------------------------
-// 对外：解析字符串
-//---------------------------------------------------------
-static int oconfig_parse_string_internal(const char *buffer, OConfigItem &root)
-{
-    if (!buffer) {
-        std::cerr << "[Error] parse_string: buffer is null\n";
+    // 解析
+    OConfigItem root("root");
+    int parse_status = oconfig_parse_file_cxx14(filename, &root);
+    if (parse_status != 0) {
+        std::cerr << "ERROR: Unable to read config file " << filename << ".\n";
         return -1;
     }
-    // 用临时文件方式写入
-    FILE *fh = std::tmpfile();
-    if (!fh) {
-        std::cerr << "[Error] tmpfile() failed\n";
+
+    // 如果 root.children == 0，表示文件空
+    if (root.children.empty()) {
+        std::cerr << "ERROR: Configuration file " << filename << " is empty.\n";
         return -1;
     }
-    std::fputs(buffer, fh);
-    std::fflush(fh);
-    std::fseek(fh, 0, SEEK_SET);
 
-    int lineNum = 0;
-    int status = parseBlock(fh, root, "root", true, lineNum);
+    // 遍历 children
+    int ret = 0;
+    for (size_t i = 0; i < root.children.size(); i++) {
+        OConfigItem &child = *root.children[i];
 
-    std::fclose(fh);
-    return status;
-}
-
-//---------------------------------------------------------
-// 提供类似 collectd oconfig.c 的对外接口
-//---------------------------------------------------------
-int oconfig_parse_file_cxx14(const char *filename, OConfigItem *root)
-{
-    if (!root) return -1;
-    return oconfig_parse_file_internal(filename, *root);
-}
-
-int oconfig_parse_string_cxx14(const char *buffer, OConfigItem *root)
-{
-    if (!root) return -1;
-    return oconfig_parse_string_internal(buffer, *root);
-}
-
-//---------------------------------------------------------
-// 下面是一些可能的辅助函数 (clone, free, etc.) 
-// 若你在别处已有实现，可不重复
-//---------------------------------------------------------
-OConfigItem* oconfig_new_item_cxx14(const char *key)
-{
-    if (!key) return nullptr;
-    return new OConfigItem(std::string(key));
-}
-
-void oconfig_free_cxx14(OConfigItem *item)
-{
-    delete item; // OConfigItem 的 unique_ptr children 会自动递归释放
-}
-
-#include <stdexcept>
-
-OConfigItem* oconfig_clone_cxx14(const OConfigItem *src)
-{
-    if (!src) return nullptr;
-    // 简单写一个深拷贝
-    OConfigItem *dest = new OConfigItem(src->key);
-    dest->values = src->values;
-    for (auto &childPtr : src->children) {
-        OConfigItem *childClone = oconfig_clone_cxx14(childPtr.get());
-        childClone->parent = dest;
-        dest->children.emplace_back(childClone);
+        // if no children => dispatch_value
+        if (child.children.empty()) {
+            if (dispatch_value(child) != 0)
+                ret = -1;
+        }
+        // else => dispatch_block
+        else {
+            if (dispatch_block(child) != 0)
+                ret = -1;
+        }
     }
-    return dest;
-}
 
-void oconfig_set_string_cxx14(OConfigItem *item, const char *str)
-{
-    if (!item || !str) return;
-    item->values.clear();
-    item->addValue(OConfigValue(std::string(str)));
-}
-
-void oconfig_add_string_cxx14(OConfigItem *item, const char *str)
-{
-    if (!item || !str) return;
-    item->addValue(OConfigValue(std::string(str)));
-}
-
-void oconfig_set_number_cxx14(OConfigItem *item, double val)
-{
-    if (!item) return;
-    item->values.clear();
-    item->addValue(OConfigValue(val));
-}
-
-void oconfig_add_number_cxx14(OConfigItem *item, double val)
-{
-    if (!item) return;
-    item->addValue(OConfigValue(val));
-}
-
-void oconfig_set_boolean_cxx14(OConfigItem *item, bool val)
-{
-    if (!item) return;
-    item->values.clear();
-    item->addValue(OConfigValue(val));
-}
-
-void oconfig_add_boolean_cxx14(OConfigItem *item, bool val)
-{
-    if (!item) return;
-    item->addValue(OConfigValue(val));
-}
-
-void oconfig_clone_values_cxx14(OConfigItem *dest, const OConfigItem *src)
-{
-    if (!dest || !src) return;
-    dest->values = src->values;
+    // 在原C代码中，会 oconfig_free(conf)；这里由unique_ptr自动释放
+    return ret;
 }
