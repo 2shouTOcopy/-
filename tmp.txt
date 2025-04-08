@@ -1,212 +1,45 @@
-/*
- * configfile.cpp - A C++14 version emulating Collectd's cf_read, dispatch_value, etc.
- *
- * Requires:
- *   - oconfig.h / oconfig.cpp (C++14 parser for Collectd-style configs)
- *   - Implementation for dispatch_loadplugin, dispatch_block_plugin, fc_configure, etc.
- */
+<!-- ================================== -->
+<!--       4 bytes digital input       -->
+<!-- ================================== -->
+<ModuleItem ID="ID_Mod_1" ModuleIdentNumber="0x00000021">
+    <ModuleInfo>
+        <Name TextId="TOK_TextId_Module_1I"/>
+        <InfoText TextId="TOK_InfoTextId_Module_1I"/>
+    </ModuleInfo>
+    <VirtualSubmoduleList>
+        <VirtualSubmoduleItem ID="1" SubmoduleIdentNumber="0x0001" MayIssueProcessAlarm="true">
+            <IOData>
+                <Input Consistency="All items consistency">
+                    <!-- 将原先的 Unsigned8 改为 Unsigned32 -->
+                    <DataItem DataType="Unsigned32" TextId="TOK_Input_DataItem_1" UseAsBits="true">
+                        <!-- 低 8 位（BitOffset = 0~7）可保持原有含义，如果依然需要兼容以前状态 -->
+                        <BitDataItem BitOffset="0" TextId="TOK_InfoTextId_Module_1I_B0"/>
+                        <BitDataItem BitOffset="1" TextId="TOK_InfoTextId_Module_1I_B1"/>
+                        <BitDataItem BitOffset="2" TextId="TOK_InfoTextId_Module_1I_B2"/>
+                        <BitDataItem BitOffset="3" TextId="TOK_InfoTextId_Module_1I_B3"/>
+                        <BitDataItem BitOffset="4" TextId="TOK_InfoTextId_Module_1I_B4"/>
+                        <BitDataItem BitOffset="5" TextId="TOK_InfoTextId_Module_1I_B5"/>
+                        <BitDataItem BitOffset="6" TextId="TOK_InfoTextId_Module_1I_B6"/>
+                        <BitDataItem BitOffset="7" TextId="TOK_InfoTextId_Module_1I_B7"/>
 
-#include <iostream>
-#include <string>
-#include <cstring>   // strcasecmp
-#include <vector>
-#include <functional>
+                        <!-- 新增 BUSY 状态，比如放在第 8 位 -->
+                        <BitDataItem BitOffset="8" TextId="TOK_InfoTextId_Module_1I_Busy"/>
 
-// 你的解析库
-#include "oconfig.h" // for OConfigItem, oconfig_parse_file_cxx14
+                        <!-- 新增心跳（Heartbeat） 状态，比如放在第 9 位 -->
+                        <BitDataItem BitOffset="9" TextId="TOK_InfoTextId_Module_1I_Heartbeat"/>
 
-// ----------------------------------------------------------------------
-// 结构体 / 函数声明：为 mimic Collectd
-// ----------------------------------------------------------------------
-struct CfValueMap {
-    std::string key;
-    std::function<int(OConfigItem &)> func;
-};
-
-struct CfGlobalOption {
-    std::string key;
-    // 可能还需要默认值等
-};
-
-// 声明要用到的函数(可在本文件或其他文件里实现)
-static int dispatch_global_option(OConfigItem &ci);
-static int dispatch_loadplugin(OConfigItem &ci);
-static int dispatch_block_plugin(OConfigItem &ci);
-static int fc_configure(OConfigItem &ci); // 例如 "Chain"
-
-// ----------------------------------------------------------------------
-// 1) 模仿 Collectd: cf_value_map[] 
-//    (如同 "PluginDir" -> dispatch_value_plugindir, etc.)
-// ----------------------------------------------------------------------
-static int dispatch_value_plugindir(OConfigItem &ci)
-{
-    // 简易示例
-    std::cout << "[dispatch_value_plugindir] key=" << ci.key << "\n";
-    if (!ci.values.empty()) {
-        std::string dir = ci.values[0].getString();
-        std::cout << "  plugin dir: " << dir << "\n";
-    }
-    return 0;
-}
-static int dispatch_value_timeout(OConfigItem &ci)
-{
-    std::cout << "[dispatch_value_timeout] key=" << ci.key << "\n";
-    // ...
-    return 0;
-}
-
-// 这里是一个示例 array，模仿 Collectd 原先的 cf_value_map[] = {{"PluginDir", ...}, ...}
-static CfValueMap cf_value_map[] = {
-    {"PluginDir", dispatch_value_plugindir},
-    {"Timeout",   dispatch_value_timeout},
-    // ...  你可以继续添加
-};
-static const int cf_value_map_num = sizeof(cf_value_map) / sizeof(cf_value_map[0]);
-
-// ----------------------------------------------------------------------
-// 2) 模仿 Collectd: cf_global_options[]
-// ----------------------------------------------------------------------
-static CfGlobalOption cf_global_options[] = {
-    {"BaseDir"},
-    {"PIDFile"},
-    {"Hostname"},
-    {"FQDNLookup"},
-    {"Interval"},
-    {"ReadThreads"},
-    // ...
-};
-static const int cf_global_options_num = sizeof(cf_global_options) / sizeof(cf_global_options[0]);
-
-// ----------------------------------------------------------------------
-// 3) dispatch_global_option
-//    在 Collectd 中它会把 "key=value" 保存到全局选项数组
-//    我们这里做个示例
-// ----------------------------------------------------------------------
-static int dispatch_global_option(OConfigItem &ci)
-{
-    // 简易示例：打印 + 模拟“写全局配置”
-    std::cout << "[dispatch_global_option] key=" << ci.key << "\n";
-    if (!ci.values.empty()) {
-        std::cout << "  value=" << ci.values[0].getString() << "\n";
-    }
-    // ...
-    return 0;
-}
-
-// ----------------------------------------------------------------------
-// 4) dispatch_block: 类似 collectd: if key==LoadPlugin => dispatch_loadplugin
-//    else if key==Plugin => dispatch_block_plugin, else if Chain => fc_configure
-// ----------------------------------------------------------------------
-static int dispatch_block(OConfigItem &ci)
-{
-    if (strcasecmp(ci.key.c_str(), "LoadPlugin") == 0) {
-        return dispatch_loadplugin(ci);
-    }
-    else if (strcasecmp(ci.key.c_str(), "Plugin") == 0) {
-        return dispatch_block_plugin(ci);
-    }
-    else if (strcasecmp(ci.key.c_str(), "Chain") == 0) {
-        return fc_configure(ci);
-    }
-    return 0;
-}
-
-// 示例: dispatch_loadplugin
-static int dispatch_loadplugin(OConfigItem &ci)
-{
-    std::cout << "[dispatch_loadplugin] key=" << ci.key << "\n";
-    // ...
-    return 0;
-}
-// 示例: dispatch_block_plugin
-static int dispatch_block_plugin(OConfigItem &ci)
-{
-    std::cout << "[dispatch_block_plugin] key=" << ci.key << "\n";
-    // ...
-    return 0;
-}
-// 示例: fc_configure (for "Chain")
-static int fc_configure(OConfigItem &ci)
-{
-    std::cout << "[fc_configure] key=" << ci.key << "\n";
-    // ...
-    return 0;
-}
-
-// ----------------------------------------------------------------------
-// 5) dispatch_value: 类似 collectd: 
-//    1) 在 cf_value_map[] 中找到 key => 执行对应函数
-//    2) 若 ret=0, 在 cf_global_options[] 中找 => dispatch_global_option(ci)
-// ----------------------------------------------------------------------
-static int dispatch_value(OConfigItem &ci)
-{
-    int ret = 0;
-
-    // 先在 cf_value_map[] 中匹配
-    for (int i = 0; i < cf_value_map_num; i++) {
-        if (strcasecmp(cf_value_map[i].key.c_str(), ci.key.c_str()) == 0) {
-            ret = cf_value_map[i].func(ci);
-            break;
-        }
-    }
-    if (ret != 0)
-        return ret;
-
-    // 如果还没处理 (ret=0)，再看看 cf_global_options
-    for (int i = 0; i < cf_global_options_num; i++) {
-        if (strcasecmp(cf_global_options[i].key.c_str(), ci.key.c_str()) == 0) {
-            ret = dispatch_global_option(ci);
-            break;
-        }
-    }
-    return ret;
-}
-
-// ----------------------------------------------------------------------
-// 6) 主接口: cf_read(const char *filename)
-//    1) 用 oconfig_parse_file_cxx14 解析 => OConfigItem root
-//    2) 判断 root 是否有 children
-//    3) 遍历 children: 若无子节点 => dispatch_value; 否则 => dispatch_block
-//    4) 返回结果
-// ----------------------------------------------------------------------
-int cf_read(const char *filename)
-{
-    if (!filename) {
-        std::cerr << "[cf_read] invalid filename (NULL)\n";
-        return -1;
-    }
-
-    // 解析
-    OConfigItem root("root");
-    int parse_status = oconfig_parse_file_cxx14(filename, &root);
-    if (parse_status != 0) {
-        std::cerr << "ERROR: Unable to read config file " << filename << ".\n";
-        return -1;
-    }
-
-    // 如果 root.children == 0，表示文件空
-    if (root.children.empty()) {
-        std::cerr << "ERROR: Configuration file " << filename << " is empty.\n";
-        return -1;
-    }
-
-    // 遍历 children
-    int ret = 0;
-    for (size_t i = 0; i < root.children.size(); i++) {
-        OConfigItem &child = *root.children[i];
-
-        // if no children => dispatch_value
-        if (child.children.empty()) {
-            if (dispatch_value(child) != 0)
-                ret = -1;
-        }
-        // else => dispatch_block
-        else {
-            if (dispatch_block(child) != 0)
-                ret = -1;
-        }
-    }
-
-    // 在原C代码中，会 oconfig_free(conf)；这里由unique_ptr自动释放
-    return ret;
-}
+                        <!-- 如果还需要更多标志位，可继续在此添加 
+                             <BitDataItem BitOffset="10" TextId="xxx"/>
+                             ...
+                             直至 BitOffset="31" -->
+                    </DataItem>
+                </Input>
+            </IOData>
+            <ModuleInfo>
+                <Name TextId="TOK_TextId_Module_1I"/>
+                <InfoText TextId="TOK_InfoTextId_Module_1I"/>
+            </ModuleInfo>
+            <!-- <PROFIenergy ProfileVersion="V1.0"/> -->
+        </VirtualSubmoduleItem>
+    </VirtualSubmoduleList>
+</ModuleItem>
