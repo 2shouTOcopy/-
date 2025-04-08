@@ -1,32 +1,169 @@
-<!-- 保留原来的 ID_Mod_1 等模块，这里只展示新增的 ID_Mod_8 -->
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <iostream>    // 示例中的打印
+#include <cstring>     // memset等
+#include <unistd.h>    // sleep
+#include <cstdint>     // uint8_t
 
-<!-- ====================================== -->
-<!--   4 bytes Camera Status Module (New)   -->
-<!-- ====================================== -->
-<ModuleItem ID="ID_Mod_8" ModuleIdentNumber="0x00000028">
-    <ModuleInfo>
-        <Name TextId="TOK_TextId_Module_8_Camera"/>
-        <InfoText TextId="TOK_InfoTextId_Module_8_Camera"/>
-    </ModuleInfo>
-    
-    <VirtualSubmoduleList>
-        <VirtualSubmoduleItem ID="8" SubmoduleIdentNumber="0x0008" MayIssueProcessAlarm="true">
-            <IOData>
-                <Input Consistency="All items consistency">
-                    <!-- 使用 Unsigned32，表示占用 4 字节 -->
-                    <DataItem DataType="Unsigned32" TextId="TOK_Input_DataItem_CameraStatus" UseAsBits="true">
-                        <!-- 仅定义 2 个 bit，其余位不需要显示定义 -->
-                        <BitDataItem BitOffset="0" TextId="TOK_CameraStatus_Busy"/>
-                        <BitDataItem BitOffset="1" TextId="TOK_CameraStatus_Heartbeat"/>
-                    </DataItem>
-                </Input>
-            </IOData>
+// 假设 extern C 接口，或你自己已有的函数
+extern "C" {
+    unsigned char* INDATA_SLOTS_ADDR(int slotIndex);
+    void pnio_indata_update();
+}
 
-            <ModuleInfo>
-                <Name TextId="TOK_TextId_Module_8_Camera"/>
-                <InfoText TextId="TOK_InfoTextId_Module_8_Camera"/>
-            </ModuleInfo>
-            <!-- <PROFIenergy ProfileVersion="V1.0"/> -->
-        </VirtualSubmoduleItem>
-    </VirtualSubmoduleList>
-</ModuleItem>
+//-----------------------
+// 工具宏: 翻转某个bit
+//-----------------------
+#ifndef PN_TOGGLE_BIT
+#define PN_TOGGLE_BIT(a, b) ((a) ^= (1U << (b)))
+#endif
+
+// 心跳位，比如放在bit0
+static constexpr unsigned HEARTBEAT_BIT = 0;
+
+// 示例：心跳管理类/结构
+struct HeartbeatManager
+{
+    // 配置项
+    bool moduleEnable{true};     // 模块使能
+    bool heartbeatEnable{true};  // 心跳使能
+    std::chrono::milliseconds interval{2000}; // 心跳间隔(ms)
+
+    // 线程控制
+    std::atomic<bool> endFlag{false};   // 结束标志
+    std::atomic<bool> running{false};   // 是否正在运行
+    std::thread       hbThread;         // 心跳线程
+
+    // 互斥锁 + 条件变量
+    std::mutex              mtx;
+    std::condition_variable cv;
+};
+
+static HeartbeatManager g_hbMgr;
+
+// 取第8槽位的数据 (示例)
+static unsigned char* getCameraStatusPtr()
+{
+    return INDATA_SLOTS_ADDR(8);
+}
+
+//------------------------
+// 线程函数：心跳逻辑
+//------------------------
+static void heartbeatThreadFunc()
+{
+    // 给线程起个名字（若需要特定平台API可以再封装）
+    // thread_set_name("pn_hb_thread"); // 不同平台不一样，这里仅示例
+
+    // 获取相机状态的指针
+    unsigned char* cam_status_ptr = getCameraStatusPtr();
+
+    g_hbMgr.running = true;
+    while (!g_hbMgr.endFlag)
+    {
+        // 先判断使能
+        if (!g_hbMgr.moduleEnable || !g_hbMgr.heartbeatEnable)
+        {
+            // 如果不可用，短暂等待(100ms)后继续检查退出标志
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        // 1. 互斥锁保护对共享数据的操作
+        {
+            std::unique_lock<std::mutex> lk(g_hbMgr.mtx);
+            // 翻转心跳位
+            PN_TOGGLE_BIT(*cam_status_ptr, HEARTBEAT_BIT);
+            pnio_indata_update(); 
+        }
+
+        // 2. 打印日志(示例)
+        std::cout << "[Heartbeat] status: 0x" 
+                  << std::hex << (int)(*cam_status_ptr) << std::dec << std::endl;
+
+        // 3. 等待下一次心跳
+        //    使用 wait_for 而不是睡眠，这样可以被唤醒而快速退出
+        {
+            std::unique_lock<std::mutex> lk(g_hbMgr.mtx);
+            // 如果在等待期间endFlag变true了，就提前退出
+            // 注意：wait_for 返回 true 表示被唤醒时满足 g_hbMgr.endFlag==true
+            g_hbMgr.cv.wait_for(lk, g_hbMgr.interval, [](){
+                return g_hbMgr.endFlag.load();
+            });
+        }
+    }
+    g_hbMgr.running = false;
+}
+
+//------------------------
+// 对外接口：初始化
+//------------------------
+int profinet_init()
+{
+    // 启动线程
+    g_hbMgr.endFlag = false;
+    if (!g_hbMgr.running)
+    {
+        g_hbMgr.hbThread = std::thread(heartbeatThreadFunc);
+    }
+    return 0;
+}
+
+//------------------------
+// 对外接口：反初始化
+//------------------------
+int profinet_deinit()
+{
+    // 标记退出
+    g_hbMgr.endFlag = true;
+
+    // 唤醒可能正在等待的线程
+    {
+        std::lock_guard<std::mutex> lk(g_hbMgr.mtx);
+        g_hbMgr.cv.notify_all();
+    }
+
+    // 等待线程退出
+    if (g_hbMgr.hbThread.joinable())
+    {
+        g_hbMgr.hbThread.join();
+    }
+
+    return 0;
+}
+
+//-------------------------
+// 如果需要动态调节心跳间隔
+//-------------------------
+void setHeartbeatInterval(int ms)
+{
+    // 范围检查
+    if (ms < 50) ms = 50; 
+    {
+        std::lock_guard<std::mutex> lk(g_hbMgr.mtx);
+        g_hbMgr.interval = std::chrono::milliseconds(ms);
+        // 如果想让线程马上使用新间隔，可以notify一下
+        g_hbMgr.cv.notify_all();
+    }
+}
+
+//-------------------------
+// 示例：使能/禁用模块或心跳
+//-------------------------
+void setModuleEnable(bool enable)
+{
+    g_hbMgr.moduleEnable = enable;
+}
+
+void setHeartbeatEnable(bool enable)
+{
+    g_hbMgr.heartbeatEnable = enable;
+    if (enable)
+    {
+        std::lock_guard<std::mutex> lk(g_hbMgr.mtx);
+        g_hbMgr.cv.notify_all();
+    }
+}
