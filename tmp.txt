@@ -1,169 +1,161 @@
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <condition_variable>
-#include <chrono>
-#include <iostream>    // 示例中的打印
-#include <cstring>     // memset等
-#include <unistd.h>    // sleep
-#include <cstdint>     // uint8_t
+// plugin.cpp
+#include "ModuleLoader.h"
+#include "collectd.h"
 
-// 假设 extern C 接口，或你自己已有的函数
-extern "C" {
-    unsigned char* INDATA_SLOTS_ADDR(int slotIndex);
-    void pnio_indata_update();
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cstdarg>
+#include <cstdio>
+
+// 全局单例
+static ModuleLoader s_loader;
+
+// ———— 插件目录配置 ————
+void plugin_set_dir(const std::string &dir) {
+    s_loader.SetDir(dir);
 }
 
-//-----------------------
-// 工具宏: 翻转某个bit
-//-----------------------
-#ifndef PN_TOGGLE_BIT
-#define PN_TOGGLE_BIT(a, b) ((a) ^= (1U << (b)))
-#endif
-
-// 心跳位，比如放在bit0
-static constexpr unsigned HEARTBEAT_BIT = 0;
-
-// 示例：心跳管理类/结构
-struct HeartbeatManager
-{
-    // 配置项
-    bool moduleEnable{true};     // 模块使能
-    bool heartbeatEnable{true};  // 心跳使能
-    std::chrono::milliseconds interval{2000}; // 心跳间隔(ms)
-
-    // 线程控制
-    std::atomic<bool> endFlag{false};   // 结束标志
-    std::atomic<bool> running{false};   // 是否正在运行
-    std::thread       hbThread;         // 心跳线程
-
-    // 互斥锁 + 条件变量
-    std::mutex              mtx;
-    std::condition_variable cv;
-};
-
-static HeartbeatManager g_hbMgr;
-
-// 取第8槽位的数据 (示例)
-static unsigned char* getCameraStatusPtr()
-{
-    return INDATA_SLOTS_ADDR(8);
+// ———— 加载 / 卸载 / 查询 ————
+int plugin_load(const char *plugin, bool global) {
+    if (!plugin) return EINVAL;
+    return s_loader.Load(plugin, global);
 }
 
-//------------------------
-// 线程函数：心跳逻辑
-//------------------------
-static void heartbeatThreadFunc()
-{
-    // 给线程起个名字（若需要特定平台API可以再封装）
-    // thread_set_name("pn_hb_thread"); // 不同平台不一样，这里仅示例
+bool plugin_is_loaded(const char *plugin) {
+    if (!plugin) return false;
+    return s_loader.IsLoaded(plugin);
+}
 
-    // 获取相机状态的指针
-    unsigned char* cam_status_ptr = getCameraStatusPtr();
-
-    g_hbMgr.running = true;
-    while (!g_hbMgr.endFlag)
-    {
-        // 先判断使能
-        if (!g_hbMgr.moduleEnable || !g_hbMgr.heartbeatEnable)
-        {
-            // 如果不可用，短暂等待(100ms)后继续检查退出标志
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        // 1. 互斥锁保护对共享数据的操作
-        {
-            std::unique_lock<std::mutex> lk(g_hbMgr.mtx);
-            // 翻转心跳位
-            PN_TOGGLE_BIT(*cam_status_ptr, HEARTBEAT_BIT);
-            pnio_indata_update(); 
-        }
-
-        // 2. 打印日志(示例)
-        std::cout << "[Heartbeat] status: 0x" 
-                  << std::hex << (int)(*cam_status_ptr) << std::dec << std::endl;
-
-        // 3. 等待下一次心跳
-        //    使用 wait_for 而不是睡眠，这样可以被唤醒而快速退出
-        {
-            std::unique_lock<std::mutex> lk(g_hbMgr.mtx);
-            // 如果在等待期间endFlag变true了，就提前退出
-            // 注意：wait_for 返回 true 表示被唤醒时满足 g_hbMgr.endFlag==true
-            g_hbMgr.cv.wait_for(lk, g_hbMgr.interval, [](){
-                return g_hbMgr.endFlag.load();
-            });
+// ———— 初始化所有插件 ————
+int plugin_init_all() {
+    int status = 0;
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) {
+            if (mod->init() != 0) {
+                std::cerr << "[plugin] init failed: " << name << "\n";
+                status = -1;
+            }
         }
     }
-    g_hbMgr.running = false;
+    return status;
 }
 
-//------------------------
-// 对外接口：初始化
-//------------------------
-int profinet_init()
-{
-    // 启动线程
-    g_hbMgr.endFlag = false;
-    if (!g_hbMgr.running)
-    {
-        g_hbMgr.hbThread = std::thread(heartbeatThreadFunc);
+// ———— 一次性读（-T 模式） ————
+int plugin_read_all_once() {
+    int status = 0;
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) {
+            if (mod->read() != 0) {
+                std::cerr << "[plugin] read failed: " << name << "\n";
+                status = -1;
+            }
+        }
+    }
+    return status;
+}
+
+// ———— 常规读循环 ————
+void plugin_read_all() {
+    // 最简单：直接复用一次性读
+    plugin_read_all_once();
+}
+
+// ———— 值分发 ————
+int plugin_dispatch_values(const value_list_t *vl) {
+    if (!vl) return EINVAL;
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) {
+            mod->write();
+        }
     }
     return 0;
 }
 
-//------------------------
-// 对外接口：反初始化
-//------------------------
-int profinet_deinit()
-{
-    // 标记退出
-    g_hbMgr.endFlag = true;
-
-    // 唤醒可能正在等待的线程
-    {
-        std::lock_guard<std::mutex> lk(g_hbMgr.mtx);
-        g_hbMgr.cv.notify_all();
+// ———— Flush 分发 ————
+int plugin_flush(const char *plugin, cdtime_t timeout, const char *identifier) {
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        if (!plugin || name == plugin) {
+            auto mod = s_loader.GetUserModuleImpl(name);
+            if (mod) mod->flush();
+        }
     }
-
-    // 等待线程退出
-    if (g_hbMgr.hbThread.joinable())
-    {
-        g_hbMgr.hbThread.join();
-    }
-
     return 0;
 }
 
-//-------------------------
-// 如果需要动态调节心跳间隔
-//-------------------------
-void setHeartbeatInterval(int ms)
+// ———— Missing 分发 ————
+int plugin_dispatch_missing(const value_list_t *vl) {
+    if (!vl) return EINVAL;
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) mod->missing();
+    }
+    return 0;
+}
+
+// ———— Cache Event 分发 ————
+void plugin_dispatch_cache_event(enum cache_event_type_e type,
+                                 unsigned long mask,
+                                 const char *name,
+                                 const value_list_t *vl)
 {
-    // 范围检查
-    if (ms < 50) ms = 50; 
-    {
-        std::lock_guard<std::mutex> lk(g_hbMgr.mtx);
-        g_hbMgr.interval = std::chrono::milliseconds(ms);
-        // 如果想让线程马上使用新间隔，可以notify一下
-        g_hbMgr.cv.notify_all();
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &p : names) {
+        auto mod = s_loader.GetUserModuleImpl(p);
+        if (mod) mod->cache_event();
     }
 }
 
-//-------------------------
-// 示例：使能/禁用模块或心跳
-//-------------------------
-void setModuleEnable(bool enable)
-{
-    g_hbMgr.moduleEnable = enable;
+// ———— 通知分发 ————
+int plugin_dispatch_notification(const notification_t *notif) {
+    if (!notif) return EINVAL;
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) mod->notification();
+    }
+    return 0;
 }
 
-void setHeartbeatEnable(bool enable)
-{
-    g_hbMgr.heartbeatEnable = enable;
-    if (enable)
-    {
-        std::lock_guard<std::mutex> lk(g_hbMgr.mtx);
-        g_hbMgr.cv.notify_all();
+// ———— 关机 ————
+int plugin_shutdown_all() {
+    int status = 0;
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) {
+            if (mod->shutdown_module() != 0) {
+                std::cerr << "[plugin] shutdown failed: " << name << "\n";
+                status = -1;
+            }
+        }
+        // 顺便卸载
+        s_loader.Unload(name);
+    }
+    return status;
+}
+
+// ———— 日志 ————
+void plugin_log(int level, const char *format, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(buf, sizeof(buf), format, ap);
+    va_end(ap);
+
+    std::cerr << buf << "\n";
+
+    auto names = s_loader.GetLoadedPluginNames();
+    for (auto &name : names) {
+        auto mod = s_loader.GetUserModuleImpl(name);
+        if (mod) mod->logmsg();
     }
 }
