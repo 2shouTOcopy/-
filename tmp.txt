@@ -1,161 +1,128 @@
-// plugin.cpp
-#include "ModuleLoader.h"
-#include "collectd.h"
-
+#include "PluginService.h"
 #include <iostream>
-#include <vector>
-#include <string>
 #include <cstdarg>
-#include <cstdio>
 
-// 全局单例
-static ModuleLoader s_loader;
-
-// ———— 插件目录配置 ————
-void plugin_set_dir(const std::string &dir) {
-    s_loader.SetDir(dir);
+PluginService &PluginService::Instance() {
+  static PluginService inst;
+  return inst;
 }
 
-// ———— 加载 / 卸载 / 查询 ————
-int plugin_load(const char *plugin, bool global) {
-    if (!plugin) return EINVAL;
-    return s_loader.Load(plugin, global);
+void PluginService::setDirectory(const std::string &dir) {
+  ModuleLoader::Instance().SetDir(dir);
 }
 
-bool plugin_is_loaded(const char *plugin) {
-    if (!plugin) return false;
-    return s_loader.IsLoaded(plugin);
+int PluginService::load(const char *pluginName, bool global) {
+  if (!pluginName) return EINVAL;
+  return ModuleLoader::Instance().Load(pluginName, global);
 }
 
-// ———— 初始化所有插件 ————
-int plugin_init_all() {
-    int status = 0;
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) {
-            if (mod->init() != 0) {
-                std::cerr << "[plugin] init failed: " << name << "\n";
-                status = -1;
-            }
-        }
+bool PluginService::isLoaded(const char *pluginName) const {
+  if (!pluginName) return false;
+  return ModuleLoader::Instance().IsLoaded(pluginName);
+}
+
+int PluginService::initAll() {
+  int status = 0;
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod && mod->init() != 0) {
+      std::cerr << "[plugin] init failed: " << name << "\n";
+      status = -1;
     }
-    return status;
+  }
+  return status;
 }
 
-// ———— 一次性读（-T 模式） ————
-int plugin_read_all_once() {
-    int status = 0;
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) {
-            if (mod->read() != 0) {
-                std::cerr << "[plugin] read failed: " << name << "\n";
-                status = -1;
-            }
-        }
+int PluginService::readAllOnce() {
+  int status = 0;
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod && mod->read() != 0) {
+      std::cerr << "[plugin] read failed: " << name << "\n";
+      status = -1;
     }
-    return status;
+  }
+  return status;
 }
 
-// ———— 常规读循环 ————
-void plugin_read_all() {
-    // 最简单：直接复用一次性读
-    plugin_read_all_once();
+void PluginService::readAll() {
+  // 简单起见，这里直接调用一次性读；你可以改成多线程或定时调度
+  readAllOnce();
 }
 
-// ———— 值分发 ————
-int plugin_dispatch_values(const value_list_t *vl) {
-    if (!vl) return EINVAL;
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) {
-            mod->write();
-        }
+int PluginService::dispatchValues(const value_list_t *vl) {
+  if (!vl) return EINVAL;
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod) mod->write();
+  }
+  return 0;
+}
+
+int PluginService::flush(const char *pluginName,
+                         cdtime_t timeout,
+                         const char *ident) {
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    if (!pluginName || name == pluginName) {
+      auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+      if (mod) mod->flush();
     }
-    return 0;
+  }
+  return 0;
 }
 
-// ———— Flush 分发 ————
-int plugin_flush(const char *plugin, cdtime_t timeout, const char *identifier) {
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        if (!plugin || name == plugin) {
-            auto mod = s_loader.GetUserModuleImpl(name);
-            if (mod) mod->flush();
-        }
+int PluginService::dispatchMissing(const value_list_t *vl) {
+  if (!vl) return EINVAL;
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod) mod->missing();
+  }
+  return 0;
+}
+
+void PluginService::dispatchCacheEvent(enum cache_event_type_e type,
+                                       unsigned long mask,
+                                       const char *name,
+                                       const value_list_t *vl) {
+  for (auto &p : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(p);
+    if (mod) mod->cache_event();
+  }
+}
+
+int PluginService::dispatchNotification(const notification_t *notif) {
+  if (!notif) return EINVAL;
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod) mod->notification();
+  }
+  return 0;
+}
+
+int PluginService::shutdownAll() {
+  int status = 0;
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod && mod->shutdown_module() != 0) {
+      std::cerr << "[plugin] shutdown failed: " << name << "\n";
+      status = -1;
     }
-    return 0;
+    // 卸载模块
+    ModuleLoader::Instance().Unload(name);
+  }
+  return status;
 }
 
-// ———— Missing 分发 ————
-int plugin_dispatch_missing(const value_list_t *vl) {
-    if (!vl) return EINVAL;
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) mod->missing();
-    }
-    return 0;
-}
-
-// ———— Cache Event 分发 ————
-void plugin_dispatch_cache_event(enum cache_event_type_e type,
-                                 unsigned long mask,
-                                 const char *name,
-                                 const value_list_t *vl)
-{
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &p : names) {
-        auto mod = s_loader.GetUserModuleImpl(p);
-        if (mod) mod->cache_event();
-    }
-}
-
-// ———— 通知分发 ————
-int plugin_dispatch_notification(const notification_t *notif) {
-    if (!notif) return EINVAL;
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) mod->notification();
-    }
-    return 0;
-}
-
-// ———— 关机 ————
-int plugin_shutdown_all() {
-    int status = 0;
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) {
-            if (mod->shutdown_module() != 0) {
-                std::cerr << "[plugin] shutdown failed: " << name << "\n";
-                status = -1;
-            }
-        }
-        // 顺便卸载
-        s_loader.Unload(name);
-    }
-    return status;
-}
-
-// ———— 日志 ————
-void plugin_log(int level, const char *format, ...) {
-    char buf[1024];
-    va_list ap;
-    va_start(ap, format);
+void PluginService::log(int level, const char *format, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, format);
     vsnprintf(buf, sizeof(buf), format, ap);
-    va_end(ap);
+  va_end(ap);
+  std::cerr << buf << "\n";
 
-    std::cerr << buf << "\n";
-
-    auto names = s_loader.GetLoadedPluginNames();
-    for (auto &name : names) {
-        auto mod = s_loader.GetUserModuleImpl(name);
-        if (mod) mod->logmsg();
-    }
+  for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames()) {
+    auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+    if (mod) mod->logmsg();
+  }
 }
