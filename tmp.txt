@@ -1,152 +1,289 @@
-#include <deque>
-#include <memory> // For std::shared_ptr
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
-#include <thread>
-#include <cstring> // For std::strncpy, std::strlen if needed
-#include <cmath>   // For std::isnan / NAN
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // For strtok_r on some older systems if not default, generally good for POSIX extensions.
+                    // For modern POSIX (POSIX.1-2001 and later), strtok_r is standard.
+#endif
 
-// --- 假设的 PluginService 和 value_list_t (为了使示例可编译和运行) ---
-// 在您的项目中，这些应该是您实际的定义
-namespace PluginService {
-    // 假设的 value_list_t 定义
-    struct value_list_t {
-        // 您的 value_list_t 实际成员
-        // 例如:
-        double values[1]; // 假设它包含一个值
-        long long timestamp;
+#include <stdio.h>      // For fprintf, stderr, perror
+#include <stdlib.h>     // For NULL, exit (if ERROR macro uses it)
+#include <string.h>     // For strlen, strtok_r, strerror, strncpy, memcpy, strcat
+#include <sys/stat.h>   // For stat, lstat, mkdir, S_ISDIR, S_IRWXU, etc.
+#include <sys/types.h>  // For mode_t, dev_t (often included by sys/stat.h)
+#include <errno.h>      // For errno, ENOENT, EEXIST
+#include <limits.h>     // For PATH_MAX (POSIX: XSI extension)
+#include <unistd.h>     // For lstat, mkdir on POSIX systems (though sys/stat.h is also key for mkdir)
+#include <stddef.h>     // For size_t
 
-        value_list_t() : timestamp(0) { values[0] = 0.0; } // 默认构造
-    };
+// --- 辅助宏定义 ---
 
-    // 假设的 PluginService 定义
-    class Instance {
-    public:
-        static Instance& get() { // 通常用 get() 或 Instance()
-            static Instance inst;
-            return inst;
-        }
-        void write(const data_set_t* ds, const value_list_t* vl) {
-            // 这是一个模拟的实现
-            printf("PluginService::write called for ds.type: %s\n", ds->type);
-            if (ds->ds_num > 0 && ds->ds) {
-                const char* type_str = "UNKNOWN_TYPE";
-                if (ds->ds[0].type == DS_TYPE_DERIVE) type_str = "DERIVE";
-                else if (ds->ds[0].type == DS_TYPE_GAUGE) type_str = "GAUGE";
-                // ... 其他类型
+// 简易的 ERROR 宏，输出到 stderr
+// 您可以根据项目需求扩展它 (例如，添加时间戳、日志级别等)
+#define ERROR(format, ...) fprintf(stderr, "ERROR: " format "\n", ##__VA_ARGS__)
 
-                printf("  Data Source[0]: name='%s', type=%d (%s), min=%.1f, max=",
-                       ds->ds[0].name, ds->ds[0].type, type_str, ds->ds[0].min);
-                if (std::isnan(ds->ds[0].max)) {
-                    printf("U (NAN)\n");
-                } else {
-                    printf("%.1f\n", ds->ds[0].max);
-                }
-            }
-            if (vl) {
-                printf("  ValueList provided (e.g., vl->values[0] = %.2f, timestamp = %lld)\n", vl->values[0], vl->timestamp);
-            }
-             printf("--------------------------------------------------\n");
-        }
-    private:
-        Instance() = default;
-    };
-} // namespace PluginService
+// STRERRNO 宏，用于获取 errno 对应的错误字符串
+#define STRERRNO strerror(errno)
 
-// 假设 RstDispatcher 在一个命名空间内，或者是一个类
-// 这里为了简化，我直接定义 Impl
-namespace RstDispatcher { // 示例命名空间
+// --- 辅助函数实现 ---
 
-struct Impl
-{
-    std::deque<std::shared_ptr<PluginService::value_list_t>> queue;
-    std::mutex              mtx;
-    std::condition_variable cv;
-    std::atomic<bool>       exit{false};
-    std::thread             th;
+/**
+ * sstrncpy_custom: 一个更安全的 strncpy 版本，确保目标字符串始终以 null 结尾。
+ * 复制最多 n-1 个字符从 src 到 dest，并在 dest[n-1] 处放置 null 终止符，
+ * 或者如果 src 较短，则复制整个 src (包括其 null 终止符) 并用 null 填充 dest 直到 n 个字节。
+ * 如果 n 为 0，则不执行任何操作。
+ *
+ * 注意：原代码中 `sstrncpy` 的使用方式，结合 `len < sizeof(file_copy)` 的检查，
+ * 使得标准 `strncpy` 的行为已经足够安全且符合预期（会进行 null 填充）。
+ * 但为了通用性，这里提供一个总是确保在 `dest[n-1]` 位置有 null 的版本。
+ * 如果严格遵循 collectd 等项目的 sstrncpy, 它通常是 void 返回值。
+ */
+static void sstrncpy_custom(char *dest, const char *src, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    strncpy(dest, src, n);
+    dest[n - 1] = '\0'; // 强制 null 终止
+}
 
-    // 为 "cpu value:DERIVE:0:U" 这组静态元数据添加成员变量
-    data_set_t      m_static_cpu_ds;
-    data_source_t   m_static_cpu_data_sources[1]; // 因为 "cpu value:DERIVE:0:U" 只有一个数据源
+/**
+ * custom_strjoin: 将字符串数组中的元素用指定分隔符连接起来。
+ *
+ * @param dst           目标缓冲区。
+ * @param dst_size      目标缓冲区大小。
+ * @param fields        要连接的字符串数组。
+ * @param fields_count  要连接的字符串数量。
+ * @param separator     分隔符字符串。
+ * @return 0 表示成功，-1 表示失败 (例如，缓冲区不足)。
+ */
+static int custom_strjoin(char *dst, size_t dst_size,
+                         char * const fields[], size_t fields_count,
+                         const char *separator) {
+    if (dst == NULL || dst_size == 0) {
+        return -1;
+    }
+    // 初始化目标缓冲区为空字符串，以便 strcat 等函数可以安全使用
+    dst[0] = '\0';
 
-    Impl()
-    {
-        // --- 在构造函数中一次性初始化静态元数据 ---
-        // 1. 填充 m_static_cpu_ds.type
-        std::strncpy(m_static_cpu_ds.type, "cpu", DATA_MAX_NAME_LEN - 1);
-        m_static_cpu_ds.type[DATA_MAX_NAME_LEN - 1] = '\0'; // 保证空字符结尾
-
-        // 2. 设置 m_static_cpu_ds.ds_num
-        m_static_cpu_ds.ds_num = 1; // 对应 "value:DERIVE:0:U" 这一个数据源
-
-        // 3. 将 m_static_cpu_ds.ds 指向内部的成员数组 m_static_cpu_data_sources
-        // 这样就无需在堆上分配内存 (即不用 malloc/new)
-        m_static_cpu_ds.ds = m_static_cpu_data_sources;
-
-        // 4. 填充 m_static_cpu_data_sources 数组的元素
-        //    对应 "value:DERIVE:0:U"
-        //    m_static_cpu_data_sources[0] 是唯一的元素
-        std::strncpy(m_static_cpu_data_sources[0].name, "value", DATA_MAX_NAME_LEN - 1);
-        m_static_cpu_data_sources[0].name[DATA_MAX_NAME_LEN - 1] = '\0';
-
-        m_static_cpu_data_sources[0].type = DS_TYPE_DERIVE; // 使用枚举值
-
-        m_static_cpu_data_sources[0].min = 0.0;
-
-        // 'U' 通常表示未定义或无限制，使用 NAN (Not a Number)
-        // 需要 #include <cmath>
-        m_static_cpu_data_sources[0].max = NAN;
-        // --- 静态元数据初始化完毕 ---
-
-
-        th = std::thread([this]{
-            /* 若有 thread_set_name，可以在此调用 */
-            // 例如: pthread_setname_np(pthread_self(), "RstDispatchTh"); (需要相应头文件和平台支持)
-            while (!exit.load(std::memory_order_acquire))
-            {
-                std::shared_ptr<PluginService::value_list_t> vl_ptr; // 从队列中获取的共享指针
-                {
-                    std::unique_lock<std::mutex> lk(mtx);
-                    // 在等待时，检查退出标志或队列非空
-                    // memory_order_relaxed 对于 exit 在 predicate 中通常是安全的，因为lk的加锁解锁会提供必要的屏障
-                    cv.wait(lk, [this]{ return exit.load(std::memory_order_relaxed) || !queue.empty(); });
-
-                    // 再次检查退出条件，特别是在被唤醒后
-                    // memory_order_acquire 用于确保看到 exit 的最新值以及其他线程的相关修改
-                    if (exit.load(std::memory_order_acquire) && queue.empty()) {
-                        break; // 退出循环
-                    }
-                    if (queue.empty()) { // 如果是因为exit被唤醒但队列仍空，则不处理
-                        continue;
-                    }
-
-                    vl_ptr = std::move(queue.front());
-                    queue.pop_front();
-                }
-
-                /* todo: 过滤链钩子占位 */
-
-                /* 分发给所有 writer 插件 */
-                // 使用预先初始化好的 m_static_cpu_ds 成员
-                // vl_ptr->get() 如果 PluginService::Instance().write 需要原始指针
-                // 如果 PluginService::Instance().write 可以接受 const std::shared_ptr<value_list_t>&，则直接传递 vl_ptr
-                PluginService::Instance::get().write(&this->m_static_cpu_ds, vl_ptr.get());
-            }
-        });
+    if (fields_count == 0) {
+        return 0; // 没有要连接的字段
     }
 
-    ~Impl()
-    {
-        exit.store(true, std::memory_order_release); // 通知线程退出
-        cv.notify_all(); // 唤醒等待的线程
-        if (th.joinable())
-        {
-            th.join(); // 等待线程结束
-        }
-        // m_static_cpu_ds 和 m_static_cpu_data_sources 是类成员,
-        // 它们的内存在 Impl 对象销毁时自动回收，无需手动 free。
-    }
-};
+    size_t current_len = 0;
+    size_t separator_len = strlen(separator);
 
-} // namespace RstDispatcher
+    for (size_t k = 0; k < fields_count; ++k) {
+        if (fields[k] == NULL) { // 根据需要处理 NULL 字段，这里选择跳过
+            continue;
+        }
+        size_t field_len = strlen(fields[k]);
+
+        // 检查空间是否足够：当前长度 + 字段长度 + (如果需要分隔符 ? 分隔符长度 : 0) + null终止符
+        size_t needed_for_field = field_len;
+        size_t needed_for_separator = 0;
+
+        if (k < fields_count - 1) { // 如果不是最后一个字段，则需要分隔符
+            needed_for_separator = separator_len;
+        }
+
+        if (current_len + needed_for_field + needed_for_separator + 1 > dst_size) {
+            // 空间不足，可以选择截断或返回错误
+            // 为安全起见，确保已写入部分以null结尾并返回错误
+            dst[current_len] = '\0';
+            return -1;
+        }
+
+        // 复制字段
+        memcpy(dst + current_len, fields[k], field_len);
+        current_len += field_len;
+
+        // 如果不是最后一个字段，复制分隔符
+        if (needed_for_separator > 0) {
+            memcpy(dst + current_len, separator, separator_len);
+            current_len += separator_len;
+        }
+    }
+
+    dst[current_len] = '\0'; // 确保最终结果以 null 结尾
+    return 0;
+}
+
+
+// --- 您提供的 check_create_dir 函数 ---
+// (已将 sstrncpy 和 strjoin 替换为自定义版本)
+int check_create_dir(const char *file_orig) {
+  struct stat statbuf;
+
+  char file_copy[PATH_MAX];
+  char dir[PATH_MAX];
+  char *fields[16]; // 最多处理 15 个目录层级 + 文件名 (或16个目录层级)
+  int fields_num;
+  char *ptr;
+  char *saveptr;
+  int last_is_file = 1;
+  int path_is_absolute = 0;
+  size_t len;
+
+  /*
+   * Sanity checks first
+   */
+  if (file_orig == NULL)
+    return -1;
+
+  if ((len = strlen(file_orig)) < 1)
+    return -1;
+  else if (len >= sizeof(file_copy)) { // len 是 strlen 的结果，不包括 \0
+                                       // sizeof(file_copy) 包括 \0 的空间
+                                       // 所以如果 len == sizeof(file_copy)-1, 字符串正好填满(有\0)
+                                       // 如果 len >= sizeof(file_copy), 则太长，无法容纳\0
+    ERROR("check_create_dir: name (%s) is too long.", file_orig);
+    return -1;
+  }
+
+  /*
+   * If `file_orig' ends in a slash the last component is a directory,
+   * otherwise it's a file. Act accordingly..
+   */
+  if (file_orig[len - 1] == '/')
+    last_is_file = 0;
+  if (file_orig[0] == '/')
+    path_is_absolute = 1;
+
+  /*
+   * Create a copy for `strtok_r' to destroy
+   * 由于已检查 len < sizeof(file_copy)，标准的 strncpy 在这里是安全的，
+   * 它会复制包括 null 终止符在内的整个字符串，并用 null 填充剩余部分。
+   * 如果您想确保 sstrncpy_custom 的行为，也可以使用它。
+   */
+  // sstrncpy_custom(file_copy, file_orig, sizeof(file_copy));
+  // 实际上，因为 len < sizeof(file_copy)，strcpy 也是安全的：
+  strcpy(file_copy, file_orig);
+
+
+  /*
+   * Break into components. This will eat up several slashes in a row and
+   * remove leading and trailing slashes..
+   */
+  ptr = file_copy;
+  saveptr = NULL;
+  fields_num = 0;
+  while ((fields[fields_num] = strtok_r(ptr, "/", &saveptr)) != NULL) {
+    ptr = NULL; // strtok_r 的后续调用需要第一个参数为 NULL
+    fields_num++;
+
+    if (fields_num >= (sizeof(fields)/sizeof(fields[0]))) // 避免超出 fields 数组边界
+      break;
+  }
+
+  /*
+   * For each component, do..
+   */
+  for (int i = 0; i < (fields_num - last_is_file); i++) {
+    /*
+     * Do not create directories that start with a dot. This
+     * prevents `../../' attacks and other likely malicious
+     * behavior.
+     */
+    if (fields[i][0] == '.') {
+      ERROR("Cowardly refusing to create a directory that "
+              "begins with a `.' (dot): `%s'",
+              file_orig); // 打印原始路径以获取上下文
+      return -2;
+    }
+
+    /*
+     * Join the components together again to form the current path part.
+     * 例如，如果 file_orig 是 "/usr/local/bin", 且 i=0, dir="/usr"
+     * i=1, dir="/usr/local"
+     * i=2 (如果 last_is_file=0), dir="/usr/local/bin"
+     */
+    // dir[0] 的设置和 dir+path_is_absolute 的用法很巧妙：
+    // 1. 如果是绝对路径 (path_is_absolute = 1):
+    //    dir[0] = '/';
+    //    custom_strjoin 连接到 dir+1。结果： "/comp1/comp2"
+    // 2. 如果是相对路径 (path_is_absolute = 0):
+    //    dir[0] = '/'; (临时设置)
+    //    custom_strjoin 连接到 dir+0，会覆盖 dir[0]。结果： "comp1/comp2"
+    dir[0] = '/'; // 仅当 path_is_absolute=1 时，这个 '/' 才会保留。
+                  // 对于相对路径，它会被 custom_strjoin 的结果覆盖。
+    if (custom_strjoin(dir + path_is_absolute,
+                (size_t)(sizeof(dir) - path_is_absolute), fields,
+                (size_t)(i + 1), "/") < 0) {
+      ERROR("custom_strjoin failed: `%s', component #%i (%s)", file_orig, i, fields[i]);
+      return -1;
+    }
+
+    while (42) { // 这是一个无限循环，依赖内部的 break 来退出
+      // 尝试 stat 和 lstat 来检查路径状态
+      // 如果两者都失败，通常意味着路径不存在或者存在其他错误
+      struct stat current_statbuf; // 每次循环使用新的 statbuf，避免混淆
+      if ((stat(dir, &current_statbuf) == -1) && (lstat(dir, &current_statbuf) == -1)) {
+        // 既然 lstat 也失败了，errno 应该是由 lstat 设置的。
+        // 如果 dir 是一个指向不存在目标的悬空符号链接，stat 会失败 (ENOENT)，但 lstat 会成功。
+        // 所以这个条件 ((stat == -1) && (lstat == -1)) 主要捕获“确实不存在”或权限问题。
+        if (errno == ENOENT) { // 路径组件不存在
+          if (mkdir(dir, S_IRWXU | S_IRWXG | S_IRWXO) == 0) // 尝试创建目录
+            break; // 创建成功，跳出 while(42)
+
+          // mkdir 可能因为其他线程同时创建了目录而失败 (EEXIST)
+          if (EEXIST == errno)
+            continue; // 重新执行 while(42) 循环，再次 stat 检查
+
+          ERROR("check_create_dir: mkdir (%s): %s", dir, STRERRNO);
+          return -1; // mkdir 因其他原因失败
+        } else { // stat/lstat 因 ENOENT 以外的原因失败 (例如，权限不足去访问父目录)
+          ERROR("check_create_dir: stat/lstat (%s): %s", dir, STRERRNO);
+          return -1;
+        }
+      } else if (!S_ISDIR(current_statbuf.st_mode)) { // 路径存在，但不是目录
+        // 注意: 如果 stat() 成功，current_statbuf 来自 stat()。
+        // 如果 stat() 失败但 lstat() 成功 (例如悬空链接), current_statbuf 来自 lstat()。
+        // 对于悬空链接，S_ISDIR 会是 false。
+        ERROR("check_create_dir: `%s' exists but is not "
+                "a directory!",
+                dir);
+        return -1;
+      }
+      // 如果路径存在且是目录，则一切正常
+      break; // 跳出 while(42)
+    } // end while(42)
+  } // end for loop
+
+  return 0;
+} /* check_create_dir */
+
+
+// --- 主函数示例 (用于测试) ---
+/*
+int main() {
+    // 测试用例
+    const char *paths_to_test[] = {
+        "testdir1/subdir/file.txt",          // 相对路径，创建 testdir1/subdir
+        "/tmp/abs_test/nextlevel/another",   // 绝对路径，创建 /tmp/abs_test/nextlevel
+        "existing_dir_test/",                // 路径以 / 结尾，创建 existing_dir_test
+        "/tmp/./dot_test_fail/some_path",    // 包含 . 目录，应该失败
+        "../../relative_dot_fail/path",    // 包含 .. 目录 (如果 strtok_r 保留它们)
+        "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q_toolong", // 测试 fields 数组限制
+        NULL,                                // NULL 测试
+        "",                                  // 空字符串测试
+        "nodirfile.txt"                      // 只创建文件所在的目录 (即不创建任何新目录)
+    };
+    int num_paths = sizeof(paths_to_test) / sizeof(paths_to_test[0]);
+
+    // 创建一个已存在的目录，用于测试 "nodirfile.txt" 和 "existing_dir_test/"
+    mkdir("testdir1", S_IRWXU | S_IRWXG | S_IRWXO); // 可能已存在，忽略错误
+    mkdir("existing_dir_test", S_IRWXU | S_IRWXG | S_IRWXO); // 可能已存在
+
+    for (int i = 0; i < num_paths; ++i) {
+        printf("Testing path: %s\n", paths_to_test[i] ? paths_to_test[i] : "(null)");
+        int result = check_create_dir(paths_to_test[i]);
+        printf("Result: %d\n", result);
+        if (result == 0) {
+            printf("  Successfully checked/created directories for: %s\n", paths_to_test[i]);
+        } else {
+            printf("  Failed for: %s (error code: %d)\n", paths_to_test[i], result);
+        }
+        printf("-------------------------------------\n");
+    }
+    printf("To verify, check for directories like 'testdir1/subdir' and '/tmp/abs_test/nextlevel'\n");
+    printf("Remember to clean up /tmp/abs_test manually if created.\n");
+    return 0;
+}
+*/
