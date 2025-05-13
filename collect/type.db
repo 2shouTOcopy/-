@@ -1,0 +1,25 @@
+clock_state             value:GAUGE:0:U
+clock_stratum           value:GAUGE:0:U
+compression             uncompressed:DERIVE:0:U, compressed:DERIVE:0:U
+compression_ratio       value:GAUGE:0:2
+commands                value:DERIVE:0:U
+connections             value:DERIVE:0:U
+conntrack               value:GAUGE:0:4294967295
+contextswitch           value:DERIVE:0:U
+controller              value:GAUGE:0:18446744073709551615
+cookies                 value:DERIVE:0:U
+count                   value:GAUGE:0:U
+counter                 value:COUNTER:U:U
+cpu                     value:DERIVE:0:U
+cpu_affinity            value:GAUGE:0:1
+cpufreq                 value:GAUGE:0:U
+current                 value:GAUGE:U:U
+current_connections     value:GAUGE:0:U
+current_sessions        value:GAUGE:0:U
+delay                   value:GAUGE:-1000000:1000000
+delay_rate              value:GAUGE:0:U
+derive                  value:DERIVE:0:U
+df                      used:GAUGE:0:1125899906842623, free:GAUGE:0:1125899906842623
+df_complex              value:GAUGE:0:U
+df_inodes               value:GAUGE:0:U
+dilution_of_precision   value:GAUGE:0:U
