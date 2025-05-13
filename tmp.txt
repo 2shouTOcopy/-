@@ -1,289 +1,433 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE // For strtok_r on some older systems if not default, generally good for POSIX extensions.
-                    // For modern POSIX (POSIX.1-2001 and later), strtok_r is standard.
-#endif
+// Forward declaration or include for ModuleLoader and CAbstractUserModule
+// Assuming ModuleLoader.h might contain something like:
+// class ModuleLoader {
+// public:
+// static ModuleLoader& Instance();
+// CAbstractUserModule* GetUserModuleImpl(const std::string& name);
+// std::vector<std::string> GetLoadedPluginNames(); // Used in PluginService
+// // ... other methods to load/unload modules
+// };
+//
+// And CAbstractUserModule.h
+// class CAbstractUserModule {
+// public:
+//     virtual ~CAbstractUserModule() {}
+//     virtual int config(const std::string &key, const std::string &val) { return 0; }
+//     virtual int read() { return 0; } // Added based on PluginService::readAllOnce
+// };
 
-#include <stdio.h>      // For fprintf, stderr, perror
-#include <stdlib.h>     // For NULL, exit (if ERROR macro uses it)
-#include <string.h>     // For strlen, strtok_r, strerror, strncpy, memcpy, strcat
-#include <sys/stat.h>   // For stat, lstat, mkdir, S_ISDIR, S_IRWXU, etc.
-#include <sys/types.h>  // For mode_t, dev_t (often included by sys/stat.h)
-#include <errno.h>      // For errno, ENOENT, EEXIST
-#include <limits.h>     // For PATH_MAX (POSIX: XSI extension)
-#include <unistd.h>     // For lstat, mkdir on POSIX systems (though sys/stat.h is also key for mkdir)
-#include <stddef.h>     // For size_t
+// --- Your existing code with the completed DispatchBlockPlugin ---
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory> // For std::unique_ptr if ConfigParser returns it
 
-// --- 辅助宏定义 ---
-
-// 简易的 ERROR 宏，输出到 stderr
-// 您可以根据项目需求扩展它 (例如，添加时间戳、日志级别等)
-#define ERROR(format, ...) fprintf(stderr, "ERROR: " format "\n", ##__VA_ARGS__)
-
-// STRERRNO 宏，用于获取 errno 对应的错误字符串
-#define STRERRNO strerror(errno)
-
-// --- 辅助函数实现 ---
-
-/**
- * sstrncpy_custom: 一个更安全的 strncpy 版本，确保目标字符串始终以 null 结尾。
- * 复制最多 n-1 个字符从 src 到 dest，并在 dest[n-1] 处放置 null 终止符，
- * 或者如果 src 较短，则复制整个 src (包括其 null 终止符) 并用 null 填充 dest 直到 n 个字节。
- * 如果 n 为 0，则不执行任何操作。
- *
- * 注意：原代码中 `sstrncpy` 的使用方式，结合 `len < sizeof(file_copy)` 的检查，
- * 使得标准 `strncpy` 的行为已经足够安全且符合预期（会进行 null 填充）。
- * 但为了通用性，这里提供一个总是确保在 `dest[n-1]` 位置有 null 的版本。
- * 如果严格遵循 collectd 等项目的 sstrncpy, 它通常是 void 返回值。
- */
-static void sstrncpy_custom(char *dest, const char *src, size_t n) {
-    if (n == 0) {
-        return;
+// --- Dummy/Placeholder implementations for missing parts to make it compilable ---
+// This would typically come from your actual parsing library and module loader
+// For CAbstractUserModule (already provided by you)
+class CAbstractUserModule
+{
+public:
+    virtual ~CAbstractUserModule() {}
+    virtual int config(const std::string &key, const std::string &val) {
+        std::cout << "  [CAbstractUserModule Default] Config called for key: " << key << ", val: " << val << ". Doing nothing." << std::endl;
+        return 0;
     }
-    strncpy(dest, src, n);
-    dest[n - 1] = '\0'; // 强制 null 终止
-}
+    virtual int read() { return 0; } // From PluginService
+};
 
-/**
- * custom_strjoin: 将字符串数组中的元素用指定分隔符连接起来。
- *
- * @param dst           目标缓冲区。
- * @param dst_size      目标缓冲区大小。
- * @param fields        要连接的字符串数组。
- * @param fields_count  要连接的字符串数量。
- * @param separator     分隔符字符串。
- * @return 0 表示成功，-1 表示失败 (例如，缓冲区不足)。
- */
-static int custom_strjoin(char *dst, size_t dst_size,
-                         char * const fields[], size_t fields_count,
-                         const char *separator) {
-    if (dst == NULL || dst_size == 0) {
+// OConfigItem struct (as defined above or matching your parser's output)
+struct OConfigItem {
+    std::string key;
+    std::vector<std::string> values;
+    std::vector<OConfigItem*> children;
+
+    ~OConfigItem() {
+        for (auto child : children) {
+            delete child;
+        }
+        children.clear();
+    }
+};
+
+// Dummy ModuleLoader
+#include <map>
+class ModuleLoader {
+private:
+    std::map<std::string, std::unique_ptr<CAbstractUserModule>> modules_;
+    std::vector<std::string> loaded_plugin_names_; // To match GetLoadedPluginNames
+
+    // Example: A concrete CPU plugin
+    class CpuPlugin : public CAbstractUserModule {
+    public:
+        int config(const std::string &key, const std::string &val) override {
+            std::cout << "  [CpuPlugin] Configuring: " << key << " = " << val << std::endl;
+            if (key == "ReportByCpu") {
+                // reportByCpu_ = (val == "true" || val == "1");
+            } else if (key == "ReportByState") {
+                // reportByState_ = (val == "true" || val == "1");
+            } // ... and so on
+            else {
+                std::cerr << "  [CpuPlugin] Unknown config key: " << key << std::endl;
+                // return -1; // Optionally return error for unknown keys
+            }
+            return 0;
+        }
+        // bool reportByCpu_ = false;
+        // bool reportByState_ = false;
+    };
+     // Example: A concrete CSV plugin
+    class CsvPlugin : public CAbstractUserModule {
+    public:
+        int config(const std::string &key, const std::string &val) override {
+            std::cout << "  [CsvPlugin] Configuring: " << key << " = " << val << std::endl;
+            if (key == "DataDir") {
+                // dataDir_ = val;
+            } else if (key == "StoreRates") {
+                // storeRates_ = (val == "true" || val == "1");
+            } else {
+                std::cerr << "  [CsvPlugin] Unknown config key: " << key << std::endl;
+            }
+            return 0;
+        }
+        // std::string dataDir_;
+        // bool storeRates_ = false;
+    };
+
+
+public:
+    static ModuleLoader& Instance() {
+        static ModuleLoader instance;
+        return instance;
+    }
+
+    // Simulate loading a plugin
+    void LoadPluginForDemo(const std::string& name) {
+        if (modules_.find(name) == modules_.end()) {
+            if (name == "cpu") {
+                modules_[name] = std::make_unique<CpuPlugin>();
+                loaded_plugin_names_.push_back(name);
+                std::cout << "[ModuleLoader] Demo: Loaded CPU plugin." << std::endl;
+            } else if (name == "csv") {
+                modules_[name] = std::make_unique<CsvPlugin>();
+                loaded_plugin_names_.push_back(name);
+                 std::cout << "[ModuleLoader] Demo: Loaded CSV plugin." << std::endl;
+            } else {
+                // For demo, just use a generic one if not specialized
+                // modules_[name] = std::make_unique<CAbstractUserModule>();
+                // loaded_plugin_names_.push_back(name);
+                std::cout << "[ModuleLoader] Demo: No specific module for " << name << ", config will go to default." << std::endl;
+            }
+        }
+    }
+
+    CAbstractUserModule* GetUserModuleImpl(const std::string& name) {
+        auto it = modules_.find(name);
+        if (it != modules_.end()) {
+            return it->second.get();
+        }
+        return nullptr;
+    }
+
+    const std::vector<std::string>& GetLoadedPluginNames() const {
+        return loaded_plugin_names_;
+    }
+};
+
+
+// Dummy ConfigParser
+class ConfigParser {
+public:
+    static std::unique_ptr<ConfigParser> create() {
+        return std::make_unique<ConfigParser>();
+    }
+    // This is a very simplified mock parser for the example config
+    OConfigItem* parseFile(const char* filename) {
+        std::cout << "[ConfigParser] Mock parsing file: " << filename << std::endl;
+        if (!filename || std::string(filename).empty()) return nullptr;
+
+        OConfigItem* root = new OConfigItem();
+        root->key = "root";
+
+        // FQDNLookup false
+        OConfigItem* fqdn = new OConfigItem();
+        fqdn->key = "FQDNLookup";
+        fqdn->values.push_back("false");
+        root->children.push_back(fqdn);
+
+        // LoadPlugin cpu
+        OConfigItem* lp_cpu = new OConfigItem();
+        lp_cpu->key = "LoadPlugin";
+        lp_cpu->values.push_back("cpu");
+        root->children.push_back(lp_cpu);
+
+        // LoadPlugin csv
+        OConfigItem* lp_csv = new OConfigItem();
+        lp_csv->key = "LoadPlugin";
+        lp_csv->values.push_back("csv");
+        root->children.push_back(lp_csv);
+        
+        // <Plugin cpu>
+        OConfigItem* plugin_cpu_block = new OConfigItem();
+        plugin_cpu_block->key = "Plugin";
+        plugin_cpu_block->values.push_back("cpu"); // "cpu" is the value for "Plugin" key
+            OConfigItem* cpu_opt1 = new OConfigItem();
+            cpu_opt1->key = "ReportByCpu";
+            cpu_opt1->values.push_back("true");
+            plugin_cpu_block->children.push_back(cpu_opt1);
+            OConfigItem* cpu_opt2 = new OConfigItem();
+            cpu_opt2->key = "ReportByState";
+            cpu_opt2->values.push_back("true");
+            plugin_cpu_block->children.push_back(cpu_opt2);
+            // Add other cpu options if needed for full demo
+        root->children.push_back(plugin_cpu_block);
+
+        // <Plugin csv>
+        OConfigItem* plugin_csv_block = new OConfigItem();
+        plugin_csv_block->key = "Plugin";
+        plugin_csv_block->values.push_back("csv"); // "csv" is the value for "Plugin" key
+            OConfigItem* csv_opt1 = new OConfigItem();
+            csv_opt1->key = "DataDir";
+            csv_opt1->values.push_back("/mnt/data/collect/csv");
+            plugin_csv_block->children.push_back(csv_opt1);
+            OConfigItem* csv_opt2 = new OConfigItem();
+            csv_opt2->key = "StoreRates";
+            csv_opt2->values.push_back("false");
+            plugin_csv_block->children.push_back(csv_opt2);
+        root->children.push_back(plugin_csv_block);
+
+        return root;
+    }
+};
+
+// ConfigManager class definition
+class ConfigManager {
+public:
+    // Forward declarations of dispatch methods used by Read and DispatchBlock
+    int DispatchLoadPlugin(OConfigItem& ci);
+    int FcConfigure(OConfigItem& ci); // Assuming this is for "Chain"
+    int DispatchValue(OConfigItem& ci);
+
+    int DispatchBlockPlugin(OConfigItem& ci);
+    int DispatchBlock(OConfigItem& ci);
+    int Read(const char* filename);
+};
+
+// --- Implementation of ConfigManager methods ---
+
+// Completed DispatchBlockPlugin
+int ConfigManager::DispatchBlockPlugin(OConfigItem& ci)
+{
+    // ci.key should be "Plugin"
+    // ci.values should contain the plugin name, e.g., "cpu" or "csv"
+    if (ci.values.empty()) {
+        std::cerr << "[dispatch_block_plugin] Error: Plugin block <" << ci.key << "> is missing plugin name." << std::endl;
         return -1;
     }
-    // 初始化目标缓冲区为空字符串，以便 strcat 等函数可以安全使用
-    dst[0] = '\0';
+    const std::string& plugin_name = ci.values[0];
 
-    if (fields_count == 0) {
-        return 0; // 没有要连接的字段
+    std::cout << "[dispatch_block_plugin] Configuring plugin block for: " << plugin_name << std::endl;
+
+    // Get the plugin instance from the ModuleLoader
+    CAbstractUserModule* plugin_module = ModuleLoader::Instance().GetUserModuleImpl(plugin_name);
+
+    if (!plugin_module) {
+        std::cerr << "[dispatch_block_plugin] Error: Plugin '" << plugin_name << "' not loaded or module not found. Cannot configure." << std::endl;
+        // Depending on strictness, you might return -1 or just warn and continue
+        // If plugins are configured before they are "fully" loaded by another mechanism,
+        // this might just be a warning. But typically, LoadPlugin should ensure it's available.
+        return -1;
     }
 
-    size_t current_len = 0;
-    size_t separator_len = strlen(separator);
-
-    for (size_t k = 0; k < fields_count; ++k) {
-        if (fields[k] == NULL) { // 根据需要处理 NULL 字段，这里选择跳过
+    int ret = 0;
+    for (auto& child_config_item : ci.children) // child_config_item is OConfigItem*
+    {
+        if (!child_config_item) {
+            std::cerr << "[dispatch_block_plugin] Warning: Encountered null child config item for plugin '" << plugin_name << "'. Skipping." << std::endl;
             continue;
         }
-        size_t field_len = strlen(fields[k]);
 
-        // 检查空间是否足够：当前长度 + 字段长度 + (如果需要分隔符 ? 分隔符长度 : 0) + null终止符
-        size_t needed_for_field = field_len;
-        size_t needed_for_separator = 0;
+        const std::string& config_key = child_config_item->key;
+        std::string config_value;
 
-        if (k < fields_count - 1) { // 如果不是最后一个字段，则需要分隔符
-            needed_for_separator = separator_len;
-        }
-
-        if (current_len + needed_for_field + needed_for_separator + 1 > dst_size) {
-            // 空间不足，可以选择截断或返回错误
-            // 为安全起见，确保已写入部分以null结尾并返回错误
-            dst[current_len] = '\0';
-            return -1;
-        }
-
-        // 复制字段
-        memcpy(dst + current_len, fields[k], field_len);
-        current_len += field_len;
-
-        // 如果不是最后一个字段，复制分隔符
-        if (needed_for_separator > 0) {
-            memcpy(dst + current_len, separator, separator_len);
-            current_len += separator_len;
-        }
-    }
-
-    dst[current_len] = '\0'; // 确保最终结果以 null 结尾
-    return 0;
-}
-
-
-// --- 您提供的 check_create_dir 函数 ---
-// (已将 sstrncpy 和 strjoin 替换为自定义版本)
-int check_create_dir(const char *file_orig) {
-  struct stat statbuf;
-
-  char file_copy[PATH_MAX];
-  char dir[PATH_MAX];
-  char *fields[16]; // 最多处理 15 个目录层级 + 文件名 (或16个目录层级)
-  int fields_num;
-  char *ptr;
-  char *saveptr;
-  int last_is_file = 1;
-  int path_is_absolute = 0;
-  size_t len;
-
-  /*
-   * Sanity checks first
-   */
-  if (file_orig == NULL)
-    return -1;
-
-  if ((len = strlen(file_orig)) < 1)
-    return -1;
-  else if (len >= sizeof(file_copy)) { // len 是 strlen 的结果，不包括 \0
-                                       // sizeof(file_copy) 包括 \0 的空间
-                                       // 所以如果 len == sizeof(file_copy)-1, 字符串正好填满(有\0)
-                                       // 如果 len >= sizeof(file_copy), 则太长，无法容纳\0
-    ERROR("check_create_dir: name (%s) is too long.", file_orig);
-    return -1;
-  }
-
-  /*
-   * If `file_orig' ends in a slash the last component is a directory,
-   * otherwise it's a file. Act accordingly..
-   */
-  if (file_orig[len - 1] == '/')
-    last_is_file = 0;
-  if (file_orig[0] == '/')
-    path_is_absolute = 1;
-
-  /*
-   * Create a copy for `strtok_r' to destroy
-   * 由于已检查 len < sizeof(file_copy)，标准的 strncpy 在这里是安全的，
-   * 它会复制包括 null 终止符在内的整个字符串，并用 null 填充剩余部分。
-   * 如果您想确保 sstrncpy_custom 的行为，也可以使用它。
-   */
-  // sstrncpy_custom(file_copy, file_orig, sizeof(file_copy));
-  // 实际上，因为 len < sizeof(file_copy)，strcpy 也是安全的：
-  strcpy(file_copy, file_orig);
-
-
-  /*
-   * Break into components. This will eat up several slashes in a row and
-   * remove leading and trailing slashes..
-   */
-  ptr = file_copy;
-  saveptr = NULL;
-  fields_num = 0;
-  while ((fields[fields_num] = strtok_r(ptr, "/", &saveptr)) != NULL) {
-    ptr = NULL; // strtok_r 的后续调用需要第一个参数为 NULL
-    fields_num++;
-
-    if (fields_num >= (sizeof(fields)/sizeof(fields[0]))) // 避免超出 fields 数组边界
-      break;
-  }
-
-  /*
-   * For each component, do..
-   */
-  for (int i = 0; i < (fields_num - last_is_file); i++) {
-    /*
-     * Do not create directories that start with a dot. This
-     * prevents `../../' attacks and other likely malicious
-     * behavior.
-     */
-    if (fields[i][0] == '.') {
-      ERROR("Cowardly refusing to create a directory that "
-              "begins with a `.' (dot): `%s'",
-              file_orig); // 打印原始路径以获取上下文
-      return -2;
-    }
-
-    /*
-     * Join the components together again to form the current path part.
-     * 例如，如果 file_orig 是 "/usr/local/bin", 且 i=0, dir="/usr"
-     * i=1, dir="/usr/local"
-     * i=2 (如果 last_is_file=0), dir="/usr/local/bin"
-     */
-    // dir[0] 的设置和 dir+path_is_absolute 的用法很巧妙：
-    // 1. 如果是绝对路径 (path_is_absolute = 1):
-    //    dir[0] = '/';
-    //    custom_strjoin 连接到 dir+1。结果： "/comp1/comp2"
-    // 2. 如果是相对路径 (path_is_absolute = 0):
-    //    dir[0] = '/'; (临时设置)
-    //    custom_strjoin 连接到 dir+0，会覆盖 dir[0]。结果： "comp1/comp2"
-    dir[0] = '/'; // 仅当 path_is_absolute=1 时，这个 '/' 才会保留。
-                  // 对于相对路径，它会被 custom_strjoin 的结果覆盖。
-    if (custom_strjoin(dir + path_is_absolute,
-                (size_t)(sizeof(dir) - path_is_absolute), fields,
-                (size_t)(i + 1), "/") < 0) {
-      ERROR("custom_strjoin failed: `%s', component #%i (%s)", file_orig, i, fields[i]);
-      return -1;
-    }
-
-    while (42) { // 这是一个无限循环，依赖内部的 break 来退出
-      // 尝试 stat 和 lstat 来检查路径状态
-      // 如果两者都失败，通常意味着路径不存在或者存在其他错误
-      struct stat current_statbuf; // 每次循环使用新的 statbuf，避免混淆
-      if ((stat(dir, &current_statbuf) == -1) && (lstat(dir, &current_statbuf) == -1)) {
-        // 既然 lstat 也失败了，errno 应该是由 lstat 设置的。
-        // 如果 dir 是一个指向不存在目标的悬空符号链接，stat 会失败 (ENOENT)，但 lstat 会成功。
-        // 所以这个条件 ((stat == -1) && (lstat == -1)) 主要捕获“确实不存在”或权限问题。
-        if (errno == ENOENT) { // 路径组件不存在
-          if (mkdir(dir, S_IRWXU | S_IRWXG | S_IRWXO) == 0) // 尝试创建目录
-            break; // 创建成功，跳出 while(42)
-
-          // mkdir 可能因为其他线程同时创建了目录而失败 (EEXIST)
-          if (EEXIST == errno)
-            continue; // 重新执行 while(42) 循环，再次 stat 检查
-
-          ERROR("check_create_dir: mkdir (%s): %s", dir, STRERRNO);
-          return -1; // mkdir 因其他原因失败
-        } else { // stat/lstat 因 ENOENT 以外的原因失败 (例如，权限不足去访问父目录)
-          ERROR("check_create_dir: stat/lstat (%s): %s", dir, STRERRNO);
-          return -1;
-        }
-      } else if (!S_ISDIR(current_statbuf.st_mode)) { // 路径存在，但不是目录
-        // 注意: 如果 stat() 成功，current_statbuf 来自 stat()。
-        // 如果 stat() 失败但 lstat() 成功 (例如悬空链接), current_statbuf 来自 lstat()。
-        // 对于悬空链接，S_ISDIR 会是 false。
-        ERROR("check_create_dir: `%s' exists but is not "
-                "a directory!",
-                dir);
-        return -1;
-      }
-      // 如果路径存在且是目录，则一切正常
-      break; // 跳出 while(42)
-    } // end while(42)
-  } // end for loop
-
-  return 0;
-} /* check_create_dir */
-
-
-// --- 主函数示例 (用于测试) ---
-/*
-int main() {
-    // 测试用例
-    const char *paths_to_test[] = {
-        "testdir1/subdir/file.txt",          // 相对路径，创建 testdir1/subdir
-        "/tmp/abs_test/nextlevel/another",   // 绝对路径，创建 /tmp/abs_test/nextlevel
-        "existing_dir_test/",                // 路径以 / 结尾，创建 existing_dir_test
-        "/tmp/./dot_test_fail/some_path",    // 包含 . 目录，应该失败
-        "../../relative_dot_fail/path",    // 包含 .. 目录 (如果 strtok_r 保留它们)
-        "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q_toolong", // 测试 fields 数组限制
-        NULL,                                // NULL 测试
-        "",                                  // 空字符串测试
-        "nodirfile.txt"                      // 只创建文件所在的目录 (即不创建任何新目录)
-    };
-    int num_paths = sizeof(paths_to_test) / sizeof(paths_to_test[0]);
-
-    // 创建一个已存在的目录，用于测试 "nodirfile.txt" 和 "existing_dir_test/"
-    mkdir("testdir1", S_IRWXU | S_IRWXG | S_IRWXO); // 可能已存在，忽略错误
-    mkdir("existing_dir_test", S_IRWXU | S_IRWXG | S_IRWXO); // 可能已存在
-
-    for (int i = 0; i < num_paths; ++i) {
-        printf("Testing path: %s\n", paths_to_test[i] ? paths_to_test[i] : "(null)");
-        int result = check_create_dir(paths_to_test[i]);
-        printf("Result: %d\n", result);
-        if (result == 0) {
-            printf("  Successfully checked/created directories for: %s\n", paths_to_test[i]);
+        if (child_config_item->values.empty()) {
+            // This could be a boolean key present without a value, e.g. "EnableFeature"
+            // Or it could be an error. CollectD often treats valueless keys as booleans set to true.
+            // For now, let's assume values are required as per CAbstractUserModule::config
+            std::cerr << "[dispatch_block_plugin] Warning: Config key '" << config_key
+                      << "' for plugin '" << plugin_name << "' has no value. Skipping." << std::endl;
+            // Or, if you want to treat valueless keys as "true":
+            // config_value = "true";
+            // Or if it's an error:
+            // ret = -1; continue;
+            continue;
         } else {
-            printf("  Failed for: %s (error code: %d)\n", paths_to_test[i], result);
+            // Taking the first value. If a key can have multiple values, this needs more logic.
+            config_value = child_config_item->values[0];
         }
-        printf("-------------------------------------\n");
+
+        std::cout << "   Dispatching to plugin '" << plugin_name << "': Key='" << config_key
+                  << "', Value='" << config_value << "'" << std::endl;
+
+        if (plugin_module->config(config_key, config_value) != 0) {
+            std::cerr << "[dispatch_block_plugin] Error: Plugin '" << plugin_name
+                      << "' failed to configure option: " << config_key << " = " << config_value << std::endl;
+            ret = -1; // Propagate error: if one config fails, the block dispatch fails
+        }
     }
-    printf("To verify, check for directories like 'testdir1/subdir' and '/tmp/abs_test/nextlevel'\n");
-    printf("Remember to clean up /tmp/abs_test manually if created.\n");
+    return ret;
+}
+
+int ConfigManager::DispatchBlock(OConfigItem& ci)
+{
+    const std::string& key = ci.key;
+    std::cout << "[DispatchBlock] Processing block type: " << key;
+    if (!ci.values.empty()) {
+        std::cout << " with name/value: " << ci.values[0];
+    }
+    std::cout << std::endl;
+
+    if (key == "LoadPlugin") return DispatchLoadPlugin(ci);
+    if (key == "Plugin") return DispatchBlockPlugin(ci); // This is what we just implemented
+    if (key == "Chain") return FcConfigure(ci);
+
+    std::cerr << "[DispatchBlock] Warning: Unknown block type '" << key << "'. Ignoring." << std::endl;
+    return 0; // Or -1 if unknown blocks are errors
+}
+
+int ConfigManager::Read(const char* filename)
+{
+    if (!filename)
+    {
+        std::cerr << "Invalid filename\n";
+        return -1;
+    }
+
+    auto parser = ConfigParser::create(); // Using smart pointer
+    std::unique_ptr<OConfigItem> root_ptr(parser->parseFile(filename)); // Manage OConfigItem lifetime
+
+    if (root_ptr == nullptr)
+    {
+        std::cerr << "Parse failed: " << filename << "\n";
+        return -1;
+    }
+
+    if (root_ptr->children.empty())
+    {
+        std::cerr << "Empty config file (or root has no children)\n";
+        return -1; // Or 0 if an empty config is not an error
+    }
+
+    int ret = 0;
+    for (auto& child : root_ptr->children) // child is OConfigItem*
+    {
+        if (!child) continue; // Safety check
+
+        if (child->children.empty()) // It's a simple key-value pair like "FQDNLookup false" or "LoadPlugin cpu"
+        {
+            // Note: "LoadPlugin" is often treated as a block-like directive even if syntactically simple.
+            // The original code dispatched LoadPlugin via DispatchBlock if child->children was NOT empty.
+            // Let's stick to the original logic: DispatchValue for truly simple values, DispatchBlock for others.
+            // However, LoadPlugin is special. It's dispatched by DispatchBlock, but its OConfigItem usually has no children.
+            // This means the original logic `if (child->children.empty()) { DispatchValue } else { DispatchBlock }`
+            // needs to be nuanced for `LoadPlugin`.
+            // Given `DispatchBlock` handles `LoadPlugin`, we can simplify here,
+            // or DispatchValue needs to know about it too.
+            // For simplicity, I'll assume DispatchBlock handles LoadPlugin correctly even if its children are empty.
+            // The `DispatchBlock` code you provided already checks `key == "LoadPlugin"`.
+
+            // If it's a "block" type that doesn't have further nested children (like LoadPlugin)
+            // it should still go to DispatchBlock.
+            // Only true "value" type items (like FQDNLookup) go to DispatchValue.
+            if (child->key == "LoadPlugin" || child->key == "Plugin" || child->key == "Chain") {
+                 if (DispatchBlock(*child) != 0) ret = -1;
+            } else { // True simple value
+                if (DispatchValue(*child) != 0) ret = -1;
+            }
+        }
+        else // It's a block like <Plugin cpu>
+        {
+            if (DispatchBlock(*child) != 0) ret = -1;
+        }
+    }
+    return ret;
+}
+
+// --- Dummy implementations for other dispatch functions for completeness ---
+int ConfigManager::DispatchLoadPlugin(OConfigItem& ci) {
+    // ci.key == "LoadPlugin"
+    // ci.values[0] == plugin name e.g. "cpu"
+    if (ci.values.empty()) {
+        std::cerr << "[DispatchLoadPlugin] Error: LoadPlugin directive missing plugin name." << std::endl;
+        return -1;
+    }
+    const std::string& plugin_name = ci.values[0];
+    std::cout << "[DispatchLoadPlugin] Request to load plugin: " << plugin_name << std::endl;
+    // Here you would actually call something like:
+    // ModuleLoader::Instance().LoadModule(plugin_name);
+    // For demo, let's use the demo loader:
+    ModuleLoader::Instance().LoadPluginForDemo(plugin_name);
     return 0;
 }
-*/
+
+int ConfigManager::FcConfigure(OConfigItem& ci) {
+    std::cout << "[FcConfigure] Configuring Chain: " << ci.key;
+    if (!ci.values.empty()) std::cout << " " << ci.values[0];
+    std::cout << std::endl;
+    // ... actual chain configuration logic ...
+    return 0;
+}
+
+int ConfigManager::DispatchValue(OConfigItem& ci) {
+    std::cout << "[DispatchValue] Processing value: " << ci.key << " = ";
+    if (!ci.values.empty()) {
+        std::cout << ci.values[0]; // Assuming single value for simple items
+        // Here you'd set global configurations or other simple parameters.
+        // e.g. if (ci.key == "FQDNLookup") { global_settings.fqdn_lookup = (ci.values[0] == "true"); }
+    } else {
+        std::cout << "(no value)";
+    }
+    std::cout << std::endl;
+    return 0;
+}
+
+// PluginService (as provided by user)
+class PluginService {
+public:
+    int readAllOnce() {
+        int status = 0;
+        std::cout << "[PluginService] readAllOnce called." << std::endl;
+        for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames())
+        {
+            auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
+            std::cout << "[readAllOnce] Reading plugin:" << name << "\n";
+            if (mod && mod->read() != 0)
+            {
+                std::cerr << "[readAllOnce] Plugin read failed: " << name << "\n";
+                status = -1;
+            } else if (!mod) {
+                std::cerr << "[readAllOnce] Plugin module not found for: " << name << "\n";
+                status = -1;
+            }
+        }
+        return status;
+    }
+};
+
+
+// --- Main for testing ---
+int main() {
+    ConfigManager cm;
+    std::cout << "--- Reading Configuration ---" << std::endl;
+    if (cm.Read("dummy_collectd.conf") != 0) {
+        std::cerr << "Failed to read or apply configuration." << std::endl;
+    } else {
+        std::cout << "Configuration read and applied successfully." << std::endl;
+    }
+    std::cout << "\n--- Simulating PluginService readAllOnce ---" << std::endl;
+    PluginService ps;
+    ps.readAllOnce();
+
+    return 0;
+}
+
