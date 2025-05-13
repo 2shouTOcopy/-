@@ -1,135 +1,152 @@
-#include <stdio.h>
-#include <stdlib.h> // For malloc, free
-#include <string.h> // For strncpy
-#include <math.h>   // For NAN (Not a Number), representing 'U'
+#include <deque>
+#include <memory> // For std::shared_ptr
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
+#include <cstring> // For std::strncpy, std::strlen if needed
+#include <cmath>   // For std::isnan / NAN
 
-// 假设 DATA_MAX_NAME_LEN 已经定义，例如：
-#ifndef DATA_MAX_NAME_LEN
-#define DATA_MAX_NAME_LEN 64
-#endif
+// --- 假设的 PluginService 和 value_list_t (为了使示例可编译和运行) ---
+// 在您的项目中，这些应该是您实际的定义
+namespace PluginService {
+    // 假设的 value_list_t 定义
+    struct value_list_t {
+        // 您的 value_list_t 实际成员
+        // 例如:
+        double values[1]; // 假设它包含一个值
+        long long timestamp;
 
-// 您的结构体定义
-struct data_source_s
-{
-    char name[DATA_MAX_NAME_LEN];
-    int type; // 将存储如下枚举的值
-    double min;
-    double max;
-};
-typedef struct data_source_s data_source_t;
+        value_list_t() : timestamp(0) { values[0] = 0.0; } // 默认构造
+    };
 
-struct data_set_s
-{
-    char type[DATA_MAX_NAME_LEN];
-    size_t ds_num;
-    data_source_t *ds;
-};
-typedef struct data_set_s data_set_t;
-
-// 为数据源类型定义一个枚举是一种好习惯
-typedef enum {
-    DS_TYPE_GAUGE = 0,
-    DS_TYPE_DERIVE = 1,
-    DS_TYPE_COUNTER = 2,
-    DS_TYPE_ABSOLUTE = 3, // 根据需要添加其他类型
-    // ... 其他类型
-    DS_TYPE_UNKNOWN = -1
-} data_source_type_enum_t;
-
-// 这是一个模拟的 PluginService 和 vl 对象，以便代码可以演示
-// 在您的实际代码中，您将使用真实的 PluginService
-// void* 可以代表您的 vl.get() 返回的任何类型，这里仅为占位符
-typedef struct ValueList {
-    // 假设它包含一些数据，但对于硬编码 ds 本身不直接相关
-    double values[1]; // 示例：假设它会提供一个值
-} ValueList;
-
-// 模拟 PluginService
-void mock_plugin_service_write(const data_set_t* ds_ptr, ValueList* vl_ptr) {
-    printf("模拟 PluginService::Instance().write 调用:\n");
-    printf("  data_set.type: %s\n", ds_ptr->type);
-    printf("  data_set.ds_num: %zu\n", ds_ptr->ds_num);
-    if (ds_ptr->ds_num > 0 && ds_ptr->ds != NULL) {
-        printf("  Data Source [0]:\n");
-        printf("    name: %s\n", ds_ptr->ds[0].name);
-        printf("    type (int): %d\n", ds_ptr->ds[0].type);
-        printf("    min: %f\n", ds_ptr->ds[0].min);
-        if (isnan(ds_ptr->ds[0].max)) {
-            printf("    max: U (NAN)\n");
-        } else {
-            printf("    max: %f\n", ds_ptr->ds[0].max);
+    // 假设的 PluginService 定义
+    class Instance {
+    public:
+        static Instance& get() { // 通常用 get() 或 Instance()
+            static Instance inst;
+            return inst;
         }
-        // 假设 vl_ptr 提供了要写入的实际值
-        if (vl_ptr != NULL) {
-             printf("    value from vl.get(): %f ( hypothetical)\n", vl_ptr->values[0]);
+        void write(const data_set_t* ds, const value_list_t* vl) {
+            // 这是一个模拟的实现
+            printf("PluginService::write called for ds.type: %s\n", ds->type);
+            if (ds->ds_num > 0 && ds->ds) {
+                const char* type_str = "UNKNOWN_TYPE";
+                if (ds->ds[0].type == DS_TYPE_DERIVE) type_str = "DERIVE";
+                else if (ds->ds[0].type == DS_TYPE_GAUGE) type_str = "GAUGE";
+                // ... 其他类型
+
+                printf("  Data Source[0]: name='%s', type=%d (%s), min=%.1f, max=",
+                       ds->ds[0].name, ds->ds[0].type, type_str, ds->ds[0].min);
+                if (std::isnan(ds->ds[0].max)) {
+                    printf("U (NAN)\n");
+                } else {
+                    printf("%.1f\n", ds->ds[0].max);
+                }
+            }
+            if (vl) {
+                printf("  ValueList provided (e.g., vl->values[0] = %.2f, timestamp = %lld)\n", vl->values[0], vl->timestamp);
+            }
+             printf("--------------------------------------------------\n");
         }
+    private:
+        Instance() = default;
+    };
+} // namespace PluginService
+
+// 假设 RstDispatcher 在一个命名空间内，或者是一个类
+// 这里为了简化，我直接定义 Impl
+namespace RstDispatcher { // 示例命名空间
+
+struct Impl
+{
+    std::deque<std::shared_ptr<PluginService::value_list_t>> queue;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::atomic<bool>       exit{false};
+    std::thread             th;
+
+    // 为 "cpu value:DERIVE:0:U" 这组静态元数据添加成员变量
+    data_set_t      m_static_cpu_ds;
+    data_source_t   m_static_cpu_data_sources[1]; // 因为 "cpu value:DERIVE:0:U" 只有一个数据源
+
+    Impl()
+    {
+        // --- 在构造函数中一次性初始化静态元数据 ---
+        // 1. 填充 m_static_cpu_ds.type
+        std::strncpy(m_static_cpu_ds.type, "cpu", DATA_MAX_NAME_LEN - 1);
+        m_static_cpu_ds.type[DATA_MAX_NAME_LEN - 1] = '\0'; // 保证空字符结尾
+
+        // 2. 设置 m_static_cpu_ds.ds_num
+        m_static_cpu_ds.ds_num = 1; // 对应 "value:DERIVE:0:U" 这一个数据源
+
+        // 3. 将 m_static_cpu_ds.ds 指向内部的成员数组 m_static_cpu_data_sources
+        // 这样就无需在堆上分配内存 (即不用 malloc/new)
+        m_static_cpu_ds.ds = m_static_cpu_data_sources;
+
+        // 4. 填充 m_static_cpu_data_sources 数组的元素
+        //    对应 "value:DERIVE:0:U"
+        //    m_static_cpu_data_sources[0] 是唯一的元素
+        std::strncpy(m_static_cpu_data_sources[0].name, "value", DATA_MAX_NAME_LEN - 1);
+        m_static_cpu_data_sources[0].name[DATA_MAX_NAME_LEN - 1] = '\0';
+
+        m_static_cpu_data_sources[0].type = DS_TYPE_DERIVE; // 使用枚举值
+
+        m_static_cpu_data_sources[0].min = 0.0;
+
+        // 'U' 通常表示未定义或无限制，使用 NAN (Not a Number)
+        // 需要 #include <cmath>
+        m_static_cpu_data_sources[0].max = NAN;
+        // --- 静态元数据初始化完毕 ---
+
+
+        th = std::thread([this]{
+            /* 若有 thread_set_name，可以在此调用 */
+            // 例如: pthread_setname_np(pthread_self(), "RstDispatchTh"); (需要相应头文件和平台支持)
+            while (!exit.load(std::memory_order_acquire))
+            {
+                std::shared_ptr<PluginService::value_list_t> vl_ptr; // 从队列中获取的共享指针
+                {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    // 在等待时，检查退出标志或队列非空
+                    // memory_order_relaxed 对于 exit 在 predicate 中通常是安全的，因为lk的加锁解锁会提供必要的屏障
+                    cv.wait(lk, [this]{ return exit.load(std::memory_order_relaxed) || !queue.empty(); });
+
+                    // 再次检查退出条件，特别是在被唤醒后
+                    // memory_order_acquire 用于确保看到 exit 的最新值以及其他线程的相关修改
+                    if (exit.load(std::memory_order_acquire) && queue.empty()) {
+                        break; // 退出循环
+                    }
+                    if (queue.empty()) { // 如果是因为exit被唤醒但队列仍空，则不处理
+                        continue;
+                    }
+
+                    vl_ptr = std::move(queue.front());
+                    queue.pop_front();
+                }
+
+                /* todo: 过滤链钩子占位 */
+
+                /* 分发给所有 writer 插件 */
+                // 使用预先初始化好的 m_static_cpu_ds 成员
+                // vl_ptr->get() 如果 PluginService::Instance().write 需要原始指针
+                // 如果 PluginService::Instance().write 可以接受 const std::shared_ptr<value_list_t>&，则直接传递 vl_ptr
+                PluginService::Instance::get().write(&this->m_static_cpu_ds, vl_ptr.get());
+            }
+        });
     }
-    printf("-----------------------------------------\n");
-}
 
-
-int main() {
-    data_set_t ds = {0}; // 初始化所有成员为0或NULL
-
-    // --- 开始硬编码 data_set_t ds ---
-
-    // 1. 填充 data_set_t 的 'type' 字段
-    // 对应 "cpu"
-    strncpy(ds.type, "cpu", DATA_MAX_NAME_LEN -1);
-    ds.type[DATA_MAX_NAME_LEN -1] = '\0'; // 确保字符串以null结尾
-
-    // 2. 填充 data_set_t 的 'ds_num' 字段
-    // "value:DERIVE:0:U" 是一个数据源定义
-    ds.ds_num = 1;
-
-    // 3. 为 data_source_t 数组分配内存
-    // 因为 ds_num 是 1, 我们需要为1个 data_source_t 元素分配空间
-    ds.ds = (data_source_t*)malloc(ds.ds_num * sizeof(data_source_t));
-    if (ds.ds == NULL) {
-        perror("为 ds.ds 分配内存失败");
-        // 在实际应用中，这里应该有错误处理逻辑
-        return 1;
+    ~Impl()
+    {
+        exit.store(true, std::memory_order_release); // 通知线程退出
+        cv.notify_all(); // 唤醒等待的线程
+        if (th.joinable())
+        {
+            th.join(); // 等待线程结束
+        }
+        // m_static_cpu_ds 和 m_static_cpu_data_sources 是类成员,
+        // 它们的内存在 Impl 对象销毁时自动回收，无需手动 free。
     }
+};
 
-    // 4. 填充第一个 (也是唯一一个) data_source_t 元素 (ds.ds[0])
-    // 对应 "value:DERIVE:0:U"
-
-    // 4a. data_source_t.name 对应 "value"
-    strncpy(ds.ds[0].name, "value", DATA_MAX_NAME_LEN -1);
-    ds.ds[0].name[DATA_MAX_NAME_LEN -1] = '\0'; // 确保null结尾
-
-    // 4b. data_source_t.type 对应 "DERIVE"
-    // 我们将 "DERIVE" 映射到整数 DS_TYPE_DERIVE
-    ds.ds[0].type = DS_TYPE_DERIVE;
-
-    // 4c. data_source_t.min 对应 "0"
-    ds.ds[0].min = 0.0;
-
-    // 4d. data_source_t.max 对应 "U"
-    // 'U' 通常表示未定义或无限制。一个常见的做法是使用 NAN (Not a Number)。
-    // NAN 在 <math.h> 中定义。
-    ds.ds[0].max = NAN;
-
-    // --- 硬编码 data_set_t ds 完成 ---
-
-    // 现在 ds 结构体已经按照 "cpu value:DERIVE:0:U" 的配置填充完毕
-    // 您可以将其传递给您的 PluginService
-    // 假设 vl 是一个已经准备好的 ValueList 指针或类似的东西
-    ValueList vl_example;
-    vl_example.values[0] = 123.45; // 假设这是从 vl.get() 得到的实际数据值
-
-    // 调用您的函数 (这里用模拟函数替代)
-    // PluginService::Instance().write(&ds, vl.get());
-    mock_plugin_service_write(&ds, &vl_example);
-
-
-    // 重要：释放动态分配的内存
-    // 如果 ds.ds 是在栈上分配的单个 data_source_t, 则不需要 free。
-    // 但由于您的结构体定义 ds 是一个指针，并且我们用 malloc 分配了它，所以需要 free。
-    if (ds.ds != NULL) {
-        free(ds.ds);
-        ds.ds = NULL; // 良好的编程习惯，防止悬挂指针
-    }
-
-    return 0;
-}
+} // namespace RstDispatcher
