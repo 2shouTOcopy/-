@@ -1,77 +1,86 @@
-#pragma once
+#include <iostream>
+#include <string>
+#include <vector>
+#include <functional>
+#include <cstring> // 用于 strcmp
 
-#include "config_global.h"
-#include "config_callbacks.h" // Note: This was 'config_callback.h' in your snippet, check filename
-#include "oconfig.h"
-#include "types_parser.h" // Include the new parser header
+#include "configfile.h"
+#include "types_parser.h" // 用于 TypesDbParser::parse_file
 
-#include <vector> // For std::vector
-#include <string> // For std::string
-#include <functional> // For std::function
+#include "../daemon/ModuleLoader.h" // 根据您的项目结构调整路径
+#include "../daemon/ModuleBase.h"   // 根据您的项目结构调整路径
 
-class ConfigManager
+
+ConfigManager::ConfigManager()
 {
-public:
-    static ConfigManager &Instance()
-    {
-        static ConfigManager instance;
-        return instance;
+    InitGlobalOptions();
+    InitValueMapper();
+    // 为 TypesDB 设置一个全局默认值，这个值可能会被配置文件覆盖。
+    global_config_.setOption("TypesDB", "/usr/share/collectd/types.db");
+}
+
+ConfigManager::~ConfigManager()
+{
+    TypesDbParser::free_datasets(type_datasets_);
+}
+
+
+void ConfigManager::InitGlobalOptions()
+{
+    global_config_.setOption("BaseDir", "/var/lib/collectd");
+    global_config_.setOption("PIDFile", "/var/run/collectd.pid");
+    global_config_.setOption("FQDNLookup", "true");
+    global_config_.setOption("Interval", "10");
+    // ... 其他全局选项 ...
+    global_config_.setOption("TypesDB", "/opt/collectd/share/collectd/types.db"); // 默认路径
+}
+
+// ... (ConfigManager 的其他方法：InitValueMapper, Dispatch*, Read 等在此请求中保持不变) ...
+// ... (确保 Read 方法正确填充了 type_datasets_)
+
+const std::vector<data_set_t>& ConfigManager::GetTypeDataSets() const {
+    // 如果 type_datasets_ 在初始化后可能被并发修改，
+    // 你需要在这里加锁。
+    // std::lock_guard<std::mutex> lock(type_datasets_mutex_);
+    return type_datasets_;
+}
+
+const data_set_t* ConfigManager::GetDataSetByName(const std::string& type_name) const {
+    // 如果 type_datasets_ 在初始化后可能被并发修改，
+    // 你需要在这里加锁。
+    // std::lock_guard<std::mutex> lock(type_datasets_mutex_);
+    for (const auto& ds : type_datasets_) {
+        // data_set_t::type 是 char 数组，使用 strcmp 进行比较
+        if (strcmp(ds.type, type_name.c_str()) == 0) {
+            return &ds; // 返回指向向量中元素的指针
+        }
+    }
+    return nullptr; // 未找到
+}
+
+int ConfigManager::GetDataSetByName(const char* type_name, const data_set_t** out_ds) const {
+    if (out_ds == nullptr) {
+        std::cerr << "ConfigManager::GetDataSetByName: out_ds parameter cannot be null." << std::endl;
+        return -1; // 无效参数
+    }
+    // 如果 type_datasets_ 在初始化后可能被并发修改，
+    // 你需要在这里加锁。
+    // std::lock_guard<std::mutex> lock(type_datasets_mutex_);
+
+    *out_ds = nullptr; // 初始化输出参数
+    if (type_name == nullptr) {
+        std::cerr << "ConfigManager::GetDataSetByName: type_name parameter cannot be null." << std::endl;
+        return -1; // 无效参数
     }
 
-    int Read(const char *filename);
-    int DispatchOption(const std::string &key, const std::string &value);
-    int Search(const std::string &key);
-    int Register(const std::string &type,
-                 std::function<int(const std::string &, const std::string &)> cb,
-                 const std::vector<std::string> &keys,
-                 plugin_ctx_t ctx); // Assuming plugin_ctx_t is defined somewhere
-    int Unregister(const std::string &type);
-    int RegisterComplex(const std::string &type,
-                        std::function<int(OConfigItem &)> cb,
-                        plugin_ctx_t ctx);
-    int UnregisterComplex(const std::string &type);
-    void SetGlobalOption(const std::string &key, const std::string &value);
-    std::string GetGlobalOption(const std::string &key);
-    double GetGlobalOptionTime(const std::string &key, double def);
-    double GetDefaultInterval();
-
-    // Method to get the parsed datasets (vector)
-    const std::vector<data_set_t>& GetTypeDataSets() const;
-
-    // New method to get a specific data_set_t by its type name
-    // Returns nullptr if not found.
-    const data_set_t* GetDataSetByName(const std::string& type_name) const;
-
-    // C-style lookup similar to c_avl_get, returns 0 on success, -1 on failure
-    // `out_ds` will point to the data_set_t if found.
-    int GetDataSetByName(const char* type_name, const data_set_t** out_ds) const;
+    for (const auto& ds : type_datasets_) {
+        if (strcmp(ds.type, type_name) == 0) {
+            *out_ds = &ds; // 设置 out_ds 指向找到的元素
+            return 0;      // 成功
+        }
+    }
+    return -1; // 未找到 (或者可以使用如 common.h 中定义的 ENOENT 等错误码)
+}
 
 
-    // 删除拷贝构造函数和赋值运算符
-    ConfigManager(const ConfigManager &) = delete;
-    ConfigManager &operator=(const ConfigManager &) = delete;
-
-private:
-    ConfigManager();
-    ~ConfigManager(); // Make sure to call TypesDbParser::free_datasets in destructor
-
-    void InitGlobalOptions();
-    void InitValueMapper();
-
-    int DispatchValuePluginDir(OConfigItem &ci);
-    int DispatchLoadPlugin(OConfigItem &ci);
-    int DispatchBlockPlugin(OConfigItem &ci);
-    int FcConfigure(OConfigItem &ci);
-    int DispatchGlobalOption(OConfigItem &ci);
-    int DispatchBlock(OConfigItem &ci);
-    int DispatchValue(OConfigItem &ci);
-
-private:
-    CfGlobalConfig global_config_;
-    CfCallbackRegistry callback_registry_;
-    CfComplexCallbackRegistry complex_registry_;
-    CfValueMapper value_mapper_;
-    std::vector<data_set_t> type_datasets_; 
-    // For thread safety if type_datasets_ can be modified concurrently after init:
-    // mutable std::mutex type_datasets_mutex_; 
-};
+// ... (ConfigManager 的其他方法：DispatchOption, Search, Register 等)
