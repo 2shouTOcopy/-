@@ -1,126 +1,77 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <functional>
+#pragma once
 
-#include "configfile.h"
-#include "types_parser.h" // For TypesDbParser::parse_file
+#include "config_global.h"
+#include "config_callbacks.h" // Note: This was 'config_callback.h' in your snippet, check filename
+#include "oconfig.h"
+#include "types_parser.h" // Include the new parser header
 
-#include "../daemon/ModuleLoader.h" // Adjust path as necessary
-#include "../daemon/ModuleBase.h"   // Adjust path as necessary
+#include <vector> // For std::vector
+#include <string> // For std::string
+#include <functional> // For std::function
 
-
-ConfigManager::ConfigManager()
+class ConfigManager
 {
-    InitGlobalOptions();
-    InitValueMapper();
-    // Add TypesDB to global options if it's a standard path
-    global_config_.setOption("TypesDB", "/usr/share/collectd/types.db"); // Example default
-}
-
-ConfigManager::~ConfigManager()
-{
-    TypesDbParser::free_datasets(type_datasets_);
-}
-
-
-void ConfigManager::InitGlobalOptions()
-{
-    global_config_.setOption("BaseDir", "/var/lib/collectd");
-    global_config_.setOption("PIDFile", "/var/run/collectd.pid");
-    global_config_.setOption("FQDNLookup", "true");
-    global_config_.setOption("Interval", "10");
-    // ... other options ...
-    global_config_.setOption("TypesDB", "/opt/collectd/share/collectd/types.db"); // Default path
-}
-
-// ... (rest of your InitValueMapper, DispatchValuePluginDir, etc. methods remain the same) ...
-// ... DispatchLoadPlugin, DispatchBlockPlugin, FcConfigure, DispatchGlobalOption ...
-// ... DispatchBlock, DispatchValue ...
-
-
-int ConfigManager::Read(const char *filename)
-{
-    if (!filename)
+public:
+    static ConfigManager &Instance()
     {
-        std::cerr << "ConfigManager::Read: Invalid filename (nullptr)\n";
-        return -1;
+        static ConfigManager instance;
+        return instance;
     }
 
-    // Parse the main configuration file (e.g., collectd.conf)
-    // This ConfigParser is for oconfig format (collectd.conf)
-    auto oconfig_parser = ConfigParser::create(); 
-    auto root = oconfig_parser->parseFile(filename);
-    if (root == nullptr)
-    {
-        std::cerr << "ConfigManager::Read: Main config parse failed: " << filename << "\n";
-        return -1;
-    }
+    int Read(const char *filename);
+    int DispatchOption(const std::string &key, const std::string &value);
+    int Search(const std::string &key);
+    int Register(const std::string &type,
+                 std::function<int(const std::string &, const std::string &)> cb,
+                 const std::vector<std::string> &keys,
+                 plugin_ctx_t ctx); // Assuming plugin_ctx_t is defined somewhere
+    int Unregister(const std::string &type);
+    int RegisterComplex(const std::string &type,
+                        std::function<int(OConfigItem &)> cb,
+                        plugin_ctx_t ctx);
+    int UnregisterComplex(const std::string &type);
+    void SetGlobalOption(const std::string &key, const std::string &value);
+    std::string GetGlobalOption(const std::string &key);
+    double GetGlobalOptionTime(const std::string &key, double def);
+    double GetDefaultInterval();
 
-    if (root->children.empty())
-    {
-        std::cerr << "ConfigManager::Read: Empty main config file: " << filename << "\n";
-        // Depending on requirements, this might not be a fatal error
-        // return -1; 
-    }
+    // Method to get the parsed datasets (vector)
+    const std::vector<data_set_t>& GetTypeDataSets() const;
 
-    int main_config_ret = 0;
-    for (auto &child : root->children)
-    {
-        if (child->children.empty())
-        {
-            if (DispatchValue(*child) != 0)
-                main_config_ret = -1;
-        }
-        else
-        {
-            if (DispatchBlock(*child) != 0)
-                main_config_ret = -1;
-        }
-    }
+    // New method to get a specific data_set_t by its type name
+    // Returns nullptr if not found.
+    const data_set_t* GetDataSetByName(const std::string& type_name) const;
 
-    if (main_config_ret != 0) {
-        std::cerr << "ConfigManager::Read: Errors occurred while processing main configuration." << std::endl;
-        // Decide if you want to proceed to parse types.db even if main config has errors
-        // return -1; 
-    }
+    // C-style lookup similar to c_avl_get, returns 0 on success, -1 on failure
+    // `out_ds` will point to the data_set_t if found.
+    int GetDataSetByName(const char* type_name, const data_set_t** out_ds) const;
 
-    // Now, parse the types.db file
-    std::string types_db_path = global_config_.getOption("TypesDB");
-    if (types_db_path.empty()) {
-        std::cerr << "ConfigManager::Read: TypesDB path not configured. Skipping types.db parsing." << std::endl;
-    } else {
-        std::cout << "ConfigManager::Read: Attempting to parse TypesDB from: " << types_db_path << std::endl;
-        // Clear previous data if any, before parsing new data
-        TypesDbParser::free_datasets(type_datasets_); 
-        if (TypesDbParser::parse_file(types_db_path.c_str(), type_datasets_) != 0) {
-            std::cerr << "ConfigManager::Read: Failed to parse TypesDB file: " << types_db_path << std::endl;
-            // Decide if this is a fatal error. Collectd typically can run without a types.db,
-            // but some plugins or features might rely on it.
-            // For now, let's consider it non-fatal for the Read function's return value,
-            // but plugins might fail later if they need these definitions.
-        } else {
-            std::cout << "ConfigManager::Read: Successfully parsed " << type_datasets_.size() << " data sets from " << types_db_path << std::endl;
-            // For debugging, you can print the parsed datasets:
-            /*
-            for (const auto& ds : type_datasets_) {
-                std::cout << "  Dataset: " << ds.type << " (Sources: " << ds.ds_num << ")" << std::endl;
-                for (size_t i = 0; i < ds.ds_num; ++i) {
-                    std::cout << "    DS: " << ds.ds[i].name 
-                              << " Type: " << ds.ds[i].type
-                              << " Min: " << ds.ds[i].min
-                              << " Max: " << ds.ds[i].max << std::endl;
-                }
-            }
-            */
-        }
-    }
 
-    return main_config_ret; // Return status of main config parsing
-}
+    // 删除拷贝构造函数和赋值运算符
+    ConfigManager(const ConfigManager &) = delete;
+    ConfigManager &operator=(const ConfigManager &) = delete;
 
-const std::vector<data_set_t>& ConfigManager::GetTypeDataSets() const {
-    return type_datasets_;
-}
+private:
+    ConfigManager();
+    ~ConfigManager(); // Make sure to call TypesDbParser::free_datasets in destructor
 
-// ... (rest of ConfigManager methods: DispatchOption, Search, Register, etc.)
+    void InitGlobalOptions();
+    void InitValueMapper();
+
+    int DispatchValuePluginDir(OConfigItem &ci);
+    int DispatchLoadPlugin(OConfigItem &ci);
+    int DispatchBlockPlugin(OConfigItem &ci);
+    int FcConfigure(OConfigItem &ci);
+    int DispatchGlobalOption(OConfigItem &ci);
+    int DispatchBlock(OConfigItem &ci);
+    int DispatchValue(OConfigItem &ci);
+
+private:
+    CfGlobalConfig global_config_;
+    CfCallbackRegistry callback_registry_;
+    CfComplexCallbackRegistry complex_registry_;
+    CfValueMapper value_mapper_;
+    std::vector<data_set_t> type_datasets_; 
+    // For thread safety if type_datasets_ can be modified concurrently after init:
+    // mutable std::mutex type_datasets_mutex_; 
+};
