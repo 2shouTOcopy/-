@@ -1,433 +1,65 @@
-// Forward declaration or include for ModuleLoader and CAbstractUserModule
-// Assuming ModuleLoader.h might contain something like:
-// class ModuleLoader {
-// public:
-// static ModuleLoader& Instance();
-// CAbstractUserModule* GetUserModuleImpl(const std::string& name);
-// std::vector<std::string> GetLoadedPluginNames(); // Used in PluginService
-// // ... other methods to load/unload modules
-// };
-//
-// And CAbstractUserModule.h
-// class CAbstractUserModule {
-// public:
-//     virtual ~CAbstractUserModule() {}
-//     virtual int config(const std::string &key, const std::string &val) { return 0; }
-//     virtual int read() { return 0; } // Added based on PluginService::readAllOnce
-// };
+#pragma once
 
-// --- Your existing code with the completed DispatchBlockPlugin ---
-#include <iostream>
-#include <string>
-#include <vector>
-#include <memory> // For std::unique_ptr if ConfigParser returns it
+#include "config_global.h"
+#include "config_callbacks.h" // Note: This was 'config_callback.h' in your snippet, check filename
+#include "oconfig.h"
+#include "types_parser.h" // <-- Include the new parser header
 
-// --- Dummy/Placeholder implementations for missing parts to make it compilable ---
-// This would typically come from your actual parsing library and module loader
-// For CAbstractUserModule (already provided by you)
-class CAbstractUserModule
+#include <vector> // For std::vector
+
+class ConfigManager
 {
 public:
-    virtual ~CAbstractUserModule() {}
-    virtual int config(const std::string &key, const std::string &val) {
-        std::cout << "  [CAbstractUserModule Default] Config called for key: " << key << ", val: " << val << ". Doing nothing." << std::endl;
-        return 0;
-    }
-    virtual int read() { return 0; } // From PluginService
-};
-
-// OConfigItem struct (as defined above or matching your parser's output)
-struct OConfigItem {
-    std::string key;
-    std::vector<std::string> values;
-    std::vector<OConfigItem*> children;
-
-    ~OConfigItem() {
-        for (auto child : children) {
-            delete child;
-        }
-        children.clear();
-    }
-};
-
-// Dummy ModuleLoader
-#include <map>
-class ModuleLoader {
-private:
-    std::map<std::string, std::unique_ptr<CAbstractUserModule>> modules_;
-    std::vector<std::string> loaded_plugin_names_; // To match GetLoadedPluginNames
-
-    // Example: A concrete CPU plugin
-    class CpuPlugin : public CAbstractUserModule {
-    public:
-        int config(const std::string &key, const std::string &val) override {
-            std::cout << "  [CpuPlugin] Configuring: " << key << " = " << val << std::endl;
-            if (key == "ReportByCpu") {
-                // reportByCpu_ = (val == "true" || val == "1");
-            } else if (key == "ReportByState") {
-                // reportByState_ = (val == "true" || val == "1");
-            } // ... and so on
-            else {
-                std::cerr << "  [CpuPlugin] Unknown config key: " << key << std::endl;
-                // return -1; // Optionally return error for unknown keys
-            }
-            return 0;
-        }
-        // bool reportByCpu_ = false;
-        // bool reportByState_ = false;
-    };
-     // Example: A concrete CSV plugin
-    class CsvPlugin : public CAbstractUserModule {
-    public:
-        int config(const std::string &key, const std::string &val) override {
-            std::cout << "  [CsvPlugin] Configuring: " << key << " = " << val << std::endl;
-            if (key == "DataDir") {
-                // dataDir_ = val;
-            } else if (key == "StoreRates") {
-                // storeRates_ = (val == "true" || val == "1");
-            } else {
-                std::cerr << "  [CsvPlugin] Unknown config key: " << key << std::endl;
-            }
-            return 0;
-        }
-        // std::string dataDir_;
-        // bool storeRates_ = false;
-    };
-
-
-public:
-    static ModuleLoader& Instance() {
-        static ModuleLoader instance;
+    static ConfigManager &Instance()
+    {
+        static ConfigManager instance;
         return instance;
     }
 
-    // Simulate loading a plugin
-    void LoadPluginForDemo(const std::string& name) {
-        if (modules_.find(name) == modules_.end()) {
-            if (name == "cpu") {
-                modules_[name] = std::make_unique<CpuPlugin>();
-                loaded_plugin_names_.push_back(name);
-                std::cout << "[ModuleLoader] Demo: Loaded CPU plugin." << std::endl;
-            } else if (name == "csv") {
-                modules_[name] = std::make_unique<CsvPlugin>();
-                loaded_plugin_names_.push_back(name);
-                 std::cout << "[ModuleLoader] Demo: Loaded CSV plugin." << std::endl;
-            } else {
-                // For demo, just use a generic one if not specialized
-                // modules_[name] = std::make_unique<CAbstractUserModule>();
-                // loaded_plugin_names_.push_back(name);
-                std::cout << "[ModuleLoader] Demo: No specific module for " << name << ", config will go to default." << std::endl;
-            }
-        }
-    }
+    int Read(const char *filename);
+    int DispatchOption(const std::string &key, const std::string &value);
+    int Search(const std::string &key);
+    int Register(const std::string &type,
+                 std::function<int(const std::string &, const std::string &)> cb,
+                 const std::vector<std::string> &keys,
+                 plugin_ctx_t ctx); // Assuming plugin_ctx_t is defined somewhere
+    int Unregister(const std::string &type);
+    int RegisterComplex(const std::string &type,
+                        std::function<int(OConfigItem &)> cb,
+                        plugin_ctx_t ctx);
+    int UnregisterComplex(const std::string &type);
+    void SetGlobalOption(const std::string &key, const std::string &value);
+    std::string GetGlobalOption(const std::string &key);
+    double GetGlobalOptionTime(const std::string &key, double def);
+    double GetDefaultInterval();
 
-    CAbstractUserModule* GetUserModuleImpl(const std::string& name) {
-        auto it = modules_.find(name);
-        if (it != modules_.end()) {
-            return it->second.get();
-        }
-        return nullptr;
-    }
+    // Method to get the parsed datasets
+    const std::vector<data_set_t>& GetTypeDataSets() const;
 
-    const std::vector<std::string>& GetLoadedPluginNames() const {
-        return loaded_plugin_names_;
-    }
+
+    // 删除拷贝构造函数和赋值运算符
+    ConfigManager(const ConfigManager &) = delete;
+    ConfigManager &operator=(const ConfigManager &) = delete;
+
+private:
+    ConfigManager();
+    ~ConfigManager(); // Make sure to call TypesDbParser::free_datasets in destructor
+
+    void InitGlobalOptions();
+    void InitValueMapper();
+
+    int DispatchValuePluginDir(OConfigItem &ci);
+    int DispatchLoadPlugin(OConfigItem &ci);
+    int DispatchBlockPlugin(OConfigItem &ci);
+    int FcConfigure(OConfigItem &ci);
+    int DispatchGlobalOption(OConfigItem &ci);
+    int DispatchBlock(OConfigItem &ci);
+    int DispatchValue(OConfigItem &ci);
+
+private:
+    CfGlobalConfig global_config_;
+    CfCallbackRegistry callback_registry_;
+    CfComplexCallbackRegistry complex_registry_;
+    CfValueMapper value_mapper_;
+    std::vector<data_set_t> type_datasets_; // <-- Store parsed types.db data
 };
-
-
-// Dummy ConfigParser
-class ConfigParser {
-public:
-    static std::unique_ptr<ConfigParser> create() {
-        return std::make_unique<ConfigParser>();
-    }
-    // This is a very simplified mock parser for the example config
-    OConfigItem* parseFile(const char* filename) {
-        std::cout << "[ConfigParser] Mock parsing file: " << filename << std::endl;
-        if (!filename || std::string(filename).empty()) return nullptr;
-
-        OConfigItem* root = new OConfigItem();
-        root->key = "root";
-
-        // FQDNLookup false
-        OConfigItem* fqdn = new OConfigItem();
-        fqdn->key = "FQDNLookup";
-        fqdn->values.push_back("false");
-        root->children.push_back(fqdn);
-
-        // LoadPlugin cpu
-        OConfigItem* lp_cpu = new OConfigItem();
-        lp_cpu->key = "LoadPlugin";
-        lp_cpu->values.push_back("cpu");
-        root->children.push_back(lp_cpu);
-
-        // LoadPlugin csv
-        OConfigItem* lp_csv = new OConfigItem();
-        lp_csv->key = "LoadPlugin";
-        lp_csv->values.push_back("csv");
-        root->children.push_back(lp_csv);
-        
-        // <Plugin cpu>
-        OConfigItem* plugin_cpu_block = new OConfigItem();
-        plugin_cpu_block->key = "Plugin";
-        plugin_cpu_block->values.push_back("cpu"); // "cpu" is the value for "Plugin" key
-            OConfigItem* cpu_opt1 = new OConfigItem();
-            cpu_opt1->key = "ReportByCpu";
-            cpu_opt1->values.push_back("true");
-            plugin_cpu_block->children.push_back(cpu_opt1);
-            OConfigItem* cpu_opt2 = new OConfigItem();
-            cpu_opt2->key = "ReportByState";
-            cpu_opt2->values.push_back("true");
-            plugin_cpu_block->children.push_back(cpu_opt2);
-            // Add other cpu options if needed for full demo
-        root->children.push_back(plugin_cpu_block);
-
-        // <Plugin csv>
-        OConfigItem* plugin_csv_block = new OConfigItem();
-        plugin_csv_block->key = "Plugin";
-        plugin_csv_block->values.push_back("csv"); // "csv" is the value for "Plugin" key
-            OConfigItem* csv_opt1 = new OConfigItem();
-            csv_opt1->key = "DataDir";
-            csv_opt1->values.push_back("/mnt/data/collect/csv");
-            plugin_csv_block->children.push_back(csv_opt1);
-            OConfigItem* csv_opt2 = new OConfigItem();
-            csv_opt2->key = "StoreRates";
-            csv_opt2->values.push_back("false");
-            plugin_csv_block->children.push_back(csv_opt2);
-        root->children.push_back(plugin_csv_block);
-
-        return root;
-    }
-};
-
-// ConfigManager class definition
-class ConfigManager {
-public:
-    // Forward declarations of dispatch methods used by Read and DispatchBlock
-    int DispatchLoadPlugin(OConfigItem& ci);
-    int FcConfigure(OConfigItem& ci); // Assuming this is for "Chain"
-    int DispatchValue(OConfigItem& ci);
-
-    int DispatchBlockPlugin(OConfigItem& ci);
-    int DispatchBlock(OConfigItem& ci);
-    int Read(const char* filename);
-};
-
-// --- Implementation of ConfigManager methods ---
-
-// Completed DispatchBlockPlugin
-int ConfigManager::DispatchBlockPlugin(OConfigItem& ci)
-{
-    // ci.key should be "Plugin"
-    // ci.values should contain the plugin name, e.g., "cpu" or "csv"
-    if (ci.values.empty()) {
-        std::cerr << "[dispatch_block_plugin] Error: Plugin block <" << ci.key << "> is missing plugin name." << std::endl;
-        return -1;
-    }
-    const std::string& plugin_name = ci.values[0];
-
-    std::cout << "[dispatch_block_plugin] Configuring plugin block for: " << plugin_name << std::endl;
-
-    // Get the plugin instance from the ModuleLoader
-    CAbstractUserModule* plugin_module = ModuleLoader::Instance().GetUserModuleImpl(plugin_name);
-
-    if (!plugin_module) {
-        std::cerr << "[dispatch_block_plugin] Error: Plugin '" << plugin_name << "' not loaded or module not found. Cannot configure." << std::endl;
-        // Depending on strictness, you might return -1 or just warn and continue
-        // If plugins are configured before they are "fully" loaded by another mechanism,
-        // this might just be a warning. But typically, LoadPlugin should ensure it's available.
-        return -1;
-    }
-
-    int ret = 0;
-    for (auto& child_config_item : ci.children) // child_config_item is OConfigItem*
-    {
-        if (!child_config_item) {
-            std::cerr << "[dispatch_block_plugin] Warning: Encountered null child config item for plugin '" << plugin_name << "'. Skipping." << std::endl;
-            continue;
-        }
-
-        const std::string& config_key = child_config_item->key;
-        std::string config_value;
-
-        if (child_config_item->values.empty()) {
-            // This could be a boolean key present without a value, e.g. "EnableFeature"
-            // Or it could be an error. CollectD often treats valueless keys as booleans set to true.
-            // For now, let's assume values are required as per CAbstractUserModule::config
-            std::cerr << "[dispatch_block_plugin] Warning: Config key '" << config_key
-                      << "' for plugin '" << plugin_name << "' has no value. Skipping." << std::endl;
-            // Or, if you want to treat valueless keys as "true":
-            // config_value = "true";
-            // Or if it's an error:
-            // ret = -1; continue;
-            continue;
-        } else {
-            // Taking the first value. If a key can have multiple values, this needs more logic.
-            config_value = child_config_item->values[0];
-        }
-
-        std::cout << "   Dispatching to plugin '" << plugin_name << "': Key='" << config_key
-                  << "', Value='" << config_value << "'" << std::endl;
-
-        if (plugin_module->config(config_key, config_value) != 0) {
-            std::cerr << "[dispatch_block_plugin] Error: Plugin '" << plugin_name
-                      << "' failed to configure option: " << config_key << " = " << config_value << std::endl;
-            ret = -1; // Propagate error: if one config fails, the block dispatch fails
-        }
-    }
-    return ret;
-}
-
-int ConfigManager::DispatchBlock(OConfigItem& ci)
-{
-    const std::string& key = ci.key;
-    std::cout << "[DispatchBlock] Processing block type: " << key;
-    if (!ci.values.empty()) {
-        std::cout << " with name/value: " << ci.values[0];
-    }
-    std::cout << std::endl;
-
-    if (key == "LoadPlugin") return DispatchLoadPlugin(ci);
-    if (key == "Plugin") return DispatchBlockPlugin(ci); // This is what we just implemented
-    if (key == "Chain") return FcConfigure(ci);
-
-    std::cerr << "[DispatchBlock] Warning: Unknown block type '" << key << "'. Ignoring." << std::endl;
-    return 0; // Or -1 if unknown blocks are errors
-}
-
-int ConfigManager::Read(const char* filename)
-{
-    if (!filename)
-    {
-        std::cerr << "Invalid filename\n";
-        return -1;
-    }
-
-    auto parser = ConfigParser::create(); // Using smart pointer
-    std::unique_ptr<OConfigItem> root_ptr(parser->parseFile(filename)); // Manage OConfigItem lifetime
-
-    if (root_ptr == nullptr)
-    {
-        std::cerr << "Parse failed: " << filename << "\n";
-        return -1;
-    }
-
-    if (root_ptr->children.empty())
-    {
-        std::cerr << "Empty config file (or root has no children)\n";
-        return -1; // Or 0 if an empty config is not an error
-    }
-
-    int ret = 0;
-    for (auto& child : root_ptr->children) // child is OConfigItem*
-    {
-        if (!child) continue; // Safety check
-
-        if (child->children.empty()) // It's a simple key-value pair like "FQDNLookup false" or "LoadPlugin cpu"
-        {
-            // Note: "LoadPlugin" is often treated as a block-like directive even if syntactically simple.
-            // The original code dispatched LoadPlugin via DispatchBlock if child->children was NOT empty.
-            // Let's stick to the original logic: DispatchValue for truly simple values, DispatchBlock for others.
-            // However, LoadPlugin is special. It's dispatched by DispatchBlock, but its OConfigItem usually has no children.
-            // This means the original logic `if (child->children.empty()) { DispatchValue } else { DispatchBlock }`
-            // needs to be nuanced for `LoadPlugin`.
-            // Given `DispatchBlock` handles `LoadPlugin`, we can simplify here,
-            // or DispatchValue needs to know about it too.
-            // For simplicity, I'll assume DispatchBlock handles LoadPlugin correctly even if its children are empty.
-            // The `DispatchBlock` code you provided already checks `key == "LoadPlugin"`.
-
-            // If it's a "block" type that doesn't have further nested children (like LoadPlugin)
-            // it should still go to DispatchBlock.
-            // Only true "value" type items (like FQDNLookup) go to DispatchValue.
-            if (child->key == "LoadPlugin" || child->key == "Plugin" || child->key == "Chain") {
-                 if (DispatchBlock(*child) != 0) ret = -1;
-            } else { // True simple value
-                if (DispatchValue(*child) != 0) ret = -1;
-            }
-        }
-        else // It's a block like <Plugin cpu>
-        {
-            if (DispatchBlock(*child) != 0) ret = -1;
-        }
-    }
-    return ret;
-}
-
-// --- Dummy implementations for other dispatch functions for completeness ---
-int ConfigManager::DispatchLoadPlugin(OConfigItem& ci) {
-    // ci.key == "LoadPlugin"
-    // ci.values[0] == plugin name e.g. "cpu"
-    if (ci.values.empty()) {
-        std::cerr << "[DispatchLoadPlugin] Error: LoadPlugin directive missing plugin name." << std::endl;
-        return -1;
-    }
-    const std::string& plugin_name = ci.values[0];
-    std::cout << "[DispatchLoadPlugin] Request to load plugin: " << plugin_name << std::endl;
-    // Here you would actually call something like:
-    // ModuleLoader::Instance().LoadModule(plugin_name);
-    // For demo, let's use the demo loader:
-    ModuleLoader::Instance().LoadPluginForDemo(plugin_name);
-    return 0;
-}
-
-int ConfigManager::FcConfigure(OConfigItem& ci) {
-    std::cout << "[FcConfigure] Configuring Chain: " << ci.key;
-    if (!ci.values.empty()) std::cout << " " << ci.values[0];
-    std::cout << std::endl;
-    // ... actual chain configuration logic ...
-    return 0;
-}
-
-int ConfigManager::DispatchValue(OConfigItem& ci) {
-    std::cout << "[DispatchValue] Processing value: " << ci.key << " = ";
-    if (!ci.values.empty()) {
-        std::cout << ci.values[0]; // Assuming single value for simple items
-        // Here you'd set global configurations or other simple parameters.
-        // e.g. if (ci.key == "FQDNLookup") { global_settings.fqdn_lookup = (ci.values[0] == "true"); }
-    } else {
-        std::cout << "(no value)";
-    }
-    std::cout << std::endl;
-    return 0;
-}
-
-// PluginService (as provided by user)
-class PluginService {
-public:
-    int readAllOnce() {
-        int status = 0;
-        std::cout << "[PluginService] readAllOnce called." << std::endl;
-        for (auto &name : ModuleLoader::Instance().GetLoadedPluginNames())
-        {
-            auto mod = ModuleLoader::Instance().GetUserModuleImpl(name);
-            std::cout << "[readAllOnce] Reading plugin:" << name << "\n";
-            if (mod && mod->read() != 0)
-            {
-                std::cerr << "[readAllOnce] Plugin read failed: " << name << "\n";
-                status = -1;
-            } else if (!mod) {
-                std::cerr << "[readAllOnce] Plugin module not found for: " << name << "\n";
-                status = -1;
-            }
-        }
-        return status;
-    }
-};
-
-
-// --- Main for testing ---
-int main() {
-    ConfigManager cm;
-    std::cout << "--- Reading Configuration ---" << std::endl;
-    if (cm.Read("dummy_collectd.conf") != 0) {
-        std::cerr << "Failed to read or apply configuration." << std::endl;
-    } else {
-        std::cout << "Configuration read and applied successfully." << std::endl;
-    }
-    std::cout << "\n--- Simulating PluginService readAllOnce ---" << std::endl;
-    PluginService ps;
-    ps.readAllOnce();
-
-    return 0;
-}
-
