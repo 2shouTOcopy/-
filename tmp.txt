@@ -1,86 +1,127 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <functional>
-#include <cstring> // 用于 strcmp
+# module/Makefile - 用于编译所有模块
 
-#include "configfile.h"
-#include "types_parser.h" // 用于 TypesDbParser::parse_file
+# --- 从父 Makefile 接收变量，如果未传递则使用默认值 (方便单独测试) ---
+TOOL_PREFIX ?=
+CXX ?= $(TOOL_PREFIX)g++
+CC ?= $(TOOL_PREFIX)gcc
 
-#include "../daemon/ModuleLoader.h" // 根据您的项目结构调整路径
-#include "../daemon/ModuleBase.h"   // 根据您的项目结构调整路径
+# 使用父 Makefile 传递的 CXXFLAGS，或提供默认值
+# 注意变量名区别，避免直接覆盖父 Makefile 的 CXXFLAGS 含义
+MODULE_CXXFLAGS := $(PARENT_CXXFLAGS)
+ifeq ($(strip $(MODULE_CXXFLAGS)),)
+    MODULE_CXXFLAGS := -Wall -Wextra -fPIC -std=c++11
+endif
 
+MODULE_CFLAGS := $(PARENT_CFLAGS)
+ifeq ($(strip $(MODULE_CFLAGS)),)
+    MODULE_CFLAGS := -Wall -Wextra -fPIC
+endif
 
-ConfigManager::ConfigManager()
-{
-    InitGlobalOptions();
-    InitValueMapper();
-    // 为 TypesDB 设置一个全局默认值，这个值可能会被配置文件覆盖。
-    global_config_.setOption("TypesDB", "/usr/share/collectd/types.db");
-}
+MODULE_LDFLAGS_SO := $(PARENT_LDFLAGS_FOR_SO)
+ifeq ($(strip $(MODULE_LDFLAGS_SO)),)
+    MODULE_LDFLAGS_SO := -shared -fPIC
+endif
 
-ConfigManager::~ConfigManager()
-{
-    TypesDbParser::free_datasets(type_datasets_);
-}
+# 父 Makefile 传递过来的绝对路径头文件包含项
+# PARENT_INCLUDES_ABS 已经是 -I... -I... 的形式
+# 子 Makefile 内部的头文件路径:
+# -I. 表示 module/ 目录自身 (如果有公共头文件在 module/ 下)
+# -I$(mod_subdir) 表示 module/cpu/ 这类具体模块的目录
+MODULE_SPECIFIC_INCLUDES := -I.
 
+# --- 接收输出目录和构建目录 (这些应该是绝对路径) ---
+# .so 文件输出目录, e.g., /abs/path/to/project/bin/modules
+ABS_SO_OUTPUT_DIR := $(OUTPUT_SO_DIR_ABS)
+# .o 文件基础构建目录, e.g., /abs/path/to/project/build/module
+ABS_MODULE_BUILD_BASE := $(MODULE_BUILD_BASE_ABS)
 
-void ConfigManager::InitGlobalOptions()
-{
-    global_config_.setOption("BaseDir", "/var/lib/collectd");
-    global_config_.setOption("PIDFile", "/var/run/collectd.pid");
-    global_config_.setOption("FQDNLookup", "true");
-    global_config_.setOption("Interval", "10");
-    // ... 其他全局选项 ...
-    global_config_.setOption("TypesDB", "/opt/collectd/share/collectd/types.db"); // 默认路径
-}
+# --- 自动发现模块子目录 ---
+# $(wildcard */.) 会找到如 "cpu/.", "csv/.", "uptime/."
+# $(patsubst %/.,%, ...) 去掉 "/." -> "cpu", "csv", "uptime"
+# $(notdir ...) 确保只取最后一部分名 (虽然在这里 patsubst 已完成)
+MODULE_NAMES := $(notdir $(patsubst %/.,%,$(wildcard */.)))
 
-// ... (ConfigManager 的其他方法：InitValueMapper, Dispatch*, Read 等在此请求中保持不变) ...
-// ... (确保 Read 方法正确填充了 type_datasets_)
+# --- 收集所有模块的 .so 目标 ---
+ALL_MODULE_SO_TARGETS := $(foreach mod_name,$(MODULE_NAMES),$(ABS_SO_OUTPUT_DIR)/$(mod_name).so)
 
-const std::vector<data_set_t>& ConfigManager::GetTypeDataSets() const {
-    // 如果 type_datasets_ 在初始化后可能被并发修改，
-    // 你需要在这里加锁。
-    // std::lock_guard<std::mutex> lock(type_datasets_mutex_);
-    return type_datasets_;
-}
-
-const data_set_t* ConfigManager::GetDataSetByName(const std::string& type_name) const {
-    // 如果 type_datasets_ 在初始化后可能被并发修改，
-    // 你需要在这里加锁。
-    // std::lock_guard<std::mutex> lock(type_datasets_mutex_);
-    for (const auto& ds : type_datasets_) {
-        // data_set_t::type 是 char 数组，使用 strcmp 进行比较
-        if (strcmp(ds.type, type_name.c_str()) == 0) {
-            return &ds; // 返回指向向量中元素的指针
-        }
-    }
-    return nullptr; // 未找到
-}
-
-int ConfigManager::GetDataSetByName(const char* type_name, const data_set_t** out_ds) const {
-    if (out_ds == nullptr) {
-        std::cerr << "ConfigManager::GetDataSetByName: out_ds parameter cannot be null." << std::endl;
-        return -1; // 无效参数
-    }
-    // 如果 type_datasets_ 在初始化后可能被并发修改，
-    // 你需要在这里加锁。
-    // std::lock_guard<std::mutex> lock(type_datasets_mutex_);
-
-    *out_ds = nullptr; // 初始化输出参数
-    if (type_name == nullptr) {
-        std::cerr << "ConfigManager::GetDataSetByName: type_name parameter cannot be null." << std::endl;
-        return -1; // 无效参数
-    }
-
-    for (const auto& ds : type_datasets_) {
-        if (strcmp(ds.type, type_name) == 0) {
-            *out_ds = &ds; // 设置 out_ds 指向找到的元素
-            return 0;      // 成功
-        }
-    }
-    return -1; // 未找到 (或者可以使用如 common.h 中定义的 ENOENT 等错误码)
-}
+# --- 调试信息 ---
+$(info === Executing module/Makefile ===)
+$(info TOOL_PREFIX: [$(TOOL_PREFIX)])
+$(info CXX: [$(CXX)])
+$(info MODULE_CXXFLAGS: [$(MODULE_CXXFLAGS)])
+$(info MODULE_LDFLAGS_SO: [$(MODULE_LDFLAGS_SO)])
+$(info PARENT_INCLUDES_ABS: [$(PARENT_INCLUDES_ABS)])
+$(info ABS_SO_OUTPUT_DIR: [$(ABS_SO_OUTPUT_DIR)])
+$(info ABS_MODULE_BUILD_BASE: [$(ABS_MODULE_BUILD_BASE)])
+$(info Discovered MODULE_NAMES: [$(MODULE_NAMES)])
+$(info ALL_MODULE_SO_TARGETS: [$(ALL_MODULE_SO_TARGETS)])
+$(info === End module/Makefile Info ===)
 
 
-// ... (ConfigManager 的其他方法：DispatchOption, Search, Register 等)
+.PHONY: all clean dirs_module
+
+all: dirs_module $(ALL_MODULE_SO_TARGETS)
+
+dirs_module:
+	@echo "(module/Makefile) Creating build directories for modules..."
+	$(foreach mod_name,$(MODULE_NAMES),@mkdir -p $(ABS_MODULE_BUILD_BASE)/$(mod_name))
+	@mkdir -p $(ABS_SO_OUTPUT_DIR) # 确保最终 .so 输出目录存在
+
+# --- 为每个模块定义编译和链接规则的模板 ---
+# $(1) 将是模块名，如 cpu, csv
+define EACH_MODULE_template
+# 源文件列表 for module $(1) (e.g., cpu/cpu.cpp, cpu/helper.cpp)
+$(1)_SRCS := $(wildcard $(1)/*.cpp)
+# 目标文件列表 for module $(1) (e.g., <ABS_MODULE_BUILD_BASE>/cpu/cpu.o)
+$(1)_OBJS := $$(patsubst $(1)/%.cpp,$(ABS_MODULE_BUILD_BASE)/$(1)/%.o,$$($(1)_SRCS))
+# 最终 .so 文件 for module $(1)
+$(1)_SO_TARGET := $(ABS_SO_OUTPUT_DIR)/$(1).so
+
+# 编译 .cpp 到 .o 的规则 for module $(1)
+# $$(obj) 是具体的 .o 文件路径, e.g. <ABS_MODULE_BUILD_BASE>/cpu/cpu.o
+# $$(src_prefix) 是模块名, e.g. cpu
+# $$(cpp_basename) 是不带路径的 .cpp 文件名, e.g. cpu.cpp
+$$(foreach obj,$$($(1)_OBJS),\
+    $$(eval src_prefix = $(1)) \
+    $$(eval cpp_basename = $$(patsubst $(ABS_MODULE_BUILD_BASE)/$(src_prefix)/%.o,%.cpp,$$(obj))) \
+    $$(eval $$(obj): $$(src_prefix)/$$(cpp_basename) \
+        @mkdir -p $$(@D) \
+        @echo "[module/$(1)] Compiling $$< -> $$@" \
+        $$(CXX) $$(MODULE_CXXFLAGS) $$(PARENT_INCLUDES_ABS) $$(MODULE_SPECIFIC_INCLUDES) -I$$(src_prefix) -c $$< -o $$@ \
+    ) \
+)
+
+# 链接 .o 到 .so 的规则 for module $(1)
+$$($(1)_SO_TARGET): $$($(1)_OBJS)
+	@mkdir -p $$(@D)
+	@echo "[module/$(1)] Linking $$^ -> $$@"
+	$$(CXX) $$(MODULE_LDFLAGS_SO) -o $$@ $$^
+
+endef
+
+# --- 为所有发现的模块实例化规则 ---
+$(foreach mod_name,$(MODULE_NAMES),$(eval $(call EACH_MODULE_template,$(mod_name))))
+
+clean:
+	@echo "(module/Makefile) Cleaning module objects and .so files..."
+ifeq ("$(origin MODULE_BUILD_BASE_ABS)","undefined") # 如果是从父Makefile调用的clean
+    ifeq ("$(origin ABS_MODULE_BUILD_BASE)","undefined")
+        $(warning MODULE_BUILD_BASE_ABS and ABS_MODULE_BUILD_BASE are not defined in module/Makefile clean)
+    else ifneq ($(strip $(ABS_MODULE_BUILD_BASE)),)
+	    $(foreach mod_name,$(MODULE_NAMES),rm -rf $(ABS_MODULE_BUILD_BASE)/$(mod_name))
+    endif
+else ifneq ($(strip $(MODULE_BUILD_BASE_ABS)),) # 如果是从命令行直接在module/下执行make clean，且父变量名被传递
+	$(foreach mod_name,$(MODULE_NAMES),rm -rf $(MODULE_BUILD_BASE_ABS)/$(mod_name))
+endif
+
+ifeq ("$(origin OUTPUT_SO_DIR_ABS)","undefined")
+    ifeq ("$(origin ABS_SO_OUTPUT_DIR)","undefined")
+        $(warning OUTPUT_SO_DIR_ABS and ABS_SO_OUTPUT_DIR are not defined in module/Makefile clean)
+    else ifneq ($(strip $(ABS_SO_OUTPUT_DIR)),)
+	    rm -f $(ALL_MODULE_SO_TARGETS)
+    endif
+else ifneq ($(strip $(OUTPUT_SO_DIR_ABS)),)
+	rm -f $(foreach mod_name,$(MODULE_NAMES),$(OUTPUT_SO_DIR_ABS)/$(mod_name).so)
+endif
+	@echo "(module/Makefile) Module cleaning finished."
+
