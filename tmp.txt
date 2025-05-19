@@ -1,396 +1,270 @@
 #include "collectd.h"
 #include "plugin.h"
-#include "utils/common/common.h"    // For IS_TRUE, STATIC_ARRAY_SIZE, sstrncpy, STRERRNO, DATA_MAX_NAME_LEN
-#include "utils/ignorelist/ignorelist.h"
-#include "utils/mount/mount.h"
+#include "utils/common/common.h" // For sstrncpy, STRERRNO, STATIC_ARRAY_SIZE, strsplit, oconfig_item_t, cf_util_get_boolean
+#include "config_features.h" // For KERNEL_LINUX (usually)
 
-#include <sys/statvfs.h>
 #include <string>
 #include <vector>
-#include <cstring> // For strcmp, strncmp, strlen, strcasecmp
-#include <cstdint> // For uint64_t
-#include <algorithm> // For std::replace
-#include <iomanip>   // For potential future use if formatting changes (not strictly needed for this direct port)
+#include <fstream>   // For std::ifstream
+#include <cstring>   // For strncasecmp
+#include <cstdlib>   // For atof (though std::stod is preferred in C++)
+#include <system_error> // For std::error_code, std::system_category if more advanced error handling was needed
 
-// Define STATANYFS_STR as it was in C
-#define STATANYFS_STR "statvfs"
+// Assuming KERNEL_LINUX is defined as it is in the C code's context for core functionality.
+#if KERNEL_LINUX
 
-namespace CollectdDfPlugin {
+namespace CollectdMemoryPlugin {
 
-// RAII Wrapper for ignorelist_t
-class IgnoreListWrapper {
-public:
-    IgnoreListWrapper(bool invert = true) : il_(ignorelist_create(invert)) {}
-    ~IgnoreListWrapper() {
-        if (il_) {
-            ignorelist_destroy(il_);
-            il_ = nullptr;
-        }
+// Plugin configuration state
+static bool g_values_absolute = true;
+static bool g_values_percentage = false;
+
+// Helper function to replace the MEMORY_SUBMIT macro
+template <typename... Args>
+void submit_memory_values(value_list_t *vl, Args... args) {
+    if (g_values_absolute) {
+        // The false indicates that the values are absolute, not percentages.
+        plugin_dispatch_multivalue(vl, false, DS_TYPE_GAUGE, args..., nullptr);
     }
-
-    IgnoreListWrapper(const IgnoreListWrapper&) = delete;
-    IgnoreListWrapper& operator=(const IgnoreListWrapper&) = delete;
-    IgnoreListWrapper(IgnoreListWrapper&& other) noexcept : il_(other.il_) {
-        other.il_ = nullptr;
+    if (g_values_percentage) {
+        // The true indicates that the values are percentages.
+        plugin_dispatch_multivalue(vl, true, DS_TYPE_GAUGE, args..., nullptr);
     }
-    IgnoreListWrapper& operator=(IgnoreListWrapper&& other) noexcept {
-        if (this != &other) {
-            if (il_) ignorelist_destroy(il_);
-            il_ = other.il_;
-            other.il_ = nullptr;
-        }
-        return *this;
-    }
-
-    ignorelist_t* get() const { return il_; }
-
-    // Helper methods (optional, can also use ignorelist_* functions directly)
-    int add(const char* pattern) { return ignorelist_add(il_, pattern); }
-    int match(const char* str) const { return ignorelist_match(il_, str); }
-    void set_invert(bool invert) { ignorelist_set_invert(il_, invert); }
-    int remove(const char* str) { return ignorelist_remove(il_, str); }
-
-
-private:
-    ignorelist_t* il_;
-};
-
-// RAII Wrapper for cu_mount_t list
-class MountListWrapper {
-public:
-    MountListWrapper() : mnt_list_(nullptr) {
-        if (cu_mount_getlist(&mnt_list_) == nullptr) {
-            ERROR("df plugin: C++: cu_mount_getlist failed.");
-            // mnt_list_ remains nullptr, head() will reflect this
-        }
-    }
-
-    ~MountListWrapper() {
-        if (mnt_list_) {
-            cu_mount_freelist(mnt_list_);
-            mnt_list_ = nullptr;
-        }
-    }
-
-    MountListWrapper(const MountListWrapper&) = delete;
-    MountListWrapper& operator=(const MountListWrapper&) = delete;
-    // Move constructor/assignment can be added if needed
-
-    cu_mount_t* head() const { return mnt_list_; }
-
-private:
-    cu_mount_t* mnt_list_;
-};
-
-
-// Plugin configuration and state variables
-static const std::vector<const char*> config_keys_cpp = {
-    "Device", "MountPoint", "FSType",
-    "IgnoreSelected", "ReportByDevice", "ReportInodes",
-    "ValuesAbsolute", "ValuesPercentage", "LogOnce"
-};
-
-// Using unique_ptr or direct objects for RAII
-// Note: These need to be pointers or Optionals if df_init can be called multiple times
-// For simplicity and to match original C static global behavior, make them static pointers.
-// They will be initialized in df_init_impl.
-static IgnoreListWrapper* il_device_ptr = nullptr;
-static IgnoreListWrapper* il_mountpoint_ptr = nullptr;
-static IgnoreListWrapper* il_fstype_ptr = nullptr;
-static IgnoreListWrapper* il_errors_ptr = nullptr;
-
-static bool by_device_flag = false;
-static bool report_inodes_flag = false;
-static bool values_absolute_flag = true;
-static bool values_percentage_flag = false;
-static bool log_once_flag = false;
-
-// Forward declaration
-static void df_submit_one_impl(const char* plugin_instance,
-                               const char* type,
-                               const char* type_instance,
-                               gauge_t value);
-
-int df_init_impl() {
-    // Ensure these are created only once or handled if re-init is possible
-    if (il_device_ptr == nullptr) il_device_ptr = new IgnoreListWrapper(true);
-    if (il_mountpoint_ptr == nullptr) il_mountpoint_ptr = new IgnoreListWrapper(true);
-    if (il_fstype_ptr == nullptr) il_fstype_ptr = new IgnoreListWrapper(true);
-    if (il_errors_ptr == nullptr) il_errors_ptr = new IgnoreListWrapper(true);
-    return 0;
 }
 
-int df_config_impl(const char* key, const char* value) {
-    if (il_device_ptr == nullptr) { // Should have been called by df_init_impl
-        df_init_impl(); 
-    }
-
-    if (strcasecmp(key, "Device") == 0) {
-        return (il_device_ptr->add(value) != 0) ? 1 : 0;
-    } else if (strcasecmp(key, "MountPoint") == 0) {
-        return (il_mountpoint_ptr->add(value) != 0) ? 1 : 0;
-    } else if (strcasecmp(key, "FSType") == 0) {
-        return (il_fstype_ptr->add(value) != 0) ? 1 : 0;
-    } else if (strcasecmp(key, "IgnoreSelected") == 0) {
-        bool invert_based_on_value = !IS_TRUE(value);
-        il_device_ptr->set_invert(invert_based_on_value);
-        il_mountpoint_ptr->set_invert(invert_based_on_value);
-        il_fstype_ptr->set_invert(invert_based_on_value);
-        return 0;
-    } else if (strcasecmp(key, "ReportByDevice") == 0) {
-        by_device_flag = IS_TRUE(value);
-        return 0;
-    } else if (strcasecmp(key, "ReportInodes") == 0) {
-        report_inodes_flag = IS_TRUE(value);
-        return 0;
-    } else if (strcasecmp(key, "ValuesAbsolute") == 0) {
-        values_absolute_flag = IS_TRUE(value);
-        return 0;
-    } else if (strcasecmp(key, "ValuesPercentage") == 0) {
-        values_percentage_flag = IS_TRUE(value);
-        return 0;
-    } else if (strcasecmp(key, "LogOnce") == 0) {
-        log_once_flag = IS_TRUE(value);
-        return 0;
-    }
-    return -1; // Unknown key
-}
-
-// __attribute__((nonnull(2))) implies plugin_instance can be NULL, type cannot.
-static void df_submit_one_impl(const char* plugin_instance, // Can be char* as in original if modified
-                               const char* type,
-                               const char* type_instance,
-                               gauge_t value) {
+#if KERNEL_LINUX // Redundant here but to mirror C structure if it was more complex
+static void memory_submit_available_impl(gauge_t value) {
     value_list_t vl = VALUE_LIST_INIT;
-    value_t v = {.gauge = value}; // Compound literal for C99, works in C++ too
+    value_t v = {.gauge = value}; // C99 compound literal, works in C++
 
     vl.values = &v;
     vl.values_len = 1;
-    sstrncpy(vl.plugin, "df", sizeof(vl.plugin));
-    if (plugin_instance != nullptr) {
-        sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
-    }
-    sstrncpy(vl.type, type, sizeof(vl.type)); // type is non-null
-    if (type_instance != nullptr) {
-        sstrncpy(vl.type_instance, type_instance, sizeof(vl.type_instance));
-    }
+
+    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
+    sstrncpy(vl.type, "memory", sizeof(vl.type));
+    sstrncpy(vl.type_instance, "available", sizeof(vl.type_instance));
+    // vl.time will be set by plugin_dispatch_values if not set before, or use cdtime() if needed here
 
     plugin_dispatch_values(&vl);
 }
+#endif // KERNEL_LINUX for memory_submit_available_impl
 
-int df_read_impl() {
-    if (!il_device_ptr || !il_mountpoint_ptr || !il_fstype_ptr || !il_errors_ptr) {
-        ERROR("df plugin C++: Ignorelists not initialized in df_read_impl. Call df_init first.");
+static int memory_read_internal_impl(value_list_t *vl_template) {
+    std::ifstream meminfo_file("/proc/meminfo");
+    if (!meminfo_file.is_open()) {
+        WARNING("memory plugin: C++: Failed to open /proc/meminfo: %s", STRERRNO);
         return -1;
     }
 
-    MountListWrapper mnt_list_obj;
-    if (mnt_list_obj.head() == nullptr) {
-        // Error already logged by MountListWrapper constructor or cu_mount_getlist
-        return -1;
+    std::string line_str;
+    std::vector<char> line_buffer; // For strsplit, which modifies the buffer
+
+    // Must match the fields array size in the original C code for strsplit
+    char *fields[8];
+    int numfields;
+
+    bool mem_available_info = false;
+    bool detailed_slab_info = false;
+
+    gauge_t mem_total = 0.0;
+    gauge_t mem_used = 0.0;
+    gauge_t mem_buffered = 0.0;
+    gauge_t mem_cached = 0.0;
+    gauge_t mem_free = 0.0;
+    gauge_t mem_available = 0.0; // Specific "MemAvailable" field
+    gauge_t mem_slab_total = 0.0;
+    gauge_t mem_slab_reclaimable = 0.0;
+    gauge_t mem_slab_unreclaimable = 0.0;
+
+    while (std::getline(meminfo_file, line_str)) {
+        // Prepare buffer for strsplit
+        line_buffer.assign(line_str.begin(), line_str.end());
+        line_buffer.push_back('\0'); // Null-terminate for C functions
+
+        gauge_t* val_ptr = nullptr;
+
+        if (strncasecmp(line_buffer.data(), "MemTotal:", 9) == 0)
+            val_ptr = &mem_total;
+        else if (strncasecmp(line_buffer.data(), "MemFree:", 8) == 0)
+            val_ptr = &mem_free;
+        else if (strncasecmp(line_buffer.data(), "Buffers:", 8) == 0)
+            val_ptr = &mem_buffered;
+        else if (strncasecmp(line_buffer.data(), "Cached:", 7) == 0)
+            val_ptr = &mem_cached;
+        else if (strncasecmp(line_buffer.data(), "Slab:", 5) == 0)
+            val_ptr = &mem_slab_total;
+        else if (strncasecmp(line_buffer.data(), "SReclaimable:", 13) == 0) {
+            val_ptr = &mem_slab_reclaimable;
+            detailed_slab_info = true;
+        } else if (strncasecmp(line_buffer.data(), "SUnreclaim:", 11) == 0) {
+            val_ptr = &mem_slab_unreclaimable;
+            detailed_slab_info = true;
+        } else if (strncasecmp(line_buffer.data(), "MemAvailable:", 13) == 0) {
+            val_ptr = &mem_available;
+            mem_available_info = true;
+        } else {
+            continue; // Not a line we are interested in
+        }
+
+        numfields = strsplit(line_buffer.data(), fields, STATIC_ARRAY_SIZE(fields));
+        if (numfields < 2) { // Expect at least "Key:" and "Value"
+            continue;
+        }
+
+        // Convert value from string to gauge_t (double), value is in KB, convert to bytes
+        try {
+            // fields[1] is the numeric value string
+            *val_ptr = 1024.0 * std::stod(fields[1]);
+        } catch (const std::invalid_argument& ia) {
+            WARNING("memory plugin: C++: Failed to parse value for %s: %s", fields[0], fields[1]);
+            continue;
+        } catch (const std::out_of_range& oor) {
+            WARNING("memory plugin: C++: Value out of range for %s: %s", fields[0], fields[1]);
+            continue;
+        }
     }
 
-    int retval = 0;
+    // meminfo_file is closed automatically by std::ifstream destructor
+    // The original C code checks fclose status, which is less common for std::ifstream
+    // but one could check meminfo_file.bad() after loop if strict error checking on close is needed.
 
-    for (cu_mount_t* mnt_ptr = mnt_list_obj.head(); mnt_ptr != nullptr; mnt_ptr = mnt_ptr->next) {
-        struct statvfs sfs_buf;
-        unsigned long long blocksize_val; // From f_frsize
-        char disk_name[DATA_MAX_NAME_LEN]; // C-style buffer for collectd API
-        
-        // Determine effective device name
-        const char* dev = (mnt_ptr->spec_device != nullptr) ? mnt_ptr->spec_device : mnt_ptr->device;
-        if (dev == nullptr) dev = ""; // Ensure dev is not null for ignorelist_match
+    // Sanity check (replicating the C code's final check)
+    // The original C code had a slightly more complex nested if, but this was the effective final check.
+    if (mem_total < (mem_free + mem_buffered + mem_cached + mem_slab_total)) {
+        WARNING("memory plugin: C++: Sanity check failed: MemTotal (%g) < sum of components.", mem_total);
+        return -1;
+    }
+    
+    // Calculate mem_used
+    if (detailed_slab_info) {
+        mem_used = mem_total - (mem_free + mem_buffered + mem_cached + mem_slab_reclaimable);
+    } else {
+        mem_used = mem_total - (mem_free + mem_buffered + mem_cached + mem_slab_total);
+    }
 
-        if (il_device_ptr->match(dev)) continue;
-        if (il_mountpoint_ptr->match(mnt_ptr->dir)) continue;
-        if (il_fstype_ptr->match(mnt_ptr->type)) continue;
+    // Dispatch values using the vl_template provided by memory_read_impl
+    if (detailed_slab_info) {
+        submit_memory_values(vl_template,
+                             "used", mem_used,
+                             "buffered", mem_buffered,
+                             "cached", mem_cached,
+                             "free", mem_free,
+                             "slab_unrecl", mem_slab_unreclaimable,
+                             "slab_recl", mem_slab_reclaimable);
+    } else {
+        submit_memory_values(vl_template,
+                             "used", mem_used,
+                             "buffered", mem_buffered,
+                             "cached", mem_cached,
+                             "free", mem_free,
+                             "slab", mem_slab_total);
+    }
 
-        // Search for duplicates
-        bool is_duplicate = false;
-        for (cu_mount_t* dup_ptr = mnt_list_obj.head(); dup_ptr != nullptr; dup_ptr = dup_ptr->next) {
-            if (dup_ptr == mnt_ptr) break; // Reached current, no duplicate found before it
+    if (mem_available_info) {
+        memory_submit_available_impl(mem_available);
+    }
 
-            const char* mnt_ptr_cmp_dev = (mnt_ptr->spec_device != nullptr) ? mnt_ptr->spec_device : mnt_ptr->device;
-            const char* dup_ptr_cmp_dev = (dup_ptr->spec_device != nullptr) ? dup_ptr->spec_device : dup_ptr->device;
-
-            if (by_device_flag) {
-                if (mnt_ptr_cmp_dev != nullptr && dup_ptr_cmp_dev != nullptr &&
-                    strcmp(mnt_ptr_cmp_dev, dup_ptr_cmp_dev) == 0) {
-                    is_duplicate = true;
-                    break;
-                }
-            } else {
-                if (strcmp(mnt_ptr->dir, dup_ptr->dir) == 0) {
-                    is_duplicate = true;
-                    break;
-                }
-            }
-        }
-        if (is_duplicate) continue;
-
-        if (statvfs(mnt_ptr->dir, &sfs_buf) < 0) {
-            if (log_once_flag == false || il_errors_ptr->match(mnt_ptr->dir) == 0) {
-                if (log_once_flag == true) {
-                    // This replicates the original C logic which seems to add to make it log next time
-                    il_errors_ptr->add(mnt_ptr->dir);
-                }
-                ERROR(STATANYFS_STR "(\"%s\") failed: %s", mnt_ptr->dir, STRERRNO);
-            }
-            retval = -1; // Mark that at least one error occurred, but continue processing others
-            continue;
-        } else {
-            if (log_once_flag == true) {
-                 // Replicates original C logic
-                il_errors_ptr->remove(mnt_ptr->dir);
-            }
-        }
-
-        if (sfs_buf.f_blocks == 0) continue; // Skip if total blocks is zero
-
-        blocksize_val = sfs_buf.f_frsize; // BLOCKSIZE(s) macro replacement
-        if (blocksize_val == 0) {
-            ERROR("df plugin C++: Filesystem %s (mounted on %s) reported blocksize of 0. Skipping.",
-                  dev, mnt_ptr->dir);
-            retval = -1;
-            continue;
-        }
-        
-        // Generate disk_name (plugin_instance)
-        if (by_device_flag) {
-            if (strncmp(dev, "/dev/", 5) == 0) {
-                sstrncpy(disk_name, dev + 5, sizeof(disk_name));
-            } else {
-                sstrncpy(disk_name, dev, sizeof(disk_name));
-            }
-            if (strlen(disk_name) < 1) {
-                 DEBUG("df C++: no device name for mountpoint %s, skipping", mnt_ptr->dir);
-                 continue;
-            }
-        } else {
-            if (strcmp(mnt_ptr->dir, "/") == 0) {
-                sstrncpy(disk_name, "root", sizeof(disk_name));
-            } else {
-                std::string temp_disk_name = mnt_ptr->dir + 1; // Skip leading '/'
-                std::replace(temp_disk_name.begin(), temp_disk_name.end(), '/', '-');
-                sstrncpy(disk_name, temp_disk_name.c_str(), sizeof(disk_name));
-            }
-        }
-
-        // Sanity checks for block counts
-        if (sfs_buf.f_bavail > sfs_buf.f_bfree) {
-             DEBUG("df plugin C++: f_bavail (%llu) > f_bfree (%llu) for %s. Adjusting f_bavail.",
-                  static_cast<unsigned long long>(sfs_buf.f_bavail), static_cast<unsigned long long>(sfs_buf.f_bfree), disk_name);
-            sfs_buf.f_bavail = sfs_buf.f_bfree;
-        }
-        if (sfs_buf.f_bfree > sfs_buf.f_blocks) {
-            DEBUG("df plugin C++: f_bfree (%llu) > f_blocks (%llu) for %s. Adjusting f_bfree.",
-                  static_cast<unsigned long long>(sfs_buf.f_bfree), static_cast<unsigned long long>(sfs_buf.f_blocks), disk_name);
-            sfs_buf.f_bfree = sfs_buf.f_blocks;
-        }
-
-        uint64_t blk_free = static_cast<uint64_t>(sfs_buf.f_bavail);
-        uint64_t blk_reserved = static_cast<uint64_t>(sfs_buf.f_bfree > sfs_buf.f_bavail ? sfs_buf.f_bfree - sfs_buf.f_bavail : 0);
-        uint64_t blk_used = static_cast<uint64_t>(sfs_buf.f_blocks > sfs_buf.f_bfree ? sfs_buf.f_blocks - sfs_buf.f_bfree : 0);
-
-
-        if (values_absolute_flag) {
-            df_submit_one_impl(disk_name, "df_complex", "free",
-                               static_cast<gauge_t>(static_cast<long double>(blk_free) * blocksize_val));
-            df_submit_one_impl(disk_name, "df_complex", "reserved",
-                               static_cast<gauge_t>(static_cast<long double>(blk_reserved) * blocksize_val));
-            df_submit_one_impl(disk_name, "df_complex", "used",
-                               static_cast<gauge_t>(static_cast<long double>(blk_used) * blocksize_val));
-        }
-
-        if (values_percentage_flag) {
-            uint64_t total_for_percentage = static_cast<uint64_t>(sfs_buf.f_blocks);
-            if (total_for_percentage > 0) {
-                df_submit_one_impl(disk_name, "percent_bytes", "free",
-                                   static_cast<gauge_t>((static_cast<long double>(blk_free) / total_for_percentage) * 100.0L));
-                df_submit_one_impl(disk_name, "percent_bytes", "reserved",
-                                   static_cast<gauge_t>((static_cast<long double>(blk_reserved) / total_for_percentage) * 100.0L));
-                df_submit_one_impl(disk_name, "percent_bytes", "used",
-                                   static_cast<gauge_t>((static_cast<long double>(blk_used) / total_for_percentage) * 100.0L));
-            } else {
-                 WARNING("df plugin C++: f_blocks is zero for %s, cannot report byte percentage.", disk_name);
-            }
-        }
-
-        if (report_inodes_flag && sfs_buf.f_files != 0) {
-             // Sanity checks for inode counts
-            if (sfs_buf.f_favail > sfs_buf.f_ffree) {
-                DEBUG("df plugin C++: f_favail (%llu) > f_ffree (%llu) for %s. Adjusting f_favail.",
-                      static_cast<unsigned long long>(sfs_buf.f_favail), static_cast<unsigned long long>(sfs_buf.f_ffree), disk_name);
-                sfs_buf.f_favail = sfs_buf.f_ffree;
-            }
-            if (sfs_buf.f_ffree > sfs_buf.f_files) {
-                DEBUG("df plugin C++: f_ffree (%llu) > f_files (%llu) for %s. Adjusting f_ffree.",
-                      static_cast<unsigned long long>(sfs_buf.f_ffree), static_cast<unsigned long long>(sfs_buf.f_files), disk_name);
-                sfs_buf.f_ffree = sfs_buf.f_files;
-            }
-
-            uint64_t inode_free = static_cast<uint64_t>(sfs_buf.f_favail);
-            uint64_t inode_reserved = static_cast<uint64_t>(sfs_buf.f_ffree > sfs_buf.f_favail ? sfs_buf.f_ffree - sfs_buf.f_favail : 0);
-            uint64_t inode_used = static_cast<uint64_t>(sfs_buf.f_files > sfs_buf.f_ffree ? sfs_buf.f_files - sfs_buf.f_ffree : 0);
-
-
-            if (values_absolute_flag) {
-                df_submit_one_impl(disk_name, "df_inodes", "free", static_cast<gauge_t>(inode_free));
-                df_submit_one_impl(disk_name, "df_inodes", "reserved", static_cast<gauge_t>(inode_reserved));
-                df_submit_one_impl(disk_name, "df_inodes", "used", static_cast<gauge_t>(inode_used));
-            }
-            if (values_percentage_flag) {
-                uint64_t total_inodes_for_percentage = static_cast<uint64_t>(sfs_buf.f_files);
-                if (total_inodes_for_percentage > 0) {
-                    df_submit_one_impl(disk_name, "percent_inodes", "free",
-                                       static_cast<gauge_t>((static_cast<long double>(inode_free) / total_inodes_for_percentage) * 100.0L));
-                    df_submit_one_impl(disk_name, "percent_inodes", "reserved",
-                                       static_cast<gauge_t>((static_cast<long double>(inode_reserved) / total_inodes_for_percentage) * 100.0L));
-                    df_submit_one_impl(disk_name, "percent_inodes", "used",
-                                       static_cast<gauge_t>((static_cast<long double>(inode_used) / total_inodes_for_percentage) * 100.0L));
-                } else {
-                     WARNING("df plugin C++: f_files is zero for %s, cannot report inode percentage.", disk_name);
-                }
-            }
-        }
-    } // End for loop over mount points
-
-    return retval;
-}
-
-int df_shutdown_impl() {
-    delete il_device_ptr; il_device_ptr = nullptr;
-    delete il_mountpoint_ptr; il_mountpoint_ptr = nullptr;
-    delete il_fstype_ptr; il_fstype_ptr = nullptr;
-    delete il_errors_ptr; il_errors_ptr = nullptr;
     return 0;
 }
 
-} // namespace CollectdDfPlugin
+// Configuration function
+static int memory_config_impl(oconfig_item_t *ci) {
+    for (int i = 0; i < ci->children_num; i++) {
+        oconfig_item_t *child = ci->children + i;
+        if (strcasecmp("ValuesAbsolute", child->key) == 0) {
+            cf_util_get_boolean(child, &g_values_absolute);
+        } else if (strcasecmp("ValuesPercentage", child->key) == 0) {
+            cf_util_get_boolean(child, &g_values_percentage);
+        } else {
+            ERROR("memory plugin: C++: Invalid configuration option: \"%s\".", child->key);
+            // Original C code does not return error here, so match that.
+        }
+    }
+    return 0;
+}
 
+// Init function
+static int memory_init_impl() {
+    // No specific initialization for Linux in the C code.
+    return 0;
+}
+
+// Read function (sets up value_list_t and calls internal read)
+static int memory_read_impl() {
+    // The original C code uses a value_t v[1] array on stack for vl.values
+    // but plugin_dispatch_multivalue expects a null-terminated list of type strings and gauge_t values.
+    // The vl itself passed to memory_read_internal_impl acts as a template for plugin name, type, and time.
+    // The actual values and their count are handled by plugin_dispatch_multivalue.
+    // So, vl.values and vl.values_len in this context are for the overall vl structure,
+    // not directly for the multivalue dispatch items.
+    // The original memory_read set vl.values_len = STATIC_ARRAY_SIZE(v) which is 1,
+    // this seems to be a placeholder or for a different type of dispatch.
+    // For plugin_dispatch_multivalue, vl.values is not directly used for the varargs data.
+
+    value_list_t vl = VALUE_LIST_INIT; // Initialize with default values
+
+    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
+    sstrncpy(vl.type, "memory", sizeof(vl.type)); // This type is for the whole group
+    vl.time = cdtime();
+    // vl.interval is usually inherited or set by collectd core based on plugin config
+
+    return memory_read_internal_impl(&vl);
+}
+
+} // namespace CollectdMemoryPlugin
+
+#endif // KERNEL_LINUX for the main implementation block
 
 // C-style entry points for collectd
 extern "C" {
-    static int df_config_entry(const char* key, const char* value) {
-        return CollectdDfPlugin::df_config_impl(key, value);
-    }
-    static int df_init_entry() {
-        return CollectdDfPlugin::df_init_impl();
-    }
-    static int df_read_entry() {
-        return CollectdDfPlugin::df_read_impl();
-    }
-    static int df_shutdown_entry() {
-        return CollectdDfPlugin::df_shutdown_impl();
+    // Config function
+    static int memory_config_entry(oconfig_item_t *ci) {
+        #if KERNEL_LINUX
+        return CollectdMemoryPlugin::memory_config_impl(ci);
+        #else
+        // If not Linux, this plugin might do nothing or be disabled.
+        // The original C code doesn't show non-Linux behavior for config,
+        // implying it might still parse config but read would do nothing.
+        // For safety, return 0.
+        return 0;
+        #endif
     }
 
+    // Init function
+    static int memory_init_entry(void) {
+        #if KERNEL_LINUX
+        return CollectdMemoryPlugin::memory_init_impl();
+        #else
+        // No specific init for non-Linux mentioned, matches C.
+        // Print a warning if this plugin is loaded on non-Linux.
+        // WARNING("memory plugin: This plugin is primarily designed for Linux (/proc/meminfo) and may not collect data on this system.");
+        return 0; // Successful init, even if it does nothing.
+        #endif
+    }
+
+    // Read function
+    static int memory_read_entry(void) {
+        #if KERNEL_LINUX
+        return CollectdMemoryPlugin::memory_read_impl();
+        #else
+        // On non-Linux systems, this plugin would typically do nothing or fail gracefully.
+        // The C code snippet relies entirely on /proc/meminfo.
+        // Returning 0 (success, but no data) or -1 (error/not applicable).
+        // To match the C code (which would fail fopen), let's try to indicate not applicable.
+        // However, simply returning 0 is fine if it means "read successfully, no data submitted".
+        // The original C code has its core logic inside #if KERNEL_LINUX for memory_read_internal.
+        // If KERNEL_LINUX is not defined, memory_read_internal would not be compiled,
+        // and memory_read would try to call a non-existent function or an empty stub.
+        // Thus, the #if KERNEL_LINUX guard around the call is crucial.
+        return 0; // Successfully did nothing on non-Linux.
+        #endif
+    }
+
+    // Module registration
     void module_register(void) {
-        plugin_register_config("df", df_config_entry,
-                               CollectdDfPlugin::config_keys_cpp.data(),
-                               CollectdDfPlugin::config_keys_cpp.size());
-        plugin_register_init("df", df_init_entry);
-        plugin_register_read("df", df_read_entry);
-        plugin_register_shutdown("df", df_shutdown_entry);
+        plugin_register_complex_config("memory", memory_config_entry);
+        plugin_register_init("memory", memory_init_entry);
+        plugin_register_read("memory", memory_read_entry);
     }
 } // extern "C"
 
