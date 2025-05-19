@@ -1,223 +1,66 @@
-#include "MemoryModule.h"
+#pragma once
 
-#include <fstream>      // For std::ifstream
-#include <system_error> // For strerror, errno (C++11方式)
-#include <cstring>      // For strncasecmp (虽然parseLine中用了std::string::rfind)
-#include <cstdio>       // For snprintf
-#include <cerrno>       // For errno
-// #include <cassert>   // 如果要使用 assert
+#include "ModuleBase.h"         // 假设定义了 CAbstractUserModule
+#include "daemon/PluginService.h" // 假设定义了 PluginService 和相关类型/宏
 
-// 假设日志宏 INFO, ERROR, WARNING 由 PluginService.h 或其包含的文件提供
-// 如果没有，为了能编译通过，这里使用简化的 printf 作为占位符
-#ifndef INFO
-#define INFO(format, ...) printf("[INFO] [MemoryModule] " format "\n", ##__VA_ARGS__)
-#endif
-#ifndef ERROR
-#define ERROR(format, ...) printf("[ERROR] [MemoryModule] " format "\n", ##__VA_ARGS__)
-#endif
-#ifndef WARNING
-#define WARNING(format, ...) printf("[WARNING] [MemoryModule] " format "\n", ##__VA_ARGS__)
-#endif
+#include <string>
+#include <vector>   // 仅当某些辅助功能需要时，当前实现中 parseLine 不需要
+#include <cstdint>  // For uint64_t, though gauge_t is likely double
 
-CMemoryModule::CMemoryModule() 
-    : m_values_absolute(true),      // 默认提交绝对值
-      m_values_percentage(false) {  // 默认不提交百分比
-    INFO("CMemoryModule instance created. Config: Absolute=%s, Percentage=%s.",
-         m_values_absolute ? "true" : "false",
-         m_values_percentage ? "true" : "false");
-    // 注意: 实际的配置加载应通过插件框架提供的机制进行 (例如，如果CAbstractUserModule有config方法)
-    // 这里仅为演示，保持与原 memory.c 类似的默认行为。
-}
+// 假设 gauge_t, value_t, value_list_t, VALUE_LIST_INIT 来自 collectd 或 PluginService.h
+// 如果 PluginService.h 没有包含它们，可能需要类似 #include "collectd.h" (或其C++等效物)
 
-// 辅助函数：解析 /proc/meminfo 中的特定行
-// 例如: "MemTotal:       16269028 kB" -> 提取 "MemTotal", 值存入 target_value_ref
-bool CMemoryModule::parseLine(const std::string& line, const char* key_to_match, gauge_t& target_value_ref) {
-    // 使用 std::string::rfind(key, 0) 来确保 key_to_match 出现在行首
-    if (line.rfind(key_to_match, 0) == 0) {
-        size_t colon_pos = line.find(':');
-        if (colon_pos == std::string::npos) {
-            return false; // 格式不正确，缺少冒号
-        }
+// 用于存储从 /proc/meminfo 解析出的数据
+struct ParsedMemInfo {
+    gauge_t mem_total = 0.0;
+    gauge_t mem_used = 0.0;
+    gauge_t mem_buffered = 0.0;
+    gauge_t mem_cached = 0.0;
+    gauge_t mem_free = 0.0;
+    gauge_t mem_available = 0.0;
+    gauge_t mem_slab_total = 0.0;
+    gauge_t mem_slab_reclaimable = 0.0;
+    gauge_t mem_slab_unreclaimable = 0.0;
 
-        // 从冒号后开始查找第一个非空字符作为数值的开始
-        size_t value_start_pos = line.find_first_not_of(" \t", colon_pos + 1);
-        if (value_start_pos == std::string::npos) {
-            return false; // 冒号后全是空格或没有内容
-        }
+    bool detailed_slab_info_present = false;
+    bool mem_available_info_present = false;
+};
 
-        // 从数值开始处查找第一个空白字符作为数值的结束
-        size_t value_end_pos = line.find_first_of(" \t", value_start_pos);
-        std::string value_str;
-        if (value_end_pos == std::string::npos) { // 数值直到行尾
-            value_str = line.substr(value_start_pos);
-        } else {
-            value_str = line.substr(value_start_pos, value_end_pos - value_start_pos);
-        }
-        
-        if (value_str.empty()) return false;
+class CMemoryModule final : public CAbstractUserModule {
+public:
+    CMemoryModule(); // 构造函数
+    ~CMemoryModule() override = default; // 默认析构函数
 
-        try {
-            // /proc/meminfo 中的值通常以 kB 为单位
-            target_value_ref = std::stod(value_str) * 1024.0; // 转换为字节
-            return true;
-        } catch (const std::invalid_argument& ia) {
-            WARNING("Failed to parse numeric value for key '%s' from substring '%s'. Invalid argument: %s", key_to_match, value_str.c_str(), ia.what());
-        } catch (const std::out_of_range& oor) {
-            WARNING("Numeric value out of range for key '%s' from substring '%s'. Out of range: %s", key_to_match, value_str.c_str(), oor.what());
-        }
-        return false;
-    }
-    return false; // Key不匹配
-}
+    // 插件主读取函数，由 PluginService 调用
+    // 假设 CAbstractUserModule 定义了 virtual int read() = 0; 或类似的
+    int read() override;
 
-bool CMemoryModule::parseMemInfo(ParsedMemInfo& data_out) {
-    std::ifstream meminfo_file("/proc/meminfo");
-    if (!meminfo_file.is_open()) {
-        ERROR("Failed to open /proc/meminfo: %s", strerror(errno));
-        return false;
-    }
+private:
+    // 解析 /proc/meminfo 文件
+    bool parseMemInfo(ParsedMemInfo& data_out);
 
-    // 重置数据结构体为默认值
-    data_out = ParsedMemInfo{}; 
-
-    std::string current_line;
-    while (std::getline(meminfo_file, current_line)) {
-        if (parseLine(current_line, "MemTotal:", data_out.mem_total)) continue;
-        if (parseLine(current_line, "MemFree:", data_out.mem_free)) continue;
-        if (parseLine(current_line, "Buffers:", data_out.mem_buffered)) continue;
-        if (parseLine(current_line, "Cached:", data_out.mem_cached)) continue;
-        if (parseLine(current_line, "Slab:", data_out.mem_slab_total)) continue;
-        
-        if (parseLine(current_line, "SReclaimable:", data_out.mem_slab_reclaimable)) {
-            data_out.detailed_slab_info_present = true; // 标记Slab详细信息存在
-            continue;
-        }
-        if (parseLine(current_line, "SUnreclaim:", data_out.mem_slab_unreclaimable)) {
-            // SReclaimable 和 SUnreclaim 通常一起出现，所以设置 detailed_slab_info_present 是合理的
-            data_out.detailed_slab_info_present = true;
-            continue;
-        }
-        if (parseLine(current_line, "MemAvailable:", data_out.mem_available)) {
-            data_out.mem_available_info_present = true; // 标记MemAvailable信息存在
-            continue;
-        }
-    }
-
-    // 文件读取完毕 (std::ifstream 会在析构时自动关闭)
-
-    // 健全性检查 (来自原 memory.c)
-    // 如果 MemTotal 小于 (Free + Buffers + Cached + Slab)，则认为数据有问题。
-    // 注意：这里的 Slab 是指 /proc/meminfo 中 "Slab:" 行的总Slab值。
-    if (data_out.mem_total < (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_total)) {
-        WARNING("Data sanity check failed: MemTotal (%lf) is less than the sum of Free (%lf), Buffered (%lf), Cached (%lf), and SlabTotal (%lf).",
-                data_out.mem_total, data_out.mem_free, data_out.mem_buffered, data_out.mem_cached, data_out.mem_slab_total);
-        return false; // 指示数据解析或内容存在问题
-    }
-
-    // 计算 mem_used (逻辑来自原 memory.c)
-    if (data_out.detailed_slab_info_present) {
-        // 如果有详细的Slab信息，Used = Total - (Free + Buffers + Cached + SReclaimable)
-        // SReclaimable 被认为是可回收的，类似于缓存，不完全计入"已用"。
-        data_out.mem_used = data_out.mem_total - (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_reclaimable);
-    } else {
-        // 如果没有详细的Slab信息，Used = Total - (Free + Buffers + Cached + Slab_total)
-        data_out.mem_used = data_out.mem_total - (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_total);
-    }
+    // 辅助方法：解析 /proc/meminfo 中的单行
+    bool parseLine(const std::string& line, const char* key_to_match, gauge_t& target_value_ref);
     
-    // 确保 used 不为负数（例如，由于浮点精度问题或 SReclaimable 异常大）
-    if (data_out.mem_used < 0) data_out.mem_used = 0;
+    // 提交单个指标数据
+    void submitMetric(const std::string& type_instance_name, gauge_t value, const char* type_name = "memory");
 
+    // 根据配置提交所有相关的内存指标
+    void submitMemoryData(const ParsedMemInfo& parsed_data);
 
-    return true; // 解析成功
+    // 配置项，类似于原 memory.c 中的全局静态变量
+    bool m_values_absolute;
+    bool m_values_percentage;
+};
+
+// 工厂函数声明
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+CAbstractUserModule* CreateMemoryModule();
+void DestroyMemoryModule(CAbstractUserModule* pUserModule);
+
+#ifdef __cplusplus
 }
-
-void CMemoryModule::submitMetric(const std::string& type_instance_name, gauge_t value, const char* type_name) {
-    value_list_t vl = VALUE_LIST_INIT; // 初始化 value_list_t
-    value_t val_entry = { .gauge = value }; // C99风格的复合文字初始化
-
-    vl.values = &val_entry;
-    vl.values_len = 1;
-
-    // 使用 snprintf 填充插件名称、类型和类型实例
-    // 修正了 uptimeSubmit 中 snprintf 的第三个参数用法
-    snprintf(vl.plugin, sizeof(vl.plugin), "memory");
-    snprintf(vl.type, sizeof(vl.type), "%s", type_name);
-    snprintf(vl.type_instance, sizeof(vl.type_instance), "%s", type_instance_name.c_str());
-
-    // 时间戳 (vl.time) 和间隔 (vl.interval) 通常由 PluginService 或 collectd核心在分发前设置
-    // 如果需要在此处设置，可以使用 cdtime() (如果可用)
-    // vl.time = cdtime(); 
-
-    INFO("Submitting metric: plugin='%s', type='%s', type_instance='%s', value=%lf",
-         vl.plugin, vl.type, vl.type_instance, value);
-    PluginService::Instance().dispatchValues(&vl); // 通过PluginService分发数据
-}
-
-void CMemoryModule::submitMemoryData(const ParsedMemInfo& parsed_data) {
-    // 提交绝对值
-    if (m_values_absolute) {
-        submitMetric("used", parsed_data.mem_used, "memory_absolute"); // 使用不同的类型名以示区分
-        submitMetric("buffered", parsed_data.mem_buffered, "memory_absolute");
-        submitMetric("cached", parsed_data.mem_cached, "memory_absolute");
-        submitMetric("free", parsed_data.mem_free, "memory_absolute");
-
-        if (parsed_data.detailed_slab_info_present) {
-            submitMetric("slab_reclaimable", parsed_data.mem_slab_reclaimable, "memory_absolute");
-            submitMetric("slab_unreclaimable", parsed_data.mem_slab_unreclaimable, "memory_absolute");
-        } else {
-            // 如果没有详细Slab信息，提交总Slab值
-            submitMetric("slab_total", parsed_data.mem_slab_total, "memory_absolute");
-        }
-
-        if (parsed_data.mem_available_info_present) {
-            submitMetric("available", parsed_data.mem_available, "memory_absolute");
-        }
-    }
-
-    // 提交百分比值
-    if (m_values_percentage && parsed_data.mem_total > 0.000001) { // 避免除以零或极小值
-        submitMetric("used_percent", (parsed_data.mem_used / parsed_data.mem_total) * 100.0, "memory_percent");
-        submitMetric("buffered_percent", (parsed_data.mem_buffered / parsed_data.mem_total) * 100.0, "memory_percent");
-        submitMetric("cached_percent", (parsed_data.mem_cached / parsed_data.mem_total) * 100.0, "memory_percent");
-        submitMetric("free_percent", (parsed_data.mem_free / parsed_data.mem_total) * 100.0, "memory_percent");
-
-        if (parsed_data.detailed_slab_info_present) {
-            submitMetric("slab_reclaimable_percent", (parsed_data.mem_slab_reclaimable / parsed_data.mem_total) * 100.0, "memory_percent");
-            submitMetric("slab_unreclaimable_percent", (parsed_data.mem_slab_unreclaimable / parsed_data.mem_total) * 100.0, "memory_percent");
-        } else {
-            submitMetric("slab_total_percent", (parsed_data.mem_slab_total / parsed_data.mem_total) * 100.0, "memory_percent");
-        }
-       
-        if (parsed_data.mem_available_info_present) {
-            submitMetric("available_percent", (parsed_data.mem_available / parsed_data.mem_total) * 100.0, "memory_percent");
-        }
-    }
-}
-
-int CMemoryModule::read() {
-    INFO("read() method called.");
-    ParsedMemInfo current_mem_data;
-
-    if (!parseMemInfo(current_mem_data)) {
-        ERROR("Failed to parse memory information from /proc/meminfo.");
-        return -1; // 指示读取失败
-    }
-
-    submitMemoryData(current_mem_data);
-    return 0; // 指示读取成功
-}
-
-// 工厂函数实现
-CAbstractUserModule* CreateMemoryModule() {
-    INFO("CreateMemoryModule() called, creating new CMemoryModule instance.");
-    return new CMemoryModule();
-}
-
-void DestroyMemoryModule(CAbstractUserModule* pUserModule) {
-    INFO("DestroyMemoryModule() called.");
-    // assert(pUserModule != nullptr); // 如果需要断言
-    if (pUserModule != nullptr) {
-        delete pUserModule;
-        // 将调用方的指针设为 nullptr 不是此函数的责任
-    }
-}
+#endif
