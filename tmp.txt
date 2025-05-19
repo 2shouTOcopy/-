@@ -1,270 +1,188 @@
-#include "collectd.h"
-#include "plugin.h"
-#include "utils/common/common.h" // For sstrncpy, STRERRNO, STATIC_ARRAY_SIZE, strsplit, oconfig_item_t, cf_util_get_boolean
-#include "config_features.h" // For KERNEL_LINUX (usually)
+#include "memory.h"
+#include "../daemon/PluginService.h" // For PluginService, value_list_t, value_t, VALUE_LIST_INIT, INFO, ERROR macros
+                                     // Also assuming gauge_t is effectively defined/usable through includes here or ModuleBase.h
 
-#include <string>
-#include <vector>
-#include <fstream>   // For std::ifstream
-#include <cstring>   // For strncasecmp
-#include <cstdlib>   // For atof (though std::stod is preferred in C++)
-#include <system_error> // For std::error_code, std::system_category if more advanced error handling was needed
+#include <sys/sysinfo.h> // For struct sysinfo and sysinfo()
+#include <cstring>       // For snprintf, strerror
+#include <cerrno>        // For errno
+#include <cassert>       // For assert
 
-// Assuming KERNEL_LINUX is defined as it is in the C code's context for core functionality.
-#if KERNEL_LINUX
+// Placeholder definitions for logging macros and types if not provided by included headers.
+// These should ideally come from your project's common headers (e.g., PluginService.h or similar).
+/*
+#ifndef INFO
+#include <cstdio> // Required for fprintf, stdout
+#define INFO(format, ...) do { fprintf(stdout, "[INFO] "); fprintf(stdout, format, ##__VA_ARGS__); fprintf(stdout, "\n"); } while(0)
+#endif
 
-namespace CollectdMemoryPlugin {
+#ifndef ERROR
+#include <cstdio> // Required for fprintf, stderr
+#define ERROR(format, ...) do { fprintf(stderr, "[ERROR] "); fprintf(stderr, format, ##__VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#endif
 
-// Plugin configuration state
-static bool g_values_absolute = true;
-static bool g_values_percentage = false;
+// Assuming value_t, value_list_t, and VALUE_LIST_INIT are defined elsewhere.
+// Example:
+// typedef double gauge_t;
+// typedef struct { gauge_t gauge; /* other types */ } value_t;
+// typedef struct value_list_s {
+//     value_t *values;
+//     size_t values_len;
+//     char plugin[64];
+//     char type[64];
+//     // Other fields like plugin_instance, type_instance, host, time, interval if used by PluginService
+// } value_list_t;
+// #define VALUE_LIST_INIT {nullptr, 0, {0}, {0}} // Example initialization
+*/
 
-// Helper function to replace the MEMORY_SUBMIT macro
-template <typename... Args>
-void submit_memory_values(value_list_t *vl, Args... args) {
-    if (g_values_absolute) {
-        // The false indicates that the values are absolute, not percentages.
-        plugin_dispatch_multivalue(vl, false, DS_TYPE_GAUGE, args..., nullptr);
-    }
-    if (g_values_percentage) {
-        // The true indicates that the values are percentages.
-        plugin_dispatch_multivalue(vl, true, DS_TYPE_GAUGE, args..., nullptr);
-    }
-}
 
-#if KERNEL_LINUX // Redundant here but to mirror C structure if it was more complex
-static void memory_submit_available_impl(gauge_t value) {
-    value_list_t vl = VALUE_LIST_INIT;
-    value_t v = {.gauge = value}; // C99 compound literal, works in C++
+/**
+ * @brief Submits a gauge metric to the PluginService.
+ *
+ * @param metric_name The specific name of the metric (e.g., "memory_total_bytes"). This will be used as the 'type'.
+ * @param value The value of the metric.
+ */
+void CMemoryModule::submitMetric(const char* metric_name, gauge_t value)
+{
+    value_list_t vl = VALUE_LIST_INIT; // Initialize using the provided macro or C++11 zero-initialization if appropriate
+    value_t temp_val;                  // Structure to hold the actual metric value
 
-    vl.values = &v;
+    // In C++11, ensure temp_val is properly initialized before assigning to a union member.
+    // If value_t is a union, this assignment is specific to the 'gauge' member.
+    temp_val.gauge = value;
+
+    vl.values = &temp_val;
     vl.values_len = 1;
 
-    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
-    sstrncpy(vl.type, "memory", sizeof(vl.type));
-    sstrncpy(vl.type_instance, "available", sizeof(vl.type_instance));
-    // vl.time will be set by plugin_dispatch_values if not set before, or use cdtime() if needed here
+    // Set the plugin name to "memory"
+    // Using snprintf for safe string copying into fixed-size buffers.
+    snprintf(vl.plugin, sizeof(vl.plugin), "memory");
+    // Ensure null-termination, though snprintf should do this if there's space.
+    vl.plugin[sizeof(vl.plugin) - 1] = '\0';
 
-    plugin_dispatch_values(&vl);
+    // Set the type to the specific metric being reported (e.g., "memory_free_bytes")
+    snprintf(vl.type, sizeof(vl.type), "%s", metric_name);
+    vl.type[sizeof(vl.type) - 1] = '\0'; // Ensure null-termination
+
+    // Log the submission, similar to the uptime plugin's logging format
+    // Assuming gauge_t might be float or double, use %lf for logging.
+    // The INFO macro should handle printf-style arguments.
+    INFO("[memory] %s Submit :%lf", metric_name, static_cast<double>(value));
+    
+    PluginService::Instance().dispatchValues(&vl);
 }
-#endif // KERNEL_LINUX for memory_submit_available_impl
 
-static int memory_read_internal_impl(value_list_t *vl_template) {
-    std::ifstream meminfo_file("/proc/meminfo");
-    if (!meminfo_file.is_open()) {
-        WARNING("memory plugin: C++: Failed to open /proc/meminfo: %s", STRERRNO);
+/**
+ * @brief Retrieves system memory information using the sysinfo system call.
+ *
+ * @param info Reference to a sysinfo struct to be filled.
+ * @return true if sysinfo call was successful, false otherwise.
+ */
+bool CMemoryModule::getSysMemoryInfo(struct sysinfo &info_ref)
+{
+    if (sysinfo(&info_ref) != 0)
+    {
+        // Log error, consistent with uptime plugin's error logging
+        ERROR("memory plugin: Error calling sysinfo: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Reads memory and swap statistics and submits them.
+ *
+ * This method is called by the plugin framework to collect and report data.
+ * @return 0 on success, -1 on failure.
+ */
+int CMemoryModule::read()
+{
+    INFO("[memory] read"); // Log entry into the read method
+
+    struct sysinfo s_info {}; // C++11 uniform initialization
+    if (!getSysMemoryInfo(s_info))
+    {
+        return -1; // Error already logged by getSysMemoryInfo
+    }
+
+    // sysinfo.mem_unit is the size of memory units in bytes.
+    // All RAM and swap values from sysinfo are in these units.
+    unsigned long long mem_unit = s_info.mem_unit;
+    if (mem_unit == 0) { // Should not happen with a valid sysinfo call, but defensive check
+        ERROR("memory plugin: sysinfo.mem_unit is 0, cannot calculate memory values.");
         return -1;
     }
 
-    std::string line_str;
-    std::vector<char> line_buffer; // For strsplit, which modifies the buffer
+    // --- Physical Memory Metrics ---
+    unsigned long long total_ram_bytes = static_cast<unsigned long long>(s_info.totalram) * mem_unit;
+    unsigned long long free_ram_bytes = static_cast<unsigned long long>(s_info.freeram) * mem_unit;
+    unsigned long long shared_ram_bytes = static_cast<unsigned long long>(s_info.sharedram) * mem_unit;
+    unsigned long long buffer_ram_bytes = static_cast<unsigned long long>(s_info.bufferram) * mem_unit;
+    
+    // Calculate used RAM. A common definition is Total - Free.
+    // For more advanced "used" (e.g., Total - Free - Buffers - Cache), /proc/meminfo parsing would be needed.
+    // Sticking to sysinfo, Total - Free is a straightforward interpretation.
+    unsigned long long used_ram_bytes = total_ram_bytes - free_ram_bytes;
 
-    // Must match the fields array size in the original C code for strsplit
-    char *fields[8];
-    int numfields;
+    submitMetric("memory_total_bytes", static_cast<gauge_t>(total_ram_bytes));
+    submitMetric("memory_free_bytes", static_cast<gauge_t>(free_ram_bytes));
+    submitMetric("memory_shared_bytes", static_cast<gauge_t>(shared_ram_bytes));
+    submitMetric("memory_buffer_bytes", static_cast<gauge_t>(buffer_ram_bytes));
+    submitMetric("memory_used_bytes", static_cast<gauge_t>(used_ram_bytes));
 
-    bool mem_available_info = false;
-    bool detailed_slab_info = false;
-
-    gauge_t mem_total = 0.0;
-    gauge_t mem_used = 0.0;
-    gauge_t mem_buffered = 0.0;
-    gauge_t mem_cached = 0.0;
-    gauge_t mem_free = 0.0;
-    gauge_t mem_available = 0.0; // Specific "MemAvailable" field
-    gauge_t mem_slab_total = 0.0;
-    gauge_t mem_slab_reclaimable = 0.0;
-    gauge_t mem_slab_unreclaimable = 0.0;
-
-    while (std::getline(meminfo_file, line_str)) {
-        // Prepare buffer for strsplit
-        line_buffer.assign(line_str.begin(), line_str.end());
-        line_buffer.push_back('\0'); // Null-terminate for C functions
-
-        gauge_t* val_ptr = nullptr;
-
-        if (strncasecmp(line_buffer.data(), "MemTotal:", 9) == 0)
-            val_ptr = &mem_total;
-        else if (strncasecmp(line_buffer.data(), "MemFree:", 8) == 0)
-            val_ptr = &mem_free;
-        else if (strncasecmp(line_buffer.data(), "Buffers:", 8) == 0)
-            val_ptr = &mem_buffered;
-        else if (strncasecmp(line_buffer.data(), "Cached:", 7) == 0)
-            val_ptr = &mem_cached;
-        else if (strncasecmp(line_buffer.data(), "Slab:", 5) == 0)
-            val_ptr = &mem_slab_total;
-        else if (strncasecmp(line_buffer.data(), "SReclaimable:", 13) == 0) {
-            val_ptr = &mem_slab_reclaimable;
-            detailed_slab_info = true;
-        } else if (strncasecmp(line_buffer.data(), "SUnreclaim:", 11) == 0) {
-            val_ptr = &mem_slab_unreclaimable;
-            detailed_slab_info = true;
-        } else if (strncasecmp(line_buffer.data(), "MemAvailable:", 13) == 0) {
-            val_ptr = &mem_available;
-            mem_available_info = true;
-        } else {
-            continue; // Not a line we are interested in
-        }
-
-        numfields = strsplit(line_buffer.data(), fields, STATIC_ARRAY_SIZE(fields));
-        if (numfields < 2) { // Expect at least "Key:" and "Value"
-            continue;
-        }
-
-        // Convert value from string to gauge_t (double), value is in KB, convert to bytes
-        try {
-            // fields[1] is the numeric value string
-            *val_ptr = 1024.0 * std::stod(fields[1]);
-        } catch (const std::invalid_argument& ia) {
-            WARNING("memory plugin: C++: Failed to parse value for %s: %s", fields[0], fields[1]);
-            continue;
-        } catch (const std::out_of_range& oor) {
-            WARNING("memory plugin: C++: Value out of range for %s: %s", fields[0], fields[1]);
-            continue;
-        }
+    if (total_ram_bytes > 0)
+    {
+        gauge_t percent_used = (static_cast<gauge_t>(used_ram_bytes) / static_cast<gauge_t>(total_ram_bytes)) * 100.0;
+        submitMetric("memory_percent_used", percent_used);
+    }
+    else
+    {
+        submitMetric("memory_percent_used", 0.0); // Avoid division by zero; report 0% if total RAM is zero
     }
 
-    // meminfo_file is closed automatically by std::ifstream destructor
-    // The original C code checks fclose status, which is less common for std::ifstream
-    // but one could check meminfo_file.bad() after loop if strict error checking on close is needed.
+    // --- Swap Space Metrics ---
+    unsigned long long total_swap_bytes = static_cast<unsigned long long>(s_info.totalswap) * mem_unit;
+    unsigned long long free_swap_bytes = static_cast<unsigned long long>(s_info.freeswap) * mem_unit;
+    unsigned long long used_swap_bytes = total_swap_bytes - free_swap_bytes;
 
-    // Sanity check (replicating the C code's final check)
-    // The original C code had a slightly more complex nested if, but this was the effective final check.
-    if (mem_total < (mem_free + mem_buffered + mem_cached + mem_slab_total)) {
-        WARNING("memory plugin: C++: Sanity check failed: MemTotal (%g) < sum of components.", mem_total);
-        return -1;
+    submitMetric("swap_total_bytes", static_cast<gauge_t>(total_swap_bytes));
+    submitMetric("swap_free_bytes", static_cast<gauge_t>(free_swap_bytes));
+    submitMetric("swap_used_bytes", static_cast<gauge_t>(used_swap_bytes));
+
+    if (total_swap_bytes > 0)
+    {
+        gauge_t swap_percent_used = (static_cast<gauge_t>(used_swap_bytes) / static_cast<gauge_t>(total_swap_bytes)) * 100.0;
+        submitMetric("swap_percent_used", swap_percent_used);
+    }
+    else
+    {
+        submitMetric("swap_percent_used", 0.0); // Avoid division by zero; report 0% if total swap is zero
     }
     
-    // Calculate mem_used
-    if (detailed_slab_info) {
-        mem_used = mem_total - (mem_free + mem_buffered + mem_cached + mem_slab_reclaimable);
-    } else {
-        mem_used = mem_total - (mem_free + mem_buffered + mem_cached + mem_slab_total);
-    }
-
-    // Dispatch values using the vl_template provided by memory_read_impl
-    if (detailed_slab_info) {
-        submit_memory_values(vl_template,
-                             "used", mem_used,
-                             "buffered", mem_buffered,
-                             "cached", mem_cached,
-                             "free", mem_free,
-                             "slab_unrecl", mem_slab_unreclaimable,
-                             "slab_recl", mem_slab_reclaimable);
-    } else {
-        submit_memory_values(vl_template,
-                             "used", mem_used,
-                             "buffered", mem_buffered,
-                             "cached", mem_cached,
-                             "free", mem_free,
-                             "slab", mem_slab_total);
-    }
-
-    if (mem_available_info) {
-        memory_submit_available_impl(mem_available);
-    }
-
-    return 0;
+    return 0; // Success
 }
 
-// Configuration function
-static int memory_config_impl(oconfig_item_t *ci) {
-    for (int i = 0; i < ci->children_num; i++) {
-        oconfig_item_t *child = ci->children + i;
-        if (strcasecmp("ValuesAbsolute", child->key) == 0) {
-            cf_util_get_boolean(child, &g_values_absolute);
-        } else if (strcasecmp("ValuesPercentage", child->key) == 0) {
-            cf_util_get_boolean(child, &g_values_percentage);
-        } else {
-            ERROR("memory plugin: C++: Invalid configuration option: \"%s\".", child->key);
-            // Original C code does not return error here, so match that.
-        }
-    }
-    return 0;
+/**
+ * @brief Factory function to create an instance of CMemoryModule.
+ *
+ * @return CAbstractUserModule* Pointer to the newly created CMemoryModule instance.
+ */
+CAbstractUserModule* CreateModule()
+{
+    return new (std::nothrow) CMemoryModule(); // Using std::nothrow to align with typical embedded/plugin practices
+                                              // where exceptions might be disabled or undesirable.
+                                              // Caller should check for nullptr.
 }
 
-// Init function
-static int memory_init_impl() {
-    // No specific initialization for Linux in the C code.
-    return 0;
+/**
+ * @brief Factory function to destroy an instance of CMemoryModule.
+ *
+ * @param pUserModule Pointer to the CMemoryModule instance to be destroyed.
+ */
+void DestroyModule(CAbstractUserModule* pUserModule)
+{
+    assert(pUserModule != nullptr); // Use C++11 nullptr for assertions
+    delete pUserModule;
+    // Setting the local pUserModule pointer to nullptr here has no effect on the caller's pointer.
+    // pUserModule = nullptr; // Kept if matching an existing style, but functionally limited for local param.
 }
-
-// Read function (sets up value_list_t and calls internal read)
-static int memory_read_impl() {
-    // The original C code uses a value_t v[1] array on stack for vl.values
-    // but plugin_dispatch_multivalue expects a null-terminated list of type strings and gauge_t values.
-    // The vl itself passed to memory_read_internal_impl acts as a template for plugin name, type, and time.
-    // The actual values and their count are handled by plugin_dispatch_multivalue.
-    // So, vl.values and vl.values_len in this context are for the overall vl structure,
-    // not directly for the multivalue dispatch items.
-    // The original memory_read set vl.values_len = STATIC_ARRAY_SIZE(v) which is 1,
-    // this seems to be a placeholder or for a different type of dispatch.
-    // For plugin_dispatch_multivalue, vl.values is not directly used for the varargs data.
-
-    value_list_t vl = VALUE_LIST_INIT; // Initialize with default values
-
-    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
-    sstrncpy(vl.type, "memory", sizeof(vl.type)); // This type is for the whole group
-    vl.time = cdtime();
-    // vl.interval is usually inherited or set by collectd core based on plugin config
-
-    return memory_read_internal_impl(&vl);
-}
-
-} // namespace CollectdMemoryPlugin
-
-#endif // KERNEL_LINUX for the main implementation block
-
-// C-style entry points for collectd
-extern "C" {
-    // Config function
-    static int memory_config_entry(oconfig_item_t *ci) {
-        #if KERNEL_LINUX
-        return CollectdMemoryPlugin::memory_config_impl(ci);
-        #else
-        // If not Linux, this plugin might do nothing or be disabled.
-        // The original C code doesn't show non-Linux behavior for config,
-        // implying it might still parse config but read would do nothing.
-        // For safety, return 0.
-        return 0;
-        #endif
-    }
-
-    // Init function
-    static int memory_init_entry(void) {
-        #if KERNEL_LINUX
-        return CollectdMemoryPlugin::memory_init_impl();
-        #else
-        // No specific init for non-Linux mentioned, matches C.
-        // Print a warning if this plugin is loaded on non-Linux.
-        // WARNING("memory plugin: This plugin is primarily designed for Linux (/proc/meminfo) and may not collect data on this system.");
-        return 0; // Successful init, even if it does nothing.
-        #endif
-    }
-
-    // Read function
-    static int memory_read_entry(void) {
-        #if KERNEL_LINUX
-        return CollectdMemoryPlugin::memory_read_impl();
-        #else
-        // On non-Linux systems, this plugin would typically do nothing or fail gracefully.
-        // The C code snippet relies entirely on /proc/meminfo.
-        // Returning 0 (success, but no data) or -1 (error/not applicable).
-        // To match the C code (which would fail fopen), let's try to indicate not applicable.
-        // However, simply returning 0 is fine if it means "read successfully, no data submitted".
-        // The original C code has its core logic inside #if KERNEL_LINUX for memory_read_internal.
-        // If KERNEL_LINUX is not defined, memory_read_internal would not be compiled,
-        // and memory_read would try to call a non-existent function or an empty stub.
-        // Thus, the #if KERNEL_LINUX guard around the call is crucial.
-        return 0; // Successfully did nothing on non-Linux.
-        #endif
-    }
-
-    // Module registration
-    void module_register(void) {
-        plugin_register_complex_config("memory", memory_config_entry);
-        plugin_register_init("memory", memory_init_entry);
-        plugin_register_read("memory", memory_read_entry);
-    }
-} // extern "C"
 
