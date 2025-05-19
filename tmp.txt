@@ -1,188 +1,223 @@
-#include "memory.h"
-#include "../daemon/PluginService.h" // For PluginService, value_list_t, value_t, VALUE_LIST_INIT, INFO, ERROR macros
-                                     // Also assuming gauge_t is effectively defined/usable through includes here or ModuleBase.h
+#include "MemoryModule.h"
 
-#include <sys/sysinfo.h> // For struct sysinfo and sysinfo()
-#include <cstring>       // For snprintf, strerror
-#include <cerrno>        // For errno
-#include <cassert>       // For assert
+#include <fstream>      // For std::ifstream
+#include <system_error> // For strerror, errno (C++11方式)
+#include <cstring>      // For strncasecmp (虽然parseLine中用了std::string::rfind)
+#include <cstdio>       // For snprintf
+#include <cerrno>       // For errno
+// #include <cassert>   // 如果要使用 assert
 
-// Placeholder definitions for logging macros and types if not provided by included headers.
-// These should ideally come from your project's common headers (e.g., PluginService.h or similar).
-/*
+// 假设日志宏 INFO, ERROR, WARNING 由 PluginService.h 或其包含的文件提供
+// 如果没有，为了能编译通过，这里使用简化的 printf 作为占位符
 #ifndef INFO
-#include <cstdio> // Required for fprintf, stdout
-#define INFO(format, ...) do { fprintf(stdout, "[INFO] "); fprintf(stdout, format, ##__VA_ARGS__); fprintf(stdout, "\n"); } while(0)
+#define INFO(format, ...) printf("[INFO] [MemoryModule] " format "\n", ##__VA_ARGS__)
 #endif
-
 #ifndef ERROR
-#include <cstdio> // Required for fprintf, stderr
-#define ERROR(format, ...) do { fprintf(stderr, "[ERROR] "); fprintf(stderr, format, ##__VA_ARGS__); fprintf(stderr, "\n"); } while(0)
+#define ERROR(format, ...) printf("[ERROR] [MemoryModule] " format "\n", ##__VA_ARGS__)
+#endif
+#ifndef WARNING
+#define WARNING(format, ...) printf("[WARNING] [MemoryModule] " format "\n", ##__VA_ARGS__)
 #endif
 
-// Assuming value_t, value_list_t, and VALUE_LIST_INIT are defined elsewhere.
-// Example:
-// typedef double gauge_t;
-// typedef struct { gauge_t gauge; /* other types */ } value_t;
-// typedef struct value_list_s {
-//     value_t *values;
-//     size_t values_len;
-//     char plugin[64];
-//     char type[64];
-//     // Other fields like plugin_instance, type_instance, host, time, interval if used by PluginService
-// } value_list_t;
-// #define VALUE_LIST_INIT {nullptr, 0, {0}, {0}} // Example initialization
-*/
-
-
-/**
- * @brief Submits a gauge metric to the PluginService.
- *
- * @param metric_name The specific name of the metric (e.g., "memory_total_bytes"). This will be used as the 'type'.
- * @param value The value of the metric.
- */
-void CMemoryModule::submitMetric(const char* metric_name, gauge_t value)
-{
-    value_list_t vl = VALUE_LIST_INIT; // Initialize using the provided macro or C++11 zero-initialization if appropriate
-    value_t temp_val;                  // Structure to hold the actual metric value
-
-    // In C++11, ensure temp_val is properly initialized before assigning to a union member.
-    // If value_t is a union, this assignment is specific to the 'gauge' member.
-    temp_val.gauge = value;
-
-    vl.values = &temp_val;
-    vl.values_len = 1;
-
-    // Set the plugin name to "memory"
-    // Using snprintf for safe string copying into fixed-size buffers.
-    snprintf(vl.plugin, sizeof(vl.plugin), "memory");
-    // Ensure null-termination, though snprintf should do this if there's space.
-    vl.plugin[sizeof(vl.plugin) - 1] = '\0';
-
-    // Set the type to the specific metric being reported (e.g., "memory_free_bytes")
-    snprintf(vl.type, sizeof(vl.type), "%s", metric_name);
-    vl.type[sizeof(vl.type) - 1] = '\0'; // Ensure null-termination
-
-    // Log the submission, similar to the uptime plugin's logging format
-    // Assuming gauge_t might be float or double, use %lf for logging.
-    // The INFO macro should handle printf-style arguments.
-    INFO("[memory] %s Submit :%lf", metric_name, static_cast<double>(value));
-    
-    PluginService::Instance().dispatchValues(&vl);
+CMemoryModule::CMemoryModule() 
+    : m_values_absolute(true),      // 默认提交绝对值
+      m_values_percentage(false) {  // 默认不提交百分比
+    INFO("CMemoryModule instance created. Config: Absolute=%s, Percentage=%s.",
+         m_values_absolute ? "true" : "false",
+         m_values_percentage ? "true" : "false");
+    // 注意: 实际的配置加载应通过插件框架提供的机制进行 (例如，如果CAbstractUserModule有config方法)
+    // 这里仅为演示，保持与原 memory.c 类似的默认行为。
 }
 
-/**
- * @brief Retrieves system memory information using the sysinfo system call.
- *
- * @param info Reference to a sysinfo struct to be filled.
- * @return true if sysinfo call was successful, false otherwise.
- */
-bool CMemoryModule::getSysMemoryInfo(struct sysinfo &info_ref)
-{
-    if (sysinfo(&info_ref) != 0)
-    {
-        // Log error, consistent with uptime plugin's error logging
-        ERROR("memory plugin: Error calling sysinfo: %s", strerror(errno));
+// 辅助函数：解析 /proc/meminfo 中的特定行
+// 例如: "MemTotal:       16269028 kB" -> 提取 "MemTotal", 值存入 target_value_ref
+bool CMemoryModule::parseLine(const std::string& line, const char* key_to_match, gauge_t& target_value_ref) {
+    // 使用 std::string::rfind(key, 0) 来确保 key_to_match 出现在行首
+    if (line.rfind(key_to_match, 0) == 0) {
+        size_t colon_pos = line.find(':');
+        if (colon_pos == std::string::npos) {
+            return false; // 格式不正确，缺少冒号
+        }
+
+        // 从冒号后开始查找第一个非空字符作为数值的开始
+        size_t value_start_pos = line.find_first_not_of(" \t", colon_pos + 1);
+        if (value_start_pos == std::string::npos) {
+            return false; // 冒号后全是空格或没有内容
+        }
+
+        // 从数值开始处查找第一个空白字符作为数值的结束
+        size_t value_end_pos = line.find_first_of(" \t", value_start_pos);
+        std::string value_str;
+        if (value_end_pos == std::string::npos) { // 数值直到行尾
+            value_str = line.substr(value_start_pos);
+        } else {
+            value_str = line.substr(value_start_pos, value_end_pos - value_start_pos);
+        }
+        
+        if (value_str.empty()) return false;
+
+        try {
+            // /proc/meminfo 中的值通常以 kB 为单位
+            target_value_ref = std::stod(value_str) * 1024.0; // 转换为字节
+            return true;
+        } catch (const std::invalid_argument& ia) {
+            WARNING("Failed to parse numeric value for key '%s' from substring '%s'. Invalid argument: %s", key_to_match, value_str.c_str(), ia.what());
+        } catch (const std::out_of_range& oor) {
+            WARNING("Numeric value out of range for key '%s' from substring '%s'. Out of range: %s", key_to_match, value_str.c_str(), oor.what());
+        }
         return false;
     }
-    return true;
+    return false; // Key不匹配
 }
 
-/**
- * @brief Reads memory and swap statistics and submits them.
- *
- * This method is called by the plugin framework to collect and report data.
- * @return 0 on success, -1 on failure.
- */
-int CMemoryModule::read()
-{
-    INFO("[memory] read"); // Log entry into the read method
-
-    struct sysinfo s_info {}; // C++11 uniform initialization
-    if (!getSysMemoryInfo(s_info))
-    {
-        return -1; // Error already logged by getSysMemoryInfo
+bool CMemoryModule::parseMemInfo(ParsedMemInfo& data_out) {
+    std::ifstream meminfo_file("/proc/meminfo");
+    if (!meminfo_file.is_open()) {
+        ERROR("Failed to open /proc/meminfo: %s", strerror(errno));
+        return false;
     }
 
-    // sysinfo.mem_unit is the size of memory units in bytes.
-    // All RAM and swap values from sysinfo are in these units.
-    unsigned long long mem_unit = s_info.mem_unit;
-    if (mem_unit == 0) { // Should not happen with a valid sysinfo call, but defensive check
-        ERROR("memory plugin: sysinfo.mem_unit is 0, cannot calculate memory values.");
-        return -1;
+    // 重置数据结构体为默认值
+    data_out = ParsedMemInfo{}; 
+
+    std::string current_line;
+    while (std::getline(meminfo_file, current_line)) {
+        if (parseLine(current_line, "MemTotal:", data_out.mem_total)) continue;
+        if (parseLine(current_line, "MemFree:", data_out.mem_free)) continue;
+        if (parseLine(current_line, "Buffers:", data_out.mem_buffered)) continue;
+        if (parseLine(current_line, "Cached:", data_out.mem_cached)) continue;
+        if (parseLine(current_line, "Slab:", data_out.mem_slab_total)) continue;
+        
+        if (parseLine(current_line, "SReclaimable:", data_out.mem_slab_reclaimable)) {
+            data_out.detailed_slab_info_present = true; // 标记Slab详细信息存在
+            continue;
+        }
+        if (parseLine(current_line, "SUnreclaim:", data_out.mem_slab_unreclaimable)) {
+            // SReclaimable 和 SUnreclaim 通常一起出现，所以设置 detailed_slab_info_present 是合理的
+            data_out.detailed_slab_info_present = true;
+            continue;
+        }
+        if (parseLine(current_line, "MemAvailable:", data_out.mem_available)) {
+            data_out.mem_available_info_present = true; // 标记MemAvailable信息存在
+            continue;
+        }
     }
 
-    // --- Physical Memory Metrics ---
-    unsigned long long total_ram_bytes = static_cast<unsigned long long>(s_info.totalram) * mem_unit;
-    unsigned long long free_ram_bytes = static_cast<unsigned long long>(s_info.freeram) * mem_unit;
-    unsigned long long shared_ram_bytes = static_cast<unsigned long long>(s_info.sharedram) * mem_unit;
-    unsigned long long buffer_ram_bytes = static_cast<unsigned long long>(s_info.bufferram) * mem_unit;
-    
-    // Calculate used RAM. A common definition is Total - Free.
-    // For more advanced "used" (e.g., Total - Free - Buffers - Cache), /proc/meminfo parsing would be needed.
-    // Sticking to sysinfo, Total - Free is a straightforward interpretation.
-    unsigned long long used_ram_bytes = total_ram_bytes - free_ram_bytes;
+    // 文件读取完毕 (std::ifstream 会在析构时自动关闭)
 
-    submitMetric("memory_total_bytes", static_cast<gauge_t>(total_ram_bytes));
-    submitMetric("memory_free_bytes", static_cast<gauge_t>(free_ram_bytes));
-    submitMetric("memory_shared_bytes", static_cast<gauge_t>(shared_ram_bytes));
-    submitMetric("memory_buffer_bytes", static_cast<gauge_t>(buffer_ram_bytes));
-    submitMetric("memory_used_bytes", static_cast<gauge_t>(used_ram_bytes));
-
-    if (total_ram_bytes > 0)
-    {
-        gauge_t percent_used = (static_cast<gauge_t>(used_ram_bytes) / static_cast<gauge_t>(total_ram_bytes)) * 100.0;
-        submitMetric("memory_percent_used", percent_used);
-    }
-    else
-    {
-        submitMetric("memory_percent_used", 0.0); // Avoid division by zero; report 0% if total RAM is zero
+    // 健全性检查 (来自原 memory.c)
+    // 如果 MemTotal 小于 (Free + Buffers + Cached + Slab)，则认为数据有问题。
+    // 注意：这里的 Slab 是指 /proc/meminfo 中 "Slab:" 行的总Slab值。
+    if (data_out.mem_total < (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_total)) {
+        WARNING("Data sanity check failed: MemTotal (%lf) is less than the sum of Free (%lf), Buffered (%lf), Cached (%lf), and SlabTotal (%lf).",
+                data_out.mem_total, data_out.mem_free, data_out.mem_buffered, data_out.mem_cached, data_out.mem_slab_total);
+        return false; // 指示数据解析或内容存在问题
     }
 
-    // --- Swap Space Metrics ---
-    unsigned long long total_swap_bytes = static_cast<unsigned long long>(s_info.totalswap) * mem_unit;
-    unsigned long long free_swap_bytes = static_cast<unsigned long long>(s_info.freeswap) * mem_unit;
-    unsigned long long used_swap_bytes = total_swap_bytes - free_swap_bytes;
-
-    submitMetric("swap_total_bytes", static_cast<gauge_t>(total_swap_bytes));
-    submitMetric("swap_free_bytes", static_cast<gauge_t>(free_swap_bytes));
-    submitMetric("swap_used_bytes", static_cast<gauge_t>(used_swap_bytes));
-
-    if (total_swap_bytes > 0)
-    {
-        gauge_t swap_percent_used = (static_cast<gauge_t>(used_swap_bytes) / static_cast<gauge_t>(total_swap_bytes)) * 100.0;
-        submitMetric("swap_percent_used", swap_percent_used);
-    }
-    else
-    {
-        submitMetric("swap_percent_used", 0.0); // Avoid division by zero; report 0% if total swap is zero
+    // 计算 mem_used (逻辑来自原 memory.c)
+    if (data_out.detailed_slab_info_present) {
+        // 如果有详细的Slab信息，Used = Total - (Free + Buffers + Cached + SReclaimable)
+        // SReclaimable 被认为是可回收的，类似于缓存，不完全计入"已用"。
+        data_out.mem_used = data_out.mem_total - (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_reclaimable);
+    } else {
+        // 如果没有详细的Slab信息，Used = Total - (Free + Buffers + Cached + Slab_total)
+        data_out.mem_used = data_out.mem_total - (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_total);
     }
     
-    return 0; // Success
+    // 确保 used 不为负数（例如，由于浮点精度问题或 SReclaimable 异常大）
+    if (data_out.mem_used < 0) data_out.mem_used = 0;
+
+
+    return true; // 解析成功
 }
 
-/**
- * @brief Factory function to create an instance of CMemoryModule.
- *
- * @return CAbstractUserModule* Pointer to the newly created CMemoryModule instance.
- */
-CAbstractUserModule* CreateModule()
-{
-    return new (std::nothrow) CMemoryModule(); // Using std::nothrow to align with typical embedded/plugin practices
-                                              // where exceptions might be disabled or undesirable.
-                                              // Caller should check for nullptr.
+void CMemoryModule::submitMetric(const std::string& type_instance_name, gauge_t value, const char* type_name) {
+    value_list_t vl = VALUE_LIST_INIT; // 初始化 value_list_t
+    value_t val_entry = { .gauge = value }; // C99风格的复合文字初始化
+
+    vl.values = &val_entry;
+    vl.values_len = 1;
+
+    // 使用 snprintf 填充插件名称、类型和类型实例
+    // 修正了 uptimeSubmit 中 snprintf 的第三个参数用法
+    snprintf(vl.plugin, sizeof(vl.plugin), "memory");
+    snprintf(vl.type, sizeof(vl.type), "%s", type_name);
+    snprintf(vl.type_instance, sizeof(vl.type_instance), "%s", type_instance_name.c_str());
+
+    // 时间戳 (vl.time) 和间隔 (vl.interval) 通常由 PluginService 或 collectd核心在分发前设置
+    // 如果需要在此处设置，可以使用 cdtime() (如果可用)
+    // vl.time = cdtime(); 
+
+    INFO("Submitting metric: plugin='%s', type='%s', type_instance='%s', value=%lf",
+         vl.plugin, vl.type, vl.type_instance, value);
+    PluginService::Instance().dispatchValues(&vl); // 通过PluginService分发数据
 }
 
-/**
- * @brief Factory function to destroy an instance of CMemoryModule.
- *
- * @param pUserModule Pointer to the CMemoryModule instance to be destroyed.
- */
-void DestroyModule(CAbstractUserModule* pUserModule)
-{
-    assert(pUserModule != nullptr); // Use C++11 nullptr for assertions
-    delete pUserModule;
-    // Setting the local pUserModule pointer to nullptr here has no effect on the caller's pointer.
-    // pUserModule = nullptr; // Kept if matching an existing style, but functionally limited for local param.
+void CMemoryModule::submitMemoryData(const ParsedMemInfo& parsed_data) {
+    // 提交绝对值
+    if (m_values_absolute) {
+        submitMetric("used", parsed_data.mem_used, "memory_absolute"); // 使用不同的类型名以示区分
+        submitMetric("buffered", parsed_data.mem_buffered, "memory_absolute");
+        submitMetric("cached", parsed_data.mem_cached, "memory_absolute");
+        submitMetric("free", parsed_data.mem_free, "memory_absolute");
+
+        if (parsed_data.detailed_slab_info_present) {
+            submitMetric("slab_reclaimable", parsed_data.mem_slab_reclaimable, "memory_absolute");
+            submitMetric("slab_unreclaimable", parsed_data.mem_slab_unreclaimable, "memory_absolute");
+        } else {
+            // 如果没有详细Slab信息，提交总Slab值
+            submitMetric("slab_total", parsed_data.mem_slab_total, "memory_absolute");
+        }
+
+        if (parsed_data.mem_available_info_present) {
+            submitMetric("available", parsed_data.mem_available, "memory_absolute");
+        }
+    }
+
+    // 提交百分比值
+    if (m_values_percentage && parsed_data.mem_total > 0.000001) { // 避免除以零或极小值
+        submitMetric("used_percent", (parsed_data.mem_used / parsed_data.mem_total) * 100.0, "memory_percent");
+        submitMetric("buffered_percent", (parsed_data.mem_buffered / parsed_data.mem_total) * 100.0, "memory_percent");
+        submitMetric("cached_percent", (parsed_data.mem_cached / parsed_data.mem_total) * 100.0, "memory_percent");
+        submitMetric("free_percent", (parsed_data.mem_free / parsed_data.mem_total) * 100.0, "memory_percent");
+
+        if (parsed_data.detailed_slab_info_present) {
+            submitMetric("slab_reclaimable_percent", (parsed_data.mem_slab_reclaimable / parsed_data.mem_total) * 100.0, "memory_percent");
+            submitMetric("slab_unreclaimable_percent", (parsed_data.mem_slab_unreclaimable / parsed_data.mem_total) * 100.0, "memory_percent");
+        } else {
+            submitMetric("slab_total_percent", (parsed_data.mem_slab_total / parsed_data.mem_total) * 100.0, "memory_percent");
+        }
+       
+        if (parsed_data.mem_available_info_present) {
+            submitMetric("available_percent", (parsed_data.mem_available / parsed_data.mem_total) * 100.0, "memory_percent");
+        }
+    }
 }
 
+int CMemoryModule::read() {
+    INFO("read() method called.");
+    ParsedMemInfo current_mem_data;
+
+    if (!parseMemInfo(current_mem_data)) {
+        ERROR("Failed to parse memory information from /proc/meminfo.");
+        return -1; // 指示读取失败
+    }
+
+    submitMemoryData(current_mem_data);
+    return 0; // 指示读取成功
+}
+
+// 工厂函数实现
+CAbstractUserModule* CreateMemoryModule() {
+    INFO("CreateMemoryModule() called, creating new CMemoryModule instance.");
+    return new CMemoryModule();
+}
+
+void DestroyMemoryModule(CAbstractUserModule* pUserModule) {
+    INFO("DestroyMemoryModule() called.");
+    // assert(pUserModule != nullptr); // 如果需要断言
+    if (pUserModule != nullptr) {
+        delete pUserModule;
+        // 将调用方的指针设为 nullptr 不是此函数的责任
+    }
+}
