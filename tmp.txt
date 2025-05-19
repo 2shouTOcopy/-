@@ -1,127 +1,396 @@
-# module/Makefile - 用于编译所有模块
+#include "collectd.h"
+#include "plugin.h"
+#include "utils/common/common.h"    // For IS_TRUE, STATIC_ARRAY_SIZE, sstrncpy, STRERRNO, DATA_MAX_NAME_LEN
+#include "utils/ignorelist/ignorelist.h"
+#include "utils/mount/mount.h"
 
-# --- 从父 Makefile 接收变量，如果未传递则使用默认值 (方便单独测试) ---
-TOOL_PREFIX ?=
-CXX ?= $(TOOL_PREFIX)g++
-CC ?= $(TOOL_PREFIX)gcc
+#include <sys/statvfs.h>
+#include <string>
+#include <vector>
+#include <cstring> // For strcmp, strncmp, strlen, strcasecmp
+#include <cstdint> // For uint64_t
+#include <algorithm> // For std::replace
+#include <iomanip>   // For potential future use if formatting changes (not strictly needed for this direct port)
 
-# 使用父 Makefile 传递的 CXXFLAGS，或提供默认值
-# 注意变量名区别，避免直接覆盖父 Makefile 的 CXXFLAGS 含义
-MODULE_CXXFLAGS := $(PARENT_CXXFLAGS)
-ifeq ($(strip $(MODULE_CXXFLAGS)),)
-    MODULE_CXXFLAGS := -Wall -Wextra -fPIC -std=c++11
-endif
+// Define STATANYFS_STR as it was in C
+#define STATANYFS_STR "statvfs"
 
-MODULE_CFLAGS := $(PARENT_CFLAGS)
-ifeq ($(strip $(MODULE_CFLAGS)),)
-    MODULE_CFLAGS := -Wall -Wextra -fPIC
-endif
+namespace CollectdDfPlugin {
 
-MODULE_LDFLAGS_SO := $(PARENT_LDFLAGS_FOR_SO)
-ifeq ($(strip $(MODULE_LDFLAGS_SO)),)
-    MODULE_LDFLAGS_SO := -shared -fPIC
-endif
+// RAII Wrapper for ignorelist_t
+class IgnoreListWrapper {
+public:
+    IgnoreListWrapper(bool invert = true) : il_(ignorelist_create(invert)) {}
+    ~IgnoreListWrapper() {
+        if (il_) {
+            ignorelist_destroy(il_);
+            il_ = nullptr;
+        }
+    }
 
-# 父 Makefile 传递过来的绝对路径头文件包含项
-# PARENT_INCLUDES_ABS 已经是 -I... -I... 的形式
-# 子 Makefile 内部的头文件路径:
-# -I. 表示 module/ 目录自身 (如果有公共头文件在 module/ 下)
-# -I$(mod_subdir) 表示 module/cpu/ 这类具体模块的目录
-MODULE_SPECIFIC_INCLUDES := -I.
+    IgnoreListWrapper(const IgnoreListWrapper&) = delete;
+    IgnoreListWrapper& operator=(const IgnoreListWrapper&) = delete;
+    IgnoreListWrapper(IgnoreListWrapper&& other) noexcept : il_(other.il_) {
+        other.il_ = nullptr;
+    }
+    IgnoreListWrapper& operator=(IgnoreListWrapper&& other) noexcept {
+        if (this != &other) {
+            if (il_) ignorelist_destroy(il_);
+            il_ = other.il_;
+            other.il_ = nullptr;
+        }
+        return *this;
+    }
 
-# --- 接收输出目录和构建目录 (这些应该是绝对路径) ---
-# .so 文件输出目录, e.g., /abs/path/to/project/bin/modules
-ABS_SO_OUTPUT_DIR := $(OUTPUT_SO_DIR_ABS)
-# .o 文件基础构建目录, e.g., /abs/path/to/project/build/module
-ABS_MODULE_BUILD_BASE := $(MODULE_BUILD_BASE_ABS)
+    ignorelist_t* get() const { return il_; }
 
-# --- 自动发现模块子目录 ---
-# $(wildcard */.) 会找到如 "cpu/.", "csv/.", "uptime/."
-# $(patsubst %/.,%, ...) 去掉 "/." -> "cpu", "csv", "uptime"
-# $(notdir ...) 确保只取最后一部分名 (虽然在这里 patsubst 已完成)
-MODULE_NAMES := $(notdir $(patsubst %/.,%,$(wildcard */.)))
-
-# --- 收集所有模块的 .so 目标 ---
-ALL_MODULE_SO_TARGETS := $(foreach mod_name,$(MODULE_NAMES),$(ABS_SO_OUTPUT_DIR)/$(mod_name).so)
-
-# --- 调试信息 ---
-$(info === Executing module/Makefile ===)
-$(info TOOL_PREFIX: [$(TOOL_PREFIX)])
-$(info CXX: [$(CXX)])
-$(info MODULE_CXXFLAGS: [$(MODULE_CXXFLAGS)])
-$(info MODULE_LDFLAGS_SO: [$(MODULE_LDFLAGS_SO)])
-$(info PARENT_INCLUDES_ABS: [$(PARENT_INCLUDES_ABS)])
-$(info ABS_SO_OUTPUT_DIR: [$(ABS_SO_OUTPUT_DIR)])
-$(info ABS_MODULE_BUILD_BASE: [$(ABS_MODULE_BUILD_BASE)])
-$(info Discovered MODULE_NAMES: [$(MODULE_NAMES)])
-$(info ALL_MODULE_SO_TARGETS: [$(ALL_MODULE_SO_TARGETS)])
-$(info === End module/Makefile Info ===)
+    // Helper methods (optional, can also use ignorelist_* functions directly)
+    int add(const char* pattern) { return ignorelist_add(il_, pattern); }
+    int match(const char* str) const { return ignorelist_match(il_, str); }
+    void set_invert(bool invert) { ignorelist_set_invert(il_, invert); }
+    int remove(const char* str) { return ignorelist_remove(il_, str); }
 
 
-.PHONY: all clean dirs_module
+private:
+    ignorelist_t* il_;
+};
 
-all: dirs_module $(ALL_MODULE_SO_TARGETS)
+// RAII Wrapper for cu_mount_t list
+class MountListWrapper {
+public:
+    MountListWrapper() : mnt_list_(nullptr) {
+        if (cu_mount_getlist(&mnt_list_) == nullptr) {
+            ERROR("df plugin: C++: cu_mount_getlist failed.");
+            // mnt_list_ remains nullptr, head() will reflect this
+        }
+    }
 
-dirs_module:
-	@echo "(module/Makefile) Creating build directories for modules..."
-	$(foreach mod_name,$(MODULE_NAMES),@mkdir -p $(ABS_MODULE_BUILD_BASE)/$(mod_name))
-	@mkdir -p $(ABS_SO_OUTPUT_DIR) # 确保最终 .so 输出目录存在
+    ~MountListWrapper() {
+        if (mnt_list_) {
+            cu_mount_freelist(mnt_list_);
+            mnt_list_ = nullptr;
+        }
+    }
 
-# --- 为每个模块定义编译和链接规则的模板 ---
-# $(1) 将是模块名，如 cpu, csv
-define EACH_MODULE_template
-# 源文件列表 for module $(1) (e.g., cpu/cpu.cpp, cpu/helper.cpp)
-$(1)_SRCS := $(wildcard $(1)/*.cpp)
-# 目标文件列表 for module $(1) (e.g., <ABS_MODULE_BUILD_BASE>/cpu/cpu.o)
-$(1)_OBJS := $$(patsubst $(1)/%.cpp,$(ABS_MODULE_BUILD_BASE)/$(1)/%.o,$$($(1)_SRCS))
-# 最终 .so 文件 for module $(1)
-$(1)_SO_TARGET := $(ABS_SO_OUTPUT_DIR)/$(1).so
+    MountListWrapper(const MountListWrapper&) = delete;
+    MountListWrapper& operator=(const MountListWrapper&) = delete;
+    // Move constructor/assignment can be added if needed
 
-# 编译 .cpp 到 .o 的规则 for module $(1)
-# $$(obj) 是具体的 .o 文件路径, e.g. <ABS_MODULE_BUILD_BASE>/cpu/cpu.o
-# $$(src_prefix) 是模块名, e.g. cpu
-# $$(cpp_basename) 是不带路径的 .cpp 文件名, e.g. cpu.cpp
-$$(foreach obj,$$($(1)_OBJS),\
-    $$(eval src_prefix = $(1)) \
-    $$(eval cpp_basename = $$(patsubst $(ABS_MODULE_BUILD_BASE)/$(src_prefix)/%.o,%.cpp,$$(obj))) \
-    $$(eval $$(obj): $$(src_prefix)/$$(cpp_basename) \
-        @mkdir -p $$(@D) \
-        @echo "[module/$(1)] Compiling $$< -> $$@" \
-        $$(CXX) $$(MODULE_CXXFLAGS) $$(PARENT_INCLUDES_ABS) $$(MODULE_SPECIFIC_INCLUDES) -I$$(src_prefix) -c $$< -o $$@ \
-    ) \
-)
+    cu_mount_t* head() const { return mnt_list_; }
 
-# 链接 .o 到 .so 的规则 for module $(1)
-$$($(1)_SO_TARGET): $$($(1)_OBJS)
-	@mkdir -p $$(@D)
-	@echo "[module/$(1)] Linking $$^ -> $$@"
-	$$(CXX) $$(MODULE_LDFLAGS_SO) -o $$@ $$^
+private:
+    cu_mount_t* mnt_list_;
+};
 
-endef
 
-# --- 为所有发现的模块实例化规则 ---
-$(foreach mod_name,$(MODULE_NAMES),$(eval $(call EACH_MODULE_template,$(mod_name))))
+// Plugin configuration and state variables
+static const std::vector<const char*> config_keys_cpp = {
+    "Device", "MountPoint", "FSType",
+    "IgnoreSelected", "ReportByDevice", "ReportInodes",
+    "ValuesAbsolute", "ValuesPercentage", "LogOnce"
+};
 
-clean:
-	@echo "(module/Makefile) Cleaning module objects and .so files..."
-ifeq ("$(origin MODULE_BUILD_BASE_ABS)","undefined") # 如果是从父Makefile调用的clean
-    ifeq ("$(origin ABS_MODULE_BUILD_BASE)","undefined")
-        $(warning MODULE_BUILD_BASE_ABS and ABS_MODULE_BUILD_BASE are not defined in module/Makefile clean)
-    else ifneq ($(strip $(ABS_MODULE_BUILD_BASE)),)
-	    $(foreach mod_name,$(MODULE_NAMES),rm -rf $(ABS_MODULE_BUILD_BASE)/$(mod_name))
-    endif
-else ifneq ($(strip $(MODULE_BUILD_BASE_ABS)),) # 如果是从命令行直接在module/下执行make clean，且父变量名被传递
-	$(foreach mod_name,$(MODULE_NAMES),rm -rf $(MODULE_BUILD_BASE_ABS)/$(mod_name))
-endif
+// Using unique_ptr or direct objects for RAII
+// Note: These need to be pointers or Optionals if df_init can be called multiple times
+// For simplicity and to match original C static global behavior, make them static pointers.
+// They will be initialized in df_init_impl.
+static IgnoreListWrapper* il_device_ptr = nullptr;
+static IgnoreListWrapper* il_mountpoint_ptr = nullptr;
+static IgnoreListWrapper* il_fstype_ptr = nullptr;
+static IgnoreListWrapper* il_errors_ptr = nullptr;
 
-ifeq ("$(origin OUTPUT_SO_DIR_ABS)","undefined")
-    ifeq ("$(origin ABS_SO_OUTPUT_DIR)","undefined")
-        $(warning OUTPUT_SO_DIR_ABS and ABS_SO_OUTPUT_DIR are not defined in module/Makefile clean)
-    else ifneq ($(strip $(ABS_SO_OUTPUT_DIR)),)
-	    rm -f $(ALL_MODULE_SO_TARGETS)
-    endif
-else ifneq ($(strip $(OUTPUT_SO_DIR_ABS)),)
-	rm -f $(foreach mod_name,$(MODULE_NAMES),$(OUTPUT_SO_DIR_ABS)/$(mod_name).so)
-endif
-	@echo "(module/Makefile) Module cleaning finished."
+static bool by_device_flag = false;
+static bool report_inodes_flag = false;
+static bool values_absolute_flag = true;
+static bool values_percentage_flag = false;
+static bool log_once_flag = false;
+
+// Forward declaration
+static void df_submit_one_impl(const char* plugin_instance,
+                               const char* type,
+                               const char* type_instance,
+                               gauge_t value);
+
+int df_init_impl() {
+    // Ensure these are created only once or handled if re-init is possible
+    if (il_device_ptr == nullptr) il_device_ptr = new IgnoreListWrapper(true);
+    if (il_mountpoint_ptr == nullptr) il_mountpoint_ptr = new IgnoreListWrapper(true);
+    if (il_fstype_ptr == nullptr) il_fstype_ptr = new IgnoreListWrapper(true);
+    if (il_errors_ptr == nullptr) il_errors_ptr = new IgnoreListWrapper(true);
+    return 0;
+}
+
+int df_config_impl(const char* key, const char* value) {
+    if (il_device_ptr == nullptr) { // Should have been called by df_init_impl
+        df_init_impl(); 
+    }
+
+    if (strcasecmp(key, "Device") == 0) {
+        return (il_device_ptr->add(value) != 0) ? 1 : 0;
+    } else if (strcasecmp(key, "MountPoint") == 0) {
+        return (il_mountpoint_ptr->add(value) != 0) ? 1 : 0;
+    } else if (strcasecmp(key, "FSType") == 0) {
+        return (il_fstype_ptr->add(value) != 0) ? 1 : 0;
+    } else if (strcasecmp(key, "IgnoreSelected") == 0) {
+        bool invert_based_on_value = !IS_TRUE(value);
+        il_device_ptr->set_invert(invert_based_on_value);
+        il_mountpoint_ptr->set_invert(invert_based_on_value);
+        il_fstype_ptr->set_invert(invert_based_on_value);
+        return 0;
+    } else if (strcasecmp(key, "ReportByDevice") == 0) {
+        by_device_flag = IS_TRUE(value);
+        return 0;
+    } else if (strcasecmp(key, "ReportInodes") == 0) {
+        report_inodes_flag = IS_TRUE(value);
+        return 0;
+    } else if (strcasecmp(key, "ValuesAbsolute") == 0) {
+        values_absolute_flag = IS_TRUE(value);
+        return 0;
+    } else if (strcasecmp(key, "ValuesPercentage") == 0) {
+        values_percentage_flag = IS_TRUE(value);
+        return 0;
+    } else if (strcasecmp(key, "LogOnce") == 0) {
+        log_once_flag = IS_TRUE(value);
+        return 0;
+    }
+    return -1; // Unknown key
+}
+
+// __attribute__((nonnull(2))) implies plugin_instance can be NULL, type cannot.
+static void df_submit_one_impl(const char* plugin_instance, // Can be char* as in original if modified
+                               const char* type,
+                               const char* type_instance,
+                               gauge_t value) {
+    value_list_t vl = VALUE_LIST_INIT;
+    value_t v = {.gauge = value}; // Compound literal for C99, works in C++ too
+
+    vl.values = &v;
+    vl.values_len = 1;
+    sstrncpy(vl.plugin, "df", sizeof(vl.plugin));
+    if (plugin_instance != nullptr) {
+        sstrncpy(vl.plugin_instance, plugin_instance, sizeof(vl.plugin_instance));
+    }
+    sstrncpy(vl.type, type, sizeof(vl.type)); // type is non-null
+    if (type_instance != nullptr) {
+        sstrncpy(vl.type_instance, type_instance, sizeof(vl.type_instance));
+    }
+
+    plugin_dispatch_values(&vl);
+}
+
+int df_read_impl() {
+    if (!il_device_ptr || !il_mountpoint_ptr || !il_fstype_ptr || !il_errors_ptr) {
+        ERROR("df plugin C++: Ignorelists not initialized in df_read_impl. Call df_init first.");
+        return -1;
+    }
+
+    MountListWrapper mnt_list_obj;
+    if (mnt_list_obj.head() == nullptr) {
+        // Error already logged by MountListWrapper constructor or cu_mount_getlist
+        return -1;
+    }
+
+    int retval = 0;
+
+    for (cu_mount_t* mnt_ptr = mnt_list_obj.head(); mnt_ptr != nullptr; mnt_ptr = mnt_ptr->next) {
+        struct statvfs sfs_buf;
+        unsigned long long blocksize_val; // From f_frsize
+        char disk_name[DATA_MAX_NAME_LEN]; // C-style buffer for collectd API
+        
+        // Determine effective device name
+        const char* dev = (mnt_ptr->spec_device != nullptr) ? mnt_ptr->spec_device : mnt_ptr->device;
+        if (dev == nullptr) dev = ""; // Ensure dev is not null for ignorelist_match
+
+        if (il_device_ptr->match(dev)) continue;
+        if (il_mountpoint_ptr->match(mnt_ptr->dir)) continue;
+        if (il_fstype_ptr->match(mnt_ptr->type)) continue;
+
+        // Search for duplicates
+        bool is_duplicate = false;
+        for (cu_mount_t* dup_ptr = mnt_list_obj.head(); dup_ptr != nullptr; dup_ptr = dup_ptr->next) {
+            if (dup_ptr == mnt_ptr) break; // Reached current, no duplicate found before it
+
+            const char* mnt_ptr_cmp_dev = (mnt_ptr->spec_device != nullptr) ? mnt_ptr->spec_device : mnt_ptr->device;
+            const char* dup_ptr_cmp_dev = (dup_ptr->spec_device != nullptr) ? dup_ptr->spec_device : dup_ptr->device;
+
+            if (by_device_flag) {
+                if (mnt_ptr_cmp_dev != nullptr && dup_ptr_cmp_dev != nullptr &&
+                    strcmp(mnt_ptr_cmp_dev, dup_ptr_cmp_dev) == 0) {
+                    is_duplicate = true;
+                    break;
+                }
+            } else {
+                if (strcmp(mnt_ptr->dir, dup_ptr->dir) == 0) {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+        }
+        if (is_duplicate) continue;
+
+        if (statvfs(mnt_ptr->dir, &sfs_buf) < 0) {
+            if (log_once_flag == false || il_errors_ptr->match(mnt_ptr->dir) == 0) {
+                if (log_once_flag == true) {
+                    // This replicates the original C logic which seems to add to make it log next time
+                    il_errors_ptr->add(mnt_ptr->dir);
+                }
+                ERROR(STATANYFS_STR "(\"%s\") failed: %s", mnt_ptr->dir, STRERRNO);
+            }
+            retval = -1; // Mark that at least one error occurred, but continue processing others
+            continue;
+        } else {
+            if (log_once_flag == true) {
+                 // Replicates original C logic
+                il_errors_ptr->remove(mnt_ptr->dir);
+            }
+        }
+
+        if (sfs_buf.f_blocks == 0) continue; // Skip if total blocks is zero
+
+        blocksize_val = sfs_buf.f_frsize; // BLOCKSIZE(s) macro replacement
+        if (blocksize_val == 0) {
+            ERROR("df plugin C++: Filesystem %s (mounted on %s) reported blocksize of 0. Skipping.",
+                  dev, mnt_ptr->dir);
+            retval = -1;
+            continue;
+        }
+        
+        // Generate disk_name (plugin_instance)
+        if (by_device_flag) {
+            if (strncmp(dev, "/dev/", 5) == 0) {
+                sstrncpy(disk_name, dev + 5, sizeof(disk_name));
+            } else {
+                sstrncpy(disk_name, dev, sizeof(disk_name));
+            }
+            if (strlen(disk_name) < 1) {
+                 DEBUG("df C++: no device name for mountpoint %s, skipping", mnt_ptr->dir);
+                 continue;
+            }
+        } else {
+            if (strcmp(mnt_ptr->dir, "/") == 0) {
+                sstrncpy(disk_name, "root", sizeof(disk_name));
+            } else {
+                std::string temp_disk_name = mnt_ptr->dir + 1; // Skip leading '/'
+                std::replace(temp_disk_name.begin(), temp_disk_name.end(), '/', '-');
+                sstrncpy(disk_name, temp_disk_name.c_str(), sizeof(disk_name));
+            }
+        }
+
+        // Sanity checks for block counts
+        if (sfs_buf.f_bavail > sfs_buf.f_bfree) {
+             DEBUG("df plugin C++: f_bavail (%llu) > f_bfree (%llu) for %s. Adjusting f_bavail.",
+                  static_cast<unsigned long long>(sfs_buf.f_bavail), static_cast<unsigned long long>(sfs_buf.f_bfree), disk_name);
+            sfs_buf.f_bavail = sfs_buf.f_bfree;
+        }
+        if (sfs_buf.f_bfree > sfs_buf.f_blocks) {
+            DEBUG("df plugin C++: f_bfree (%llu) > f_blocks (%llu) for %s. Adjusting f_bfree.",
+                  static_cast<unsigned long long>(sfs_buf.f_bfree), static_cast<unsigned long long>(sfs_buf.f_blocks), disk_name);
+            sfs_buf.f_bfree = sfs_buf.f_blocks;
+        }
+
+        uint64_t blk_free = static_cast<uint64_t>(sfs_buf.f_bavail);
+        uint64_t blk_reserved = static_cast<uint64_t>(sfs_buf.f_bfree > sfs_buf.f_bavail ? sfs_buf.f_bfree - sfs_buf.f_bavail : 0);
+        uint64_t blk_used = static_cast<uint64_t>(sfs_buf.f_blocks > sfs_buf.f_bfree ? sfs_buf.f_blocks - sfs_buf.f_bfree : 0);
+
+
+        if (values_absolute_flag) {
+            df_submit_one_impl(disk_name, "df_complex", "free",
+                               static_cast<gauge_t>(static_cast<long double>(blk_free) * blocksize_val));
+            df_submit_one_impl(disk_name, "df_complex", "reserved",
+                               static_cast<gauge_t>(static_cast<long double>(blk_reserved) * blocksize_val));
+            df_submit_one_impl(disk_name, "df_complex", "used",
+                               static_cast<gauge_t>(static_cast<long double>(blk_used) * blocksize_val));
+        }
+
+        if (values_percentage_flag) {
+            uint64_t total_for_percentage = static_cast<uint64_t>(sfs_buf.f_blocks);
+            if (total_for_percentage > 0) {
+                df_submit_one_impl(disk_name, "percent_bytes", "free",
+                                   static_cast<gauge_t>((static_cast<long double>(blk_free) / total_for_percentage) * 100.0L));
+                df_submit_one_impl(disk_name, "percent_bytes", "reserved",
+                                   static_cast<gauge_t>((static_cast<long double>(blk_reserved) / total_for_percentage) * 100.0L));
+                df_submit_one_impl(disk_name, "percent_bytes", "used",
+                                   static_cast<gauge_t>((static_cast<long double>(blk_used) / total_for_percentage) * 100.0L));
+            } else {
+                 WARNING("df plugin C++: f_blocks is zero for %s, cannot report byte percentage.", disk_name);
+            }
+        }
+
+        if (report_inodes_flag && sfs_buf.f_files != 0) {
+             // Sanity checks for inode counts
+            if (sfs_buf.f_favail > sfs_buf.f_ffree) {
+                DEBUG("df plugin C++: f_favail (%llu) > f_ffree (%llu) for %s. Adjusting f_favail.",
+                      static_cast<unsigned long long>(sfs_buf.f_favail), static_cast<unsigned long long>(sfs_buf.f_ffree), disk_name);
+                sfs_buf.f_favail = sfs_buf.f_ffree;
+            }
+            if (sfs_buf.f_ffree > sfs_buf.f_files) {
+                DEBUG("df plugin C++: f_ffree (%llu) > f_files (%llu) for %s. Adjusting f_ffree.",
+                      static_cast<unsigned long long>(sfs_buf.f_ffree), static_cast<unsigned long long>(sfs_buf.f_files), disk_name);
+                sfs_buf.f_ffree = sfs_buf.f_files;
+            }
+
+            uint64_t inode_free = static_cast<uint64_t>(sfs_buf.f_favail);
+            uint64_t inode_reserved = static_cast<uint64_t>(sfs_buf.f_ffree > sfs_buf.f_favail ? sfs_buf.f_ffree - sfs_buf.f_favail : 0);
+            uint64_t inode_used = static_cast<uint64_t>(sfs_buf.f_files > sfs_buf.f_ffree ? sfs_buf.f_files - sfs_buf.f_ffree : 0);
+
+
+            if (values_absolute_flag) {
+                df_submit_one_impl(disk_name, "df_inodes", "free", static_cast<gauge_t>(inode_free));
+                df_submit_one_impl(disk_name, "df_inodes", "reserved", static_cast<gauge_t>(inode_reserved));
+                df_submit_one_impl(disk_name, "df_inodes", "used", static_cast<gauge_t>(inode_used));
+            }
+            if (values_percentage_flag) {
+                uint64_t total_inodes_for_percentage = static_cast<uint64_t>(sfs_buf.f_files);
+                if (total_inodes_for_percentage > 0) {
+                    df_submit_one_impl(disk_name, "percent_inodes", "free",
+                                       static_cast<gauge_t>((static_cast<long double>(inode_free) / total_inodes_for_percentage) * 100.0L));
+                    df_submit_one_impl(disk_name, "percent_inodes", "reserved",
+                                       static_cast<gauge_t>((static_cast<long double>(inode_reserved) / total_inodes_for_percentage) * 100.0L));
+                    df_submit_one_impl(disk_name, "percent_inodes", "used",
+                                       static_cast<gauge_t>((static_cast<long double>(inode_used) / total_inodes_for_percentage) * 100.0L));
+                } else {
+                     WARNING("df plugin C++: f_files is zero for %s, cannot report inode percentage.", disk_name);
+                }
+            }
+        }
+    } // End for loop over mount points
+
+    return retval;
+}
+
+int df_shutdown_impl() {
+    delete il_device_ptr; il_device_ptr = nullptr;
+    delete il_mountpoint_ptr; il_mountpoint_ptr = nullptr;
+    delete il_fstype_ptr; il_fstype_ptr = nullptr;
+    delete il_errors_ptr; il_errors_ptr = nullptr;
+    return 0;
+}
+
+} // namespace CollectdDfPlugin
+
+
+// C-style entry points for collectd
+extern "C" {
+    static int df_config_entry(const char* key, const char* value) {
+        return CollectdDfPlugin::df_config_impl(key, value);
+    }
+    static int df_init_entry() {
+        return CollectdDfPlugin::df_init_impl();
+    }
+    static int df_read_entry() {
+        return CollectdDfPlugin::df_read_impl();
+    }
+    static int df_shutdown_entry() {
+        return CollectdDfPlugin::df_shutdown_impl();
+    }
+
+    void module_register(void) {
+        plugin_register_config("df", df_config_entry,
+                               CollectdDfPlugin::config_keys_cpp.data(),
+                               CollectdDfPlugin::config_keys_cpp.size());
+        plugin_register_init("df", df_init_entry);
+        plugin_register_read("df", df_read_entry);
+        plugin_register_shutdown("df", df_shutdown_entry);
+    }
+} // extern "C"
 
