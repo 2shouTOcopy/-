@@ -1,41 +1,198 @@
-// df.h
-#pragma once
+// df.cpp
+#include "df.h"
+#include "../daemon/PluginService.h"
+#include "utils/mount/mount.h"    // cu_mount_getlist, cu_mount_freelist
+#include <sys/statvfs.h>          // statvfs, struct statvfs
+#include <cstring>                // strerror, strlen, strcmp, strncmp
+#include <cerrno>                 // errno
 
-#include "ModuleBase.h"
-#include "IgnoreList.h"
-#include <string>
+int CDFModule::init() {
+    // 清空旧的忽略列表
+    il_device_.clear();
+    il_mountpoint_.clear();
+    il_fstype_.clear();
+    il_errors_.clear();
+    return 0;
+}
 
-class CDFModule final : public CAbstractUserModule {
-public:
-    CDFModule() = default;
-    ~CDFModule() override = default;
+int CDFModule::config(const std::string &key, const std::string &value) {
+    if (key == "Device") {
+        il_device_.add(value);
+    }
+    else if (key == "MountPoint") {
+        il_mountpoint_.add(value);
+    }
+    else if (key == "FSType") {
+        il_fstype_.add(value);
+    }
+    else if (key == "IgnoreSelected") {
+        // true → 正常忽略列表；false → 选中列表（invert）
+        bool ignoreListed = IS_TRUE(value.c_str());
+        bool inv = !ignoreListed;
+        il_device_.setInvert(inv);
+        il_mountpoint_.setInvert(inv);
+        il_fstype_.setInvert(inv);
+    }
+    else if (key == "ReportByDevice") {
+        by_device_ = IS_TRUE(value.c_str());
+    }
+    else if (key == "ReportInodes") {
+        report_inodes_ = IS_TRUE(value.c_str());
+    }
+    else if (key == "ValuesAbsolute") {
+        values_absolute_ = IS_TRUE(value.c_str());
+    }
+    else if (key == "ValuesPercentage") {
+        values_percentage_ = IS_TRUE(value.c_str());
+    }
+    else if (key == "LogOnce") {
+        log_once_ = IS_TRUE(value.c_str());
+    }
+    else {
+        return -1;
+    }
+    return 0;
+}
 
-    // 插件生命周期钩子
-    int init() override;
-    int config(const std::string &key, const std::string &value) override;
-    int read() override;
-    int shutdown() override;
+void CDFModule::submitValue(const std::string &pluginInstance,
+                            const std::string &type,
+                            const std::string &typeInstance,
+                            gauge_t value)
+{
+    value_list_t vl = VALUE_LIST_INIT;
+    value_t tmp  = { .gauge = value };
 
-private:
-    void submitValue(const std::string &pluginInstance,
-                     const std::string &type,
-                     const std::string &typeInstance,
-                     gauge_t value);
+    vl.values     = &tmp;
+    vl.values_len = 1;
 
-    IgnoreList il_device_{ true };
-    IgnoreList il_mountpoint_{ true };
-    IgnoreList il_fstype_{ true };
-    IgnoreList il_errors_{ true };
+    // 填充元数据
+    sstrncpy(vl.plugin,          "df",        sizeof(vl.plugin));
+    sstrncpy(vl.plugin_instance, pluginInstance.c_str(), sizeof(vl.plugin_instance));
+    sstrncpy(vl.type,            type.c_str(),          sizeof(vl.type));
+    sstrncpy(vl.type_instance,   typeInstance.c_str(),  sizeof(vl.type_instance));
 
-    bool by_device_{ false };
-    bool report_inodes_{ false };
-    bool values_absolute_{ true };
-    bool values_percentage_{ false };
-    bool log_once_{ false };
-};
+    PluginService::Instance().dispatchValues(&vl);
+}
 
-// C 风格导出符
+int CDFModule::read() {
+    struct statvfs st{};
+    cu_mount_t *mnt_list = nullptr;
+    if (cu_mount_getlist(&mnt_list) == nullptr) {
+        ERROR("df plugin: cu_mount_getlist failed.");
+        return -1;
+    }
+
+    for (auto *mnt = mnt_list; mnt; mnt = mnt->next) {
+        const char *dev = mnt->spec_device ? mnt->spec_device : mnt->device;
+        std::string dev_s(dev), dir_s(mnt->dir), type_s(mnt->type);
+
+        // 忽略规则
+        if (il_device_.match(dev_s) ||
+            il_mountpoint_.match(dir_s) ||
+            il_fstype_.match(type_s))
+            continue;
+
+        // 去重：先前同设备或同挂载点已处理过
+        bool is_dup = false;
+        for (auto *dup = mnt_list; dup != mnt; dup = dup->next) {
+            if (by_device_) {
+                if (dup->spec_device && mnt->spec_device &&
+                    strcmp(dup->spec_device, mnt->spec_device) == 0) {
+                    is_dup = true; break;
+                }
+            } else {
+                if (strcmp(dup->dir, mnt->dir) == 0) {
+                    is_dup = true; break;
+                }
+            }
+        }
+        if (is_dup) continue;
+
+        // statvfs
+        if (statvfs(mnt->dir, &st) < 0) {
+            if (!log_once_ || !il_errors_.match(dir_s)) {
+                if (log_once_) il_errors_.add(dir_s);
+                ERROR("statvfs(\"%s\") failed: %s", mnt->dir, strerror(errno));
+            }
+            continue;
+        } else if (log_once_) {
+            il_errors_.remove(dir_s);
+        }
+
+        if (st.f_blocks == 0) continue;
+
+        // 构造实例名
+        std::string inst;
+        if (by_device_) {
+            const char *p = (strncmp(dev, "/dev/", 5) == 0) ? dev + 5 : dev;
+            inst = (std::strlen(p) ? p : "unknown");
+        } else {
+            if (strcmp(mnt->dir, "/") == 0) {
+                inst = "root";
+            } else {
+                inst = mnt->dir + 1;
+                for (auto &c : inst) if (c == '/') c = '-';
+            }
+        }
+
+        uint64_t blk_size = st.f_frsize;
+        uint64_t free_blk = st.f_bavail;
+        uint64_t res_blk  = st.f_bfree - st.f_bavail;
+        uint64_t used_blk = st.f_blocks - st.f_bfree;
+
+        // 绝对值上报
+        if (values_absolute_) {
+            submitValue(inst, "df_complex", "free",     free_blk * blk_size);
+            submitValue(inst, "df_complex", "reserved", res_blk * blk_size);
+            submitValue(inst, "df_complex", "used",     used_blk * blk_size);
+        }
+        // 百分比上报
+        if (values_percentage_ && st.f_blocks > 0) {
+            long double total = st.f_blocks;
+            submitValue(inst, "percent_bytes", "free",     (gauge_t)(free_blk/total*100.0L));
+            submitValue(inst, "percent_bytes", "reserved", (gauge_t)(res_blk/total*100.0L));
+            submitValue(inst, "percent_bytes", "used",     (gauge_t)(used_blk/total*100.0L));
+        }
+
+        // Inodes
+        if (report_inodes_ && st.f_files > 0) {
+            uint64_t ifree = st.f_favail;
+            uint64_t ires  = st.f_ffree - st.f_favail;
+            uint64_t iused = st.f_files - st.f_ffree;
+
+            if (values_absolute_) {
+                submitValue(inst, "df_inodes",   "free",     ifree);
+                submitValue(inst, "df_inodes",   "reserved", ires);
+                submitValue(inst, "df_inodes",   "used",     iused);
+            }
+            if (values_percentage_) {
+                long double itot = st.f_files;
+                submitValue(inst, "percent_inodes", "free",     (gauge_t)(ifree/itot*100.0L));
+                submitValue(inst, "percent_inodes", "reserved", (gauge_t)(ires/itot*100.0L));
+                submitValue(inst, "percent_inodes", "used",     (gauge_t)(iused/itot*100.0L));
+            }
+        }
+    }
+
+    cu_mount_freelist(mnt_list);
+    return 0;
+}
+
+int CDFModule::shutdown() {
+    il_device_.clear();
+    il_mountpoint_.clear();
+    il_fstype_.clear();
+    il_errors_.clear();
+    return 0;
+}
+
+// C 风格导出
 extern "C" {
-    CAbstractUserModule* CreateModule();
-    void DestroyModule(CAbstractUserModule *p);
+CAbstractUserModule* CreateModule() {
+    return new CDFModule();
+}
+void DestroyModule(CAbstractUserModule *p) {
+    assert(p);
+    delete p;
+}
 }
