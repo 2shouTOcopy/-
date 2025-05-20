@@ -1,66 +1,220 @@
-#pragma once
+#include "MemoryModule.h"
+#include "utils/common/common.h" // 需要 sstrncpy, cdtime, STRERRNO, STATIC_ARRAY_SIZE
 
-#include "ModuleBase.h"         // 假设定义了 CAbstractUserModule
-#include "daemon/PluginService.h" // 假设定义了 PluginService 和相关类型/宏
+#include <fstream>
+#include <system_error> // For strerror
+#include <cstring>      // For strncasecmp in parseLine (if kept, or std::string methods)
+#include <cstdio>       // For snprintf
+#include <cerrno>       // For errno
 
-#include <string>
-#include <vector>   // 仅当某些辅助功能需要时，当前实现中 parseLine 不需要
-#include <cstdint>  // For uint64_t, though gauge_t is likely double
-
-// 假设 gauge_t, value_t, value_list_t, VALUE_LIST_INIT 来自 collectd 或 PluginService.h
-// 如果 PluginService.h 没有包含它们，可能需要类似 #include "collectd.h" (或其C++等效物)
-
-// 用于存储从 /proc/meminfo 解析出的数据
-struct ParsedMemInfo {
-    gauge_t mem_total = 0.0;
-    gauge_t mem_used = 0.0;
-    gauge_t mem_buffered = 0.0;
-    gauge_t mem_cached = 0.0;
-    gauge_t mem_free = 0.0;
-    gauge_t mem_available = 0.0;
-    gauge_t mem_slab_total = 0.0;
-    gauge_t mem_slab_reclaimable = 0.0;
-    gauge_t mem_slab_unreclaimable = 0.0;
-
-    bool detailed_slab_info_present = false;
-    bool mem_available_info_present = false;
-};
-
-class CMemoryModule final : public CAbstractUserModule {
-public:
-    CMemoryModule(); // 构造函数
-    ~CMemoryModule() override = default; // 默认析构函数
-
-    // 插件主读取函数，由 PluginService 调用
-    // 假设 CAbstractUserModule 定义了 virtual int read() = 0; 或类似的
-    int read() override;
-
-private:
-    // 解析 /proc/meminfo 文件
-    bool parseMemInfo(ParsedMemInfo& data_out);
-
-    // 辅助方法：解析 /proc/meminfo 中的单行
-    bool parseLine(const std::string& line, const char* key_to_match, gauge_t& target_value_ref);
-    
-    // 提交单个指标数据
-    void submitMetric(const std::string& type_instance_name, gauge_t value, const char* type_name = "memory");
-
-    // 根据配置提交所有相关的内存指标
-    void submitMemoryData(const ParsedMemInfo& parsed_data);
-
-    // 配置项，类似于原 memory.c 中的全局静态变量
-    bool m_values_absolute;
-    bool m_values_percentage;
-};
-
-// 工厂函数声明
-#ifdef __cplusplus
-extern "C" {
+// 假设日志宏 INFO, ERROR, WARNING 由 PluginService.h 或其包含的文件提供
+#ifndef INFO
+#define INFO(format, ...) printf("[INFO] [MemoryModule] " format "\n", ##__VA_ARGS__)
+#endif
+#ifndef ERROR
+#define ERROR(format, ...) printf("[ERROR] [MemoryModule] " format "\n", ##__VA_ARGS__)
+#endif
+#ifndef WARNING
+#define WARNING(format, ...) printf("[WARNING] [MemoryModule] " format "\n", ##__VA_ARGS__)
 #endif
 
-CAbstractUserModule* CreateMemoryModule();
-void DestroyMemoryModule(CAbstractUserModule* pUserModule);
+// DS_TYPE_GAUGE 通常在 collectd.h 或 plugin.h 中定义
+#ifndef DS_TYPE_GAUGE
+#define DS_TYPE_GAUGE 1 // 仅为占位符，请确保使用collectd的实际定义
+#endif
 
-#ifdef __cplusplus
+
+CMemoryModule::CMemoryModule() 
+    : m_values_absolute(true),
+      m_values_percentage(false) {
+    INFO("CMemoryModule实例已创建。配置: Absolute=%s, Percentage=%s.",
+         m_values_absolute ? "true" : "false",
+         m_values_percentage ? "true" : "false");
+    // 此处应集成插件框架的配置加载机制（如果存在）
 }
-#endif
+
+// parseLine 和 parseMemInfo 方法与您之前提供的版本基本一致，这里不再重复，
+// 请确保它们能正确填充 ParsedMemInfo 结构体。为简洁起见，此处省略其完整代码，
+// 假设它们已正确实现。
+
+bool CMemoryModule::parseLine(const std::string& line, const char* key_to_match, gauge_t& target_value_ref) {
+    if (line.rfind(key_to_match, 0) == 0) {
+        size_t colon_pos = line.find(':');
+        if (colon_pos == std::string::npos) return false;
+        size_t value_start_pos = line.find_first_not_of(" \t", colon_pos + 1);
+        if (value_start_pos == std::string::npos) return false;
+        size_t value_end_pos = line.find_first_of(" \t", value_start_pos);
+        std::string value_str = (value_end_pos == std::string::npos) ? line.substr(value_start_pos) : line.substr(value_start_pos, value_end_pos - value_start_pos);
+        if (value_str.empty()) return false;
+        try {
+            target_value_ref = std::stod(value_str) * 1024.0; // 从KB转换为Bytes
+            return true;
+        } catch (const std::exception& e) {
+            WARNING("解析键 '%s' 的数值 '%s' 失败: %s", key_to_match, value_str.c_str(), e.what());
+            return false;
+        }
+    }
+    return false;
+}
+
+bool CMemoryModule::parseMemInfo(ParsedMemInfo& data_out) {
+    std::ifstream meminfo_file("/proc/meminfo");
+    if (!meminfo_file.is_open()) {
+        ERROR("打开 /proc/meminfo 失败: %s", strerror(errno));
+        return false;
+    }
+    data_out = ParsedMemInfo{}; 
+    std::string current_line;
+    while (std::getline(meminfo_file, current_line)) {
+        if (parseLine(current_line, "MemTotal:", data_out.mem_total)) continue;
+        if (parseLine(current_line, "MemFree:", data_out.mem_free)) continue;
+        if (parseLine(current_line, "Buffers:", data_out.mem_buffered)) continue;
+        if (parseLine(current_line, "Cached:", data_out.mem_cached)) continue;
+        if (parseLine(current_line, "Slab:", data_out.mem_slab_total)) continue;
+        if (parseLine(current_line, "SReclaimable:", data_out.mem_slab_reclaimable)) {
+            data_out.detailed_slab_info_present = true; continue;
+        }
+        if (parseLine(current_line, "SUnreclaim:", data_out.mem_slab_unreclaimable)) {
+            data_out.detailed_slab_info_present = true; continue;
+        }
+        if (parseLine(current_line, "MemAvailable:", data_out.mem_available)) {
+            data_out.mem_available_info_present = true; continue;
+        }
+    }
+    if (data_out.mem_total < (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_total)) {
+        WARNING("数据健全性检查失败: MemTotal (%lf) < 各组成部分之和。", data_out.mem_total);
+        return false;
+    }
+    if (data_out.detailed_slab_info_present) {
+        data_out.mem_used = data_out.mem_total - (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_reclaimable);
+    } else {
+        data_out.mem_used = data_out.mem_total - (data_out.mem_free + data_out.mem_buffered + data_out.mem_cached + data_out.mem_slab_total);
+    }
+    if (data_out.mem_used < 0) data_out.mem_used = 0;
+    return true;
+}
+
+
+void CMemoryModule::dispatch_multivalue_metrics(value_list_t* vl_template, const ParsedMemInfo& d) {
+    // 此函数模拟 MEMORY_SUBMIT 宏的行为
+    // vl_template 提供了 plugin, type, time, host (通常由daemon设置), interval
+    // plugin_dispatch_multivalue 的变参部分是 (const char *type_instance, gauge_t value) 对, 以 NULL 结尾
+
+    if (m_values_absolute) {
+        INFO("提交绝对值内存指标 (multivalue)...");
+        if (d.detailed_slab_info_present) {
+            plugin_dispatch_multivalue(vl_template, /* store_percentage = */ false, DS_TYPE_GAUGE,
+                                       "used", d.mem_used,
+                                       "buffered", d.mem_buffered,
+                                       "cached", d.mem_cached,
+                                       "free", d.mem_free,
+                                       "slab_unrecl", d.mem_slab_unreclaimable,
+                                       "slab_recl", d.mem_slab_reclaimable,
+                                       nullptr); // 变参列表结束标记
+        } else {
+            plugin_dispatch_multivalue(vl_template, /* store_percentage = */ false, DS_TYPE_GAUGE,
+                                       "used", d.mem_used,
+                                       "buffered", d.mem_buffered,
+                                       "cached", d.mem_cached,
+                                       "free", d.mem_free,
+                                       "slab", d.mem_slab_total, // 使用Slab总值
+                                       nullptr);
+        }
+    }
+
+    if (m_values_percentage) {
+        INFO("提交百分比内存指标 (multivalue)...");
+        // 当 store_percentage = true 时, collectd 核心期望接收绝对值，
+        // 然后它会根据 types.db 中定义的相应 "value" 数据源的总量 (如果存在) 来计算百分比。
+        // 或者，如果类型本身定义为百分比类型，它会直接存储。
+        // 原始 memory.c 插件依赖 collectd 核心进行此转换。
+        if (d.detailed_slab_info_present) {
+            plugin_dispatch_multivalue(vl_template, /* store_percentage = */ true, DS_TYPE_GAUGE,
+                                       "used", d.mem_used, // 仍然传递绝对值
+                                       "buffered", d.mem_buffered,
+                                       "cached", d.mem_cached,
+                                       "free", d.mem_free,
+                                       "slab_unrecl", d.mem_slab_unreclaimable,
+                                       "slab_recl", d.mem_slab_reclaimable,
+                                       nullptr);
+        } else {
+            plugin_dispatch_multivalue(vl_template, /* store_percentage = */ true, DS_TYPE_GAUGE,
+                                       "used", d.mem_used, // 仍然传递绝对值
+                                       "buffered", d.mem_buffered,
+                                       "cached", d.mem_cached,
+                                       "free", d.mem_free,
+                                       "slab", d.mem_slab_total,
+                                       nullptr);
+        }
+    }
+}
+
+void CMemoryModule::dispatch_available_metric(gauge_t mem_available_value) {
+    // 此函数模拟 memory_submit_available 的行为
+
+    value_list_t vl = VALUE_LIST_INIT;
+    value_t val_entry = { .gauge = mem_available_value };
+
+    vl.values = &val_entry;
+    vl.values_len = 1;
+
+    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
+    sstrncpy(vl.type, "memory", sizeof(vl.type)); // "available" 也属于 "memory" 类型
+    sstrncpy(vl.type_instance, "available", sizeof(vl.type_instance));
+    
+    // 如果需要，设置时间戳。通常 plugin_dispatch_values 会处理时间。
+    // vl.time = cdtime(); // 如果 cdtime() 可用且需要手动设置
+
+    INFO("提交 'available' 指标: value=%lf", mem_available_value);
+    plugin_dispatch_values(&vl); // 直接调用 collectd C API
+                                 // 或者 PluginService::Instance().dispatchValues(&vl); 如果它是简单封装
+}
+
+int CMemoryModule::read() {
+    INFO("read() 方法被调用。");
+    ParsedMemInfo current_mem_data;
+
+    if (!parseMemInfo(current_mem_data)) {
+        ERROR("从 /proc/meminfo 解析内存信息失败。");
+        return -1; // 指示读取失败
+    }
+
+    // 准备 value_list_t 模板
+    // plugin_dispatch_multivalue 将使用此模板中的 plugin, type, time, interval 等信息
+    value_list_t vl_template = VALUE_LIST_INIT;
+    sstrncpy(vl_template.plugin, "memory", sizeof(vl_template.plugin));
+    sstrncpy(vl_template.type, "memory", sizeof(vl_template.type)); // 指标组的主类型名
+
+    // 设置时间戳，与原 memory_read 行为一致
+    // 假设 cdtime() 可通过 utils/common/common.h 或 collectd.h 获得
+    vl_template.time = cdtime(); 
+
+    // 提交主要的内存指标集合
+    dispatch_multivalue_metrics(&vl_template, current_mem_data);
+
+    // 如果解析到了 MemAvailable 信息，则单独提交它
+    if (current_mem_data.mem_available_info_present) {
+        // dispatch_available_metric 会创建自己的 value_list_t，
+        // 所以 vl_template 中的时间戳不会直接用于此调用，
+        // plugin_dispatch_values 会获取新的时间戳（或使用 vl_template.time 如果它也被传递并使用）。
+        // 为了与 memory_submit_available 的独立性一致，这里直接调用。
+        dispatch_available_metric(current_mem_data.mem_available);
+    }
+
+    return 0; // 指示读取成功
+}
+
+// 工厂函数实现 (与之前版本一致)
+CAbstractUserModule* CreateMemoryModule() {
+    INFO("CreateMemoryModule() 已调用，正在创建新的 CMemoryModule 实例。");
+    return new CMemoryModule();
+}
+
+void DestroyMemoryModule(CAbstractUserModule* pUserModule) {
+    INFO("DestroyMemoryModule() 已调用。");
+    // assert(pUserModule != nullptr); // 如果需要断言
+    if (pUserModule != nullptr) {
+        delete pUserModule;
+    }
+}
+
