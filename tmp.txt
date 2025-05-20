@@ -1,63 +1,37 @@
-// --- CMemoryModule.cpp (部分修改) ---
-// ...
-void CMemoryModule::dispatch_multivalue_metrics(value_list_t* vl_template, const ParsedMemInfo& d) {
-    std::vector<MetricDataPoint> data_points;
-    int store_type_for_all = DS_TYPE_GAUGE; // memory.c 插件主要处理 GAUGE 类型
+#include <string>
+#include <unordered_set>
 
-    // 填充 data_points vector
-    if (d.detailed_slab_info_present) {
-        data_points.push_back({ "used", d.mem_used });
-        data_points.push_back({ "buffered", d.mem_buffered });
-        data_points.push_back({ "cached", d.mem_cached });
-        data_points.push_back({ "free", d.mem_free });
-        data_points.push_back({ "slab_unrecl", d.mem_slab_unreclaimable });
-        data_points.push_back({ "slab_recl", d.mem_slab_reclaimable });
-    } else {
-        data_points.push_back({ "used", d.mem_used });
-        data_points.push_back({ "buffered", d.mem_buffered });
-        data_points.push_back({ "cached", d.mem_cached });
-        data_points.push_back({ "free", d.mem_free });
-        data_points.push_back({ "slab", d.mem_slab_total });
+/// 简单的“忽略列表”
+/// invert_ = false 时：匹配列表中项 → 忽略；
+/// invert_ = true  时：匹配列表中项 → 选中，忽略其他所有。
+class IgnoreList {
+public:
+    explicit IgnoreList(bool invert = false)
+        : invert_(invert) {}
+
+    /// 添加一个条目
+    void add(const std::string &item) {
+        items_.insert(item);
+    }
+    /// 删除一个条目
+    void remove(const std::string &item) {
+        items_.erase(item);
+    }
+    /// 清空所有条目
+    void clear() {
+        items_.clear();
+    }
+    /// 设置是否反转匹配逻辑
+    void setInvert(bool invert) {
+        invert_ = invert;
+    }
+    /// 测试是否“匹配”（返回 true 则表示应该忽略/过滤这个条目）
+    bool match(const std::string &item) const {
+        bool found = (items_.count(item) > 0);
+        return invert_ ? !found : found;
     }
 
-    if (data_points.empty()) {
-        return;
-    }
-
-    if (m_values_absolute) {
-        INFO("通过新接口提交绝对值内存指标...");
-        PluginService::Instance().dispatchMultivalues(vl_template, 
-                                                    false, // store_percentage_if_gauge
-                                                    store_type_for_all, 
-                                                    data_points);
-    }
-
-    if (m_values_percentage) {
-        INFO("通过新接口提交百分比内存指标...");
-        PluginService::Instance().dispatchMultivalues(vl_template, 
-                                                    true, // store_percentage_if_gauge
-                                                    store_type_for_all, 
-                                                    data_points); // 传递原始绝对值，由dispatchMultivalues处理百分比
-    }
-}
-
-void CMemoryModule::dispatch_available_metric(gauge_t mem_available_value) {
-    // 这个函数保持不变，因为它本身就是单值提交，可以使用 PluginService::dispatchValues
-    value_list_t vl = VALUE_LIST_INIT;
-    value_t val_entry = { .gauge = mem_available_value };
-    vl.values = &val_entry;
-    vl.values_len = 1;
-
-    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
-    sstrncpy(vl.type, "memory", sizeof(vl.type));
-    sstrncpy(vl.type_instance, "available", sizeof(vl.type_instance));
-    
-    // 假设时间戳由 PluginService::dispatchValues 或 RstDispatcher::enqueue 内部处理 (通过 cdtime)
-    // vl.time = cdtime(); // 如果需要显式设置
-
-    INFO("提交 'available' 指标: value=%lf", mem_available_value);
-    PluginService::Instance().dispatchValues(&vl); // 使用现有的单值提交通道
-}
-
-// CMemoryModule::read() 方法中的调用也相应调整 (vl_template 的准备与之前类似)
-// ...
+private:
+    std::unordered_set<std::string> items_;
+    bool invert_;
+};
