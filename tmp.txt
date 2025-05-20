@@ -1,37 +1,41 @@
+// df.h
+#pragma once
+
+#include "ModuleBase.h"
+#include "IgnoreList.h"
 #include <string>
-#include <unordered_set>
 
-/// 简单的“忽略列表”
-/// invert_ = false 时：匹配列表中项 → 忽略；
-/// invert_ = true  时：匹配列表中项 → 选中，忽略其他所有。
-class IgnoreList {
+class CDFModule final : public CAbstractUserModule {
 public:
-    explicit IgnoreList(bool invert = false)
-        : invert_(invert) {}
+    CDFModule() = default;
+    ~CDFModule() override = default;
 
-    /// 添加一个条目
-    void add(const std::string &item) {
-        items_.insert(item);
-    }
-    /// 删除一个条目
-    void remove(const std::string &item) {
-        items_.erase(item);
-    }
-    /// 清空所有条目
-    void clear() {
-        items_.clear();
-    }
-    /// 设置是否反转匹配逻辑
-    void setInvert(bool invert) {
-        invert_ = invert;
-    }
-    /// 测试是否“匹配”（返回 true 则表示应该忽略/过滤这个条目）
-    bool match(const std::string &item) const {
-        bool found = (items_.count(item) > 0);
-        return invert_ ? !found : found;
-    }
+    // 插件生命周期钩子
+    int init() override;
+    int config(const std::string &key, const std::string &value) override;
+    int read() override;
+    int shutdown() override;
 
 private:
-    std::unordered_set<std::string> items_;
-    bool invert_;
+    void submitValue(const std::string &pluginInstance,
+                     const std::string &type,
+                     const std::string &typeInstance,
+                     gauge_t value);
+
+    IgnoreList il_device_{ true };
+    IgnoreList il_mountpoint_{ true };
+    IgnoreList il_fstype_{ true };
+    IgnoreList il_errors_{ true };
+
+    bool by_device_{ false };
+    bool report_inodes_{ false };
+    bool values_absolute_{ true };
+    bool values_percentage_{ false };
+    bool log_once_{ false };
 };
+
+// C 风格导出符
+extern "C" {
+    CAbstractUserModule* CreateModule();
+    void DestroyModule(CAbstractUserModule *p);
+}
