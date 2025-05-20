@@ -1,108 +1,63 @@
-// --- RstDispatcher.cpp ---
-#include <cmath> // For std::isnan, NAN (或者 collectd 自己的 IS_NAN)
-#include <numeric> // For std::accumulate (可选，用于计算sum)
+// --- CMemoryModule.cpp (部分修改) ---
+// ...
+void CMemoryModule::dispatch_multivalue_metrics(value_list_t* vl_template, const ParsedMemInfo& d) {
+    std::vector<MetricDataPoint> data_points;
+    int store_type_for_all = DS_TYPE_GAUGE; // memory.c 插件主要处理 GAUGE 类型
 
-// 假设 sstrncpy 和 cdtime() 已经可用
-// #include "utils/common/common.h" // 如果需要从中获取
-
-// ... (已有的 enqueue 和 vl_clone 实现) ...
-
-// 新增方法的实现
-int RstDispatcher::enqueueMultivalues(const value_list_t* vl_template,
-                                      bool store_percentage_if_gauge,
-                                      int common_store_type,
-                                      const std::vector<MetricDataPoint>& data_points) {
-    if (!vl_template || data_points.empty()) {
-        return EINVAL; // 无效参数
-    }
-
-    // 原始C代码断言 vl_template->values_len == 1。
-    // 虽然我们的克隆和后续处理会为每个指标创建一个有效的单值value_list_t,
-    // 但保持对模板的这个预期是好的。
-    // if (vl_template->values_len != 1) {
-    //     // 可以选择报错或记录警告
-    //     WARNING("RstDispatcher::enqueueMultivalues: vl_template->values_len is not 1.");
-    // }
-
-    // 1. 如果是 GAUGE 类型且需要计算百分比，则先计算总和
-    gauge_t sum = 0.0;
-    if (common_store_type == DS_TYPE_GAUGE && store_percentage_if_gauge) {
-        for (const auto& dp : data_points) {
-            // 检查 dp.value 是否为 NaN，这与原始C代码行为一致
-            if (!std::isnan(dp.value)) { // C++11 cmath
-                sum += dp.value;
-            }
-        }
-    }
-
-    int failed_submissions = 0;
-
-    // 准备一个工作用的 value_list_t，它将基于模板并为每个数据点进行调整
-    // 这个 working_vl 会在循环中被修改并用于调用 this->enqueue()
-    // this->enqueue() 内部的 vl_clone 会负责深拷贝，所以我们只需要一个工作实例
-    value_list_t working_vl;
-    value_t single_value_for_dispatch; // 用于存储每个指标的单个值
-
-    // 从模板初始化 working_vl 的元数据字段
-    // 注意：不直接完整克隆模板的 values 数组，因为我们将为每个指标设置它
-    working_vl.time = (vl_template->time == 0) ? cdtime() : vl_template->time;
-    working_vl.interval = vl_template->interval;
-    sstrncpy(working_vl.plugin, vl_template->plugin, sizeof(working_vl.plugin));
-    sstrncpy(working_vl.plugin_instance, vl_template->plugin_instance, sizeof(working_vl.plugin_instance));
-    sstrncpy(working_vl.host, vl_template->host, sizeof(working_vl.host)); // 确保host也被复制
-
-    // 设置 working_vl 的 values 部分，使其指向单个 value_t 存储
-    working_vl.values = &single_value_for_dispatch;
-    working_vl.values_len = 1;
-
-    // 如果需要存储百分比 (且是GAUGE类型)，则修改工作副本的 type
-    // 原始C代码仅在 store_percentage 为 true 时修改类型，不检查 common_store_type 是否为 GAUGE，
-    // 但逻辑上这只对 GAUGE 有意义。
-    if (store_percentage_if_gauge && common_store_type == DS_TYPE_GAUGE) {
-        sstrncpy(working_vl.type, "percent", sizeof(working_vl.type));
+    // 填充 data_points vector
+    if (d.detailed_slab_info_present) {
+        data_points.push_back({ "used", d.mem_used });
+        data_points.push_back({ "buffered", d.mem_buffered });
+        data_points.push_back({ "cached", d.mem_cached });
+        data_points.push_back({ "free", d.mem_free });
+        data_points.push_back({ "slab_unrecl", d.mem_slab_unreclaimable });
+        data_points.push_back({ "slab_recl", d.mem_slab_reclaimable });
     } else {
-        sstrncpy(working_vl.type, vl_template->type, sizeof(working_vl.type));
+        data_points.push_back({ "used", d.mem_used });
+        data_points.push_back({ "buffered", d.mem_buffered });
+        data_points.push_back({ "cached", d.mem_cached });
+        data_points.push_back({ "free", d.mem_free });
+        data_points.push_back({ "slab", d.mem_slab_total });
     }
 
-    // 2. 遍历所有数据点，为每个数据点准备并派发 value_list_t
-    for (const auto& dp : data_points) {
-        // 设置当前指标的 type_instance
-        sstrncpy(working_vl.type_instance, dp.type_instance_name, sizeof(working_vl.type_instance));
-
-        // 设置当前指标的值 (包括可能的百分比转换)
-        // 注意：我们假设 MetricDataPoint 中的 value 成员与 common_store_type 匹配
-        switch (common_store_type) {
-            case DS_TYPE_GAUGE:
-                working_vl.values[0].gauge = dp.value;
-                if (store_percentage_if_gauge) {
-                    if (sum != 0.0 && !std::isnan(dp.value)) {
-                        working_vl.values[0].gauge = (dp.value / sum) * 100.0;
-                    } else {
-                        // 如果 sum 为0或dp.value为NaN，则结果为NaN，这与原始C代码行为一致
-                        working_vl.values[0].gauge = NAN; 
-                    }
-                }
-                break;
-            // TODO: 为 DS_TYPE_ABSOLUTE, DS_TYPE_COUNTER, DS_TYPE_DERIVE 添加 case
-            // 这需要 MetricDataPoint 能够携带这些类型的值，或者 dispatchMultivalues 接口更复杂。
-            // 例如:
-            // case DS_TYPE_ABSOLUTE:
-            //    working_vl.values[0].absolute = static_cast<absolute_t>(dp.value); // 假设dp.value能转换
-            //    break;
-            default:
-                ERROR("RstDispatcher::enqueueMultivalues: 不支持的 common_store_type: %d "
-                      "用于指标 '%s'.", common_store_type, dp.type_instance_name);
-                failed_submissions++;
-                continue; // 跳过这个数据点
-        }
-
-        // 使用现有的 enqueue 方法提交这个已准备好的单值 value_list_t
-        // enqueue 方法内部会调用 vl_clone 进行深拷贝
-        if (this->enqueue(&working_vl) != 0) {
-            failed_submissions++;
-        }
+    if (data_points.empty()) {
+        return;
     }
 
-    return failed_submissions > 0 ? -1 : failed_submissions; // 返回失败次数，或-1表示有失败
+    if (m_values_absolute) {
+        INFO("通过新接口提交绝对值内存指标...");
+        PluginService::Instance().dispatchMultivalues(vl_template, 
+                                                    false, // store_percentage_if_gauge
+                                                    store_type_for_all, 
+                                                    data_points);
+    }
+
+    if (m_values_percentage) {
+        INFO("通过新接口提交百分比内存指标...");
+        PluginService::Instance().dispatchMultivalues(vl_template, 
+                                                    true, // store_percentage_if_gauge
+                                                    store_type_for_all, 
+                                                    data_points); // 传递原始绝对值，由dispatchMultivalues处理百分比
+    }
 }
-// ... (pImpl_ 定义和初始化) ...
+
+void CMemoryModule::dispatch_available_metric(gauge_t mem_available_value) {
+    // 这个函数保持不变，因为它本身就是单值提交，可以使用 PluginService::dispatchValues
+    value_list_t vl = VALUE_LIST_INIT;
+    value_t val_entry = { .gauge = mem_available_value };
+    vl.values = &val_entry;
+    vl.values_len = 1;
+
+    sstrncpy(vl.plugin, "memory", sizeof(vl.plugin));
+    sstrncpy(vl.type, "memory", sizeof(vl.type));
+    sstrncpy(vl.type_instance, "available", sizeof(vl.type_instance));
+    
+    // 假设时间戳由 PluginService::dispatchValues 或 RstDispatcher::enqueue 内部处理 (通过 cdtime)
+    // vl.time = cdtime(); // 如果需要显式设置
+
+    INFO("提交 'available' 指标: value=%lf", mem_available_value);
+    PluginService::Instance().dispatchValues(&vl); // 使用现有的单值提交通道
+}
+
+// CMemoryModule::read() 方法中的调用也相应调整 (vl_template 的准备与之前类似)
+// ...
