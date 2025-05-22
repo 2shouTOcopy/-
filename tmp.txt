@@ -1,162 +1,399 @@
-#include <string>
-#include <vector>
-#include <memory>
-#include <sstream> // 需要包含，用于 std::ostringstream
-#include <iomanip> // 需要包含，用于 std::setw, std::setfill, std::fixed, std::setprecision
-#include <cstdio>  // 需要包含，用于 sscanf
+是的，您提出的这种“事先创建好 SC_TCP_CLIENT_NUM 个线程，成功建立连接后唤醒其中一个线程进行处理”的方式是完全可行的。这实际上是一种固定大小的线程池，其中每个线程可以被视为对应一个“处理槽位”。这种方法同样能有效地解决因频繁创建销毁线程而导致的 arena 内存问题，因为线程是复用的。
+下面是基于您描述的逻辑修改后的代码方案：
+核心思路：
+ * 初始化：
+   * 在 tcp_listen_thread 启动时，或更早的程序初始化阶段，创建 SC_TCP_CLIENT_NUM 个工作线程。
+   * 为每个工作线程创建一个数据结构，包含其标识、状态、用于同步的互斥锁和条件变量。
+   * 全局 tcp_server_msg 结构（如 ext_tcp_msg）中的 cli_fd[i] 依然用来表示第 i 个客户端槽位是否被占用。-1 表示空闲。
+   * 引入一个全局互斥锁 g_tcp_man_mutex 来保护对 ext_tcp_msg.cli_num 和 ext_tcp_msg.cli_fd 数组的并发访问（主要是在监听线程查找和分配槽位，以及工作线程释放槽位时）。
+ * 监听与分配：
+   * tcp_listen_thread 接受新连接 (connfd)。
+   * 加锁 g_tcp_man_mutex，查找 ext_tcp_msg.cli_fd 中的空闲槽位 i（即 ext_tcp_msg.cli_fd[i] == -1）。
+   * 如果找到空闲槽位 i 并且 ext_tcp_msg.cli_num < SC_TCP_CLIENT_NUM：
+     * 将 connfd 存入 ext_tcp_msg.cli_fd[i]。
+     * 更新 ext_tcp_msg.cli_num++。
+     * 重置 ext_tcp_msg.cli_exit[i] = 0。
+     * 解锁 g_tcp_man_mutex。
+     * 通过与该槽位 i 对应的工作线程的条件变量，唤醒该工作线程，并传递必要信息（通常工作线程通过其索引 i 就能从 ext_tcp_msg 中获取 connfd）。
+   * 如果找不到空闲槽位或客户端已满，则拒绝连接并关闭 connfd。
+ * 工作线程处理：
+   * 每个工作线程在其主循环中等待其专属的条件变量。
+   * 被唤醒后，工作线程通过其索引 i 从 ext_tcp_msg.cli_fd[i] 获取客户端 fd。
+   * 调用核心处理逻辑函数（例如，我们之前讨论的 sc_gvmp_client_processing_logic(tcp_man, i)）。
+   * 处理完毕后（无论成功或失败），sc_gvmp_client_processing_logic 函数内部会负责（在 g_tcp_man_mutex 保护下）关闭 fd、将 ext_tcp_msg.cli_fd[i] 置为 -1、递减 ext_tcp_msg.cli_num、设置 ext_tcp_msg.cli_exit[i] = 1。
+   * 工作线程随后返回等待下一次唤醒。
+数据结构定义：
+#include <pthread.h> // 使用 POSIX 线程
+#include <errno.h>   // For errno
 
-// CFormatter 基类 (假设已定义或如你提供)
-class CFormatter
-{
-protected:
-	std::string formatStr; // 用于存储格式字符串
-	std::string separator; // 用于存储分隔符
+// 假设 ext_tcp_msg 和 get_product_data() 已在别处定义
+extern struct tcp_server_msg ext_tcp_msg;
+extern struct product_data *get_product_data();
 
-public:
-	CFormatter(const std::string &fmt, const std::string &sep) : formatStr(fmt), separator(sep) {}
+// 假设 SC_TCP_CLIENT_NUM 和 SC_TRANSMIT_PACKET_LEN 已定义
+// #define SC_TCP_CLIENT_NUM 10 // 示例值
+// #define SC_TRANSMIT_PACKET_LEN 65536 // 示例值
 
-	virtual ~CFormatter() {}
+// 日志宏 (示例，请替换为您的实际日志实现)
+#define LOGI(format, ...) printf("INFO: " format, ##__VA_ARGS__)
+#define LOGE(format, ...) printf("ERROR: " format, ##__VA_ARGS__)
+#define LOGW(format, ...) printf("WARN: " format, ##__VA_ARGS__)
+#define LOGD(format, ...) printf("DEBUG: " format, ##__VA_ARGS__)
 
-	virtual std::string format() = 0;
+// 函数声明 (如果您的编译器需要)
+static void *dedicated_worker_thread_func(void *arg);
+static int sc_gvmp_client_processing_logic(struct tcp_server_msg *tcp_man, int cli_fd_idx);
+// 假设的外部函数
+extern int sc_file_access_proc(int32_t cli_fd_idx);
+extern int tcp_create_socket(); // 假设这个函数存在
+extern void thread_set_name(const char* name); // 假设这个函数存在
 
-	const std::string &getSeparator() const { return separator; }
-};
+// 全局互斥锁，用于保护 ext_tcp_msg.cli_fd 和 ext_tcp_msg.cli_num
+pthread_mutex_t g_tcp_man_mutex;
 
-// int 类型的 CFormatter
-class IntFormatter : public CFormatter
-{
-	int value;
+// 每个工作线程的专属信息
+typedef struct {
+    pthread_t tid;                  // 线程ID
+    int worker_idx;                 // 工作线程的固定索引 (0 to SC_TCP_CLIENT_NUM-1)
+    struct tcp_server_msg *tcp_man; // 指向全局的 tcp_server_msg
+    pthread_mutex_t mutex;          // 用于此工作线程条件变量的互斥锁
+    pthread_cond_t cond;            // 工作线程等待的条件变量
+    volatile int new_data_flag;     // 标志，指示是否有新连接分配给此线程
+    // volatile int shutdown_flag;  // 可选：用于优雅关闭单个线程
+} dedicated_worker_info_t;
 
-public:
-	IntFormatter(int v, const std::string &fmt, const std::string &sep) : CFormatter(fmt, sep), value(v) {}
+dedicated_worker_info_t g_workers[SC_TCP_CLIENT_NUM]; // 全局工作线程信息数组
+volatile int g_shutdown_all_workers_flag = 0; // 全局关闭标志
 
-	std::string format() override
-	{
-		int width = 0;
-		// 从 "%10d" 这样的格式字符串中提取宽度
-		if (sscanf(formatStr.c_str(), "%%%dd", &width) == 1) {
-            // sscanf 成功并且读取了 width
-        } else {
-            // 如果 formatStr 不是预期的格式，则处理错误或设置默认宽度
-            // 例如，如果 sscanf 失败，width 将保持为 0
-            // 你也可以选择抛出异常或记录错误
+1. 客户端核心处理逻辑函数 (sc_gvmp_client_processing_logic)
+这个函数与之前线程池版本中的类似，负责处理单个客户端的通信。关键在于它在结束时如何清理资源并更新共享状态。
+static int sc_gvmp_client_processing_logic(struct tcp_server_msg *tcp_man, int cli_fd_idx) {
+    int32_t ret = 0;
+    fd_set rset;
+    struct timeval timeout;
+    int client_socket_fd = tcp_man->cli_fd[cli_fd_idx]; // 获取实际的 socket fd
+
+    LOGI("Worker %d: Processing client on fd %d (slot %d)\n", cli_fd_idx, client_socket_fd, cli_fd_idx);
+
+    // tcp_man->cli_exit[cli_fd_idx] 已由监听线程在分配时设置为 0
+
+    while (!g_shutdown_all_workers_flag && client_socket_fd > 0) {
+        // 再次检查 fd 是否仍然是当前槽位的 fd，以防万一在外部被关闭后槽位被重用
+        // (理论上在当前模型，一个worker处理完之前，槽位fd不变)
+        pthread_mutex_lock(&g_tcp_man_mutex);
+        if (tcp_man->cli_fd[cli_fd_idx] != client_socket_fd || tcp_man->cli_fd[cli_fd_idx] <= 0) {
+             pthread_mutex_unlock(&g_tcp_man_mutex);
+             LOGW("Worker %d: fd %d for slot %d seems to have changed or closed externally. Current slot fd: %d\n",
+                  cli_fd_idx, client_socket_fd, cli_fd_idx, tcp_man->cli_fd[cli_fd_idx]);
+             // 如果 fd 确实无效了，可能需要直接退出处理
+             // 如果是 client_socket_fd <=0, select会出错，这里是额外保护
+             break;
+        }
+        pthread_mutex_unlock(&g_tcp_man_mutex);
+
+
+        FD_ZERO(&rset);
+        FD_SET(client_socket_fd, &rset);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 30 * 1000; // 30ms
+
+        ret = select(client_socket_fd + 1, &rset, NULL, NULL, &timeout);
+
+        if (g_shutdown_all_workers_flag) { // 检查全局关闭标志
+            LOGI("Worker %d: Global shutdown detected during select.\n", cli_fd_idx);
+            break;
         }
 
-		std::ostringstream oss;
-		oss << std::setw(width) << std::setfill('0') << value; // 添加了 std::setfill('0')
-		return oss.str();
-	}
-};
-
-// float 类型的 CFormatter
-class FloatFormatter : public CFormatter
-{
-	float value;
-
-public:
-	FloatFormatter(float v, const std::string &fmt, const std::string &sep) : CFormatter(fmt, sep), value(v) {}
-
-	std::string format() override
-	{
-		int width = 0, precision = 0;
-        // 从 "%10.3f" 这样的格式字符串中提取宽度和精度
-		if (sscanf(formatStr.c_str(), "%%%d.%df", &width, &precision) == 2) {
-            // sscanf 成功并且读取了 width 和 precision
-        } else if (sscanf(formatStr.c_str(), "%%%df", &width) == 1) { // 对应 "%10f" 这样的情况
-            // 只指定了宽度，精度可以默认为0或标准浮点数精度（通常是6）
-        }
-        else {
-            // 处理错误或设置默认的 width/precision
-        }
-
-		std::ostringstream oss;
-		// 添加了 std::setfill('0')
-		oss << std::fixed << std::setw(width) << std::setfill('0') << std::setprecision(precision) << value;
-		return oss.str();
-	}
-};
-
-// 字符串类型的 CFormatter (保持不变，但为了完整性包含在此)
-class StringFormatter : public CFormatter
-{
-	std::string value;
-
-public:
-	StringFormatter(const std::string &v, const std::string &fmt, const std::string &sep) : CFormatter(fmt, sep), value(v) {}
-	std::string format() override
-	{
-		// 字符串格式化器通常不以这种方式使用C风格格式字符串中的宽度/填充。
-        // 如果需要填充，对于 std::string 将需要不同的方法。
-        // 目前，它只是按照原始代码返回该值。
-		return value;
-	}
-};
-
-// 假设 CFormatModule 和其 FormatAndCombine 方法已定义
-// 例如:
-class CFormatModule {
-public:
-    // 'IN' 关键字不是标准 C++，通常是注释或用于文档的宏。
-    // 为了标准的 C++ 语法，我将其移除。
-    std::string FormatAndCombine(const std::vector<std::unique_ptr<CFormatter>> &formatters)
-    {
-        std::string strResult;
-        bool firstElement = true; // 用于控制分隔符的添加
-        for (const auto &formatter : formatters)
-        {
-            if (!formatter) continue; // 防御性检查
-
-            // 如果不是第一个元素，并且我们希望分隔符在元素之间
-            // (注意：原始逻辑是在每个元素后添加分隔符)
-            // if (!firstElement) {
-            //     strResult += formatter->getSeparator(); // 或者一个通用的分隔符
-            // }
-            strResult += formatter->format();
-            strResult += formatter->getSeparator(); // 原始逻辑：在每个元素后添加其分隔符
-            // firstElement = false; // 如果分隔符在元素之间，则需要这个
-        }
-        // 如果你希望严格遵循原始逻辑（每个元素后都有分隔符），那么上面的循环是正确的。
-        // 如果你希望分隔符仅在元素 *之间*，那么最后一个元素不应该有后缀分隔符，
-        // 这需要稍微修改循环逻辑，例如：
-        /*
-        std::string strResult;
-        for (size_t i = 0; i < formatters.size(); ++i) {
-            if (formatters[i]) {
-                strResult += formatters[i]->format();
-                if (i < formatters.size() - 1) { // 只在非最后一个元素后添加分隔符
-                    strResult += formatters[i]->getSeparator(); // 或者下一个元素的 getSeparator()，取决于设计
-                } else if (!formatters[i]->getSeparator().empty()){
-                    // 如果设计就是每个元素（包括最后一个）都必须有其定义的分隔符跟随，即使它是空的
-                     strResult += formatters[i]->getSeparator();
+        if (ret > 0) {
+            if (FD_ISSET(client_socket_fd, &rset)) {
+                ret = sc_file_access_proc(cli_fd_idx); // 核心业务
+                if (ret != 0) {
+                    LOGE("Worker %d: sc_file_access_proc failed for fd %d, ret = %d. Closing.\n", cli_fd_idx, client_socket_fd, ret);
+                    break; // 跳出循环进行清理
                 }
             }
+        } else if (ret == 0) {
+            // Timeout - 可以添加其他检查，比如全局连接状态
+            // struct product_data *rt_data = get_product_data();
+            // if (0 == rt_data->device_state.GevCCPIsConnect) {
+            //    LOGI("Worker %d: GevCCPIsConnect is 0, closing client fd %d\n", cli_fd_idx, client_socket_fd);
+            //    break;
+            // }
+            continue;
+        } else { // ret < 0
+            if (errno == EINTR && !g_shutdown_all_workers_flag) { // 被信号中断，且不是因为我们主动关闭
+                LOGW("Worker %d: select for fd %d interrupted by signal, retrying.\n", cli_fd_idx, client_socket_fd);
+                continue;
+            }
+            LOGE("Worker %d: select error for fd %d, errno = %d. Closing.\n", cli_fd_idx, client_socket_fd, errno);
+            break; // 跳出循环进行清理
         }
-        */
-        return strResult;
     }
-};
 
-// 使用示例 (可以放在你的 main 函数或测试函数中)
-/*
-#include <iostream> // 用于 std::cout
+    // 清理逻辑
+    LOGI("Worker %d: Cleaning up for slot %d, original fd %d.\n", cli_fd_idx, cli_fd_idx, client_socket_fd);
+    pthread_mutex_lock(&g_tcp_man_mutex);
+    // 再次确认我们操作的是否还是最初分配的那个fd，并且它是否还属于这个槽位
+    if (tcp_man->cli_fd[cli_fd_idx] == client_socket_fd && client_socket_fd > 0) {
+        close(client_socket_fd);
+        tcp_man->cli_fd[cli_fd_idx] = -1;
+        tcp_man->cli_num--;
+    } else if (tcp_man->cli_fd[cli_fd_idx] > 0 && tcp_man->cli_fd[cli_fd_idx] != client_socket_fd) {
+        // 这不应该发生，说明在处理过程中槽位被重新分配给了其他fd
+        LOGE("Worker %d: Slot %d was reassigned (now %d) while processing fd %d! This is a bug.\n",
+             cli_fd_idx, cli_fd_idx, tcp_man->cli_fd[cli_fd_idx], client_socket_fd);
+        // 可能不需要再动 cli_num，因为可能已经被其他逻辑错误地修改了
+    } else if (tcp_man->cli_fd[cli_fd_idx] == -1 && client_socket_fd > 0) {
+        // 可能已经被其他地方（如全局关闭）关闭和清理过了
+        LOGW("Worker %d: Slot %d (original fd %d) already cleared.\n", cli_fd_idx, client_socket_fd);
+    }
+    tcp_man->cli_exit[cli_fd_idx] = 1; // 标记此槽位的会话已结束
+    pthread_mutex_unlock(&g_tcp_man_mutex);
 
-int main() {
-    std::vector<std::unique_ptr<CFormatter>> formatters;
-
-    // 示例：整数补零
-    formatters.push_back(std::make_unique<IntFormatter>(42, "%5d", ",")); // 格式化为 "00042"
-    // 示例：浮点数补零
-    formatters.push_back(std::make_unique<FloatFormatter>(3.14159f, "%08.3f", ";")); // 格式化为 "0003.142"
-    // 字符串类型
-    formatters.push_back(std::make_unique<StringFormatter>("test", "%s", "|"));
-
-    CFormatModule module;
-    std::string result = module.FormatAndCombine(formatters);
-
-    // 根据原始的 FormatAndCombine 逻辑，结果会是: "00042,0003.142;test|"
-    // (每个格式化后的字符串都带上了它自己的分隔符)
-    std::cout << "Formatted string: " << result << std::endl;
-
+    LOGI("Worker %d: Finished processing for slot %d.\n", cli_fd_idx);
     return 0;
 }
-*/
+
+2. 专用工作线程函数 (dedicated_worker_thread_func)
+static void *dedicated_worker_thread_func(void *arg) {
+    dedicated_worker_info_t *my_info = (dedicated_worker_info_t *)arg;
+    struct tcp_server_msg *tcp_man = my_info->tcp_man; // 指向 ext_tcp_msg
+    int my_idx = my_info->worker_idx;
+    char thread_name[32];
+
+    snprintf(thread_name, sizeof(thread_name), "ded_worker_%d", my_idx);
+    thread_set_name(thread_name); // 设置线程名
+
+    LOGI("Worker thread %d started, waiting for connections.\n", my_idx);
+
+    while (!g_shutdown_all_workers_flag) {
+        pthread_mutex_lock(&my_info->mutex);
+        while (!my_info->new_data_flag && !g_shutdown_all_workers_flag) {
+            pthread_cond_wait(&my_info->cond, &my_info->mutex);
+        }
+
+        if (g_shutdown_all_workers_flag) {
+            pthread_mutex_unlock(&my_info->mutex);
+            break; // 检测到全局关闭信号，退出循环
+        }
+
+        // 到这里时，my_info->new_data_flag 应该是 true
+        my_info->new_data_flag = 0; // 重置标志，为下一次做准备
+        pthread_mutex_unlock(&my_info->mutex);
+
+        // 确认槽位中确实有有效的 fd (由监听线程设置)
+        // 加锁是为了读取 cli_fd[my_idx] 的值，虽然监听线程已经设置，但为了严谨
+        int current_fd_in_slot;
+        pthread_mutex_lock(&g_tcp_man_mutex);
+        current_fd_in_slot = tcp_man->cli_fd[my_idx];
+        pthread_mutex_unlock(&g_tcp_man_mutex);
+
+        if (current_fd_in_slot > 0) {
+            sc_gvmp_client_processing_logic(tcp_man, my_idx);
+        } else {
+            // 如果被唤醒但发现对应的槽位是空的或者fd无效，记录一下
+            LOGW("Worker %d woken up, but no valid fd in tcp_man->cli_fd[%d] (value: %d).\n",
+                 my_idx, my_idx, current_fd_in_slot);
+        }
+        // 处理完毕，循环回到开头等待下一次唤醒
+    }
+
+    LOGI("Worker thread %d shutting down.\n", my_idx);
+    return NULL;
+}
+
+3. 修改 tcp_listen_thread
+static void *tcp_listen_thread(void *arg) {
+    int32_t sockfd = -1;
+    int32_t connfd = -1;
+    socklen_t addrlen = sizeof(struct sockaddr_in);
+    struct tcp_server_msg *tcp_man = (struct tcp_server_msg *)arg; // 或直接用全局 ext_tcp_msg
+    struct sockaddr_in client_addr;
+    int32_t i = 0; // 循环变量
+    int32_t k = 0; // 循环变量，用于初始化worker
+    int32_t on = 1;
+    // int32_t add_client_ok = 0; // 不再直接需要此变量
+    fd_set rset;
+    int32_t nready;
+    int32_t maxfd;
+    struct timeval timeout;
+    struct linger tcp_linger = { .l_onoff = 1, .l_linger = 1 };
+    int32_t tcp_bufsize = SC_TRANSMIT_PACKET_LEN; // 假设已定义
+    char pthread_name_buf[32] = {0}; // 用于监听线程名
+    struct product_data *rt = get_product_data();
+
+    // 初始化全局互斥锁 (应该在程序启动的早期完成一次)
+    if (pthread_mutex_init(&g_tcp_man_mutex, NULL) != 0) {
+        LOGE("Failed to initialize g_tcp_man_mutex\n");
+        return NULL;
+    }
+
+    // 初始化并创建 SC_TCP_CLIENT_NUM 个工作线程
+    g_shutdown_all_workers_flag = 0; //确保关闭标志初始为0
+    for (k = 0; k < SC_TCP_CLIENT_NUM; k++) {
+        g_workers[k].worker_idx = k;
+        g_workers[k].tcp_man = tcp_man; // 使用传入的 tcp_man (或全局的 ext_tcp_msg)
+        g_workers[k].new_data_flag = 0;
+        // g_workers[k].shutdown_flag = 0; // 如果有单线程关闭标志
+        if (pthread_mutex_init(&g_workers[k].mutex, NULL) != 0) {
+            LOGE("Failed to init mutex for worker %d\n", k); return NULL; /* 错误处理 */
+        }
+        if (pthread_cond_init(&g_workers[k].cond, NULL) != 0) {
+            LOGE("Failed to init cond for worker %d\n", k); return NULL; /* 错误处理 */
+        }
+        if (pthread_create(&g_workers[k].tid, NULL, dedicated_worker_thread_func, &g_workers[k]) != 0) {
+            LOGE("Failed to create worker thread %d\n", k);
+            // 这里应该有更完善的错误处理，比如停止已创建的线程
+            g_shutdown_all_workers_flag = 1; // 通知已启动的线程退出
+            for(int j=0; j<k; ++j) { // Signal already started threads to exit
+                 pthread_mutex_lock(&g_workers[j].mutex);
+                 pthread_cond_signal(&g_workers[j].cond);
+                 pthread_mutex_unlock(&g_workers[j].mutex);
+                 pthread_join(g_workers[j].tid, NULL); // Wait for them
+            }
+            return NULL;
+        }
+    }
+
+    snprintf(pthread_name_buf, sizeof(pthread_name_buf), "priv_tcp_listen");
+    thread_set_name(pthread_name_buf);
+    // thread_bind_cpu(1); // 如有需要
+
+    LOGI("TCP Listen thread started, %d worker threads created.\n", SC_TCP_CLIENT_NUM);
+
+    while (!g_shutdown_all_workers_flag) { // 主循环，可被外部信号或条件中断以实现优雅关闭
+        if (tcp_man->recreate_fd) {
+            // ... (与原代码相同，创建socket的逻辑) ...
+            if (tcp_man->active) { usleep(1000); continue; }
+            if (tcp_create_socket() < 0) { LOGE("ext_tcp_create_socket failed \r\n"); usleep(100000); continue; }
+            tcp_man->recreate_fd = 0;
+        }
+
+        if (0 == rt->device_state.GevCCPIsConnect) {
+            // tcp_close_all_client(); // 这个函数需要特别小心处理
+            // 如果调用 tcp_close_all_client(), 它应该：
+            // 1. 加锁 g_tcp_man_mutex
+            // 2. 遍历所有活动的 cli_fd[j], close(fd), cli_fd[j]=-1, cli_num--
+            // 3. 工作线程中的 select 会因此出错或超时，然后进入清理逻辑。
+            // 确保这里的操作与工作线程的清理逻辑不会冲突。
+            // 或者，设置一个标志，让工作线程自行关闭。
+            // 暂时注释掉，因为它的实现需要非常小心
+        }
+
+        sockfd = tcp_man->lis_fd;
+        if (sockfd < 0) {
+            usleep(100000);
+            tcp_man->recreate_fd = 1;
+            continue;
+        }
+
+        FD_ZERO(&rset);
+        FD_SET(sockfd, &rset);
+        maxfd = sockfd;
+        timeout.tv_sec = 0;  // 短超时，以便能及时响应 shutdown 信号
+        timeout.tv_usec = 100 * 1000; // 100ms
+
+        nready = select(maxfd + 1, &rset, NULL, NULL, &timeout);
+
+        if (g_shutdown_all_workers_flag) break; // 检查关闭标志
+
+        if (nready < 0) {
+            if (errno == EINTR) continue; // 被信号中断，重试
+            LOGE("select error on listen socket, errno: %d\n", errno);
+            usleep(10 * 1000); // 防止CPU空转
+            tcp_man->recreate_fd = 1; // 尝试重建监听socket
+            continue;
+        } else if (0 == nready) { // Timeout
+            continue;
+        }
+
+        // 只有当监听socket就绪时才 accept
+        if (FD_ISSET(sockfd, &rset)) {
+            connfd = accept(sockfd, (struct sockaddr *)&client_addr, (socklen_t *)&addrlen);
+            if (connfd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    LOGW("Accept temporarily unavailable or interrupted (errno: %d)\n", errno);
+                } else {
+                    LOGE("Accept() failed. errno: %d\n", errno);
+                }
+                usleep(1000); // 短暂等待后重试
+                continue;
+            }
+
+            // ... (setsockopt 调用与原代码相同) ...
+            if (setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, (void *)&on, sizeof(on)) < 0) { LOGE("set socketopt TCP_NODELAY failed for fd %d.\n", connfd); }
+            // ... 其他 setsockopt ...
+
+            int assigned_idx = -1;
+            pthread_mutex_lock(&g_tcp_man_mutex);
+            if (tcp_man->cli_num < SC_TCP_CLIENT_NUM) {
+                for (i = 0; i < SC_TCP_CLIENT_NUM; i++) {
+                    if (tcp_man->cli_fd[i] < 0) { // 找到空闲槽位
+                        tcp_man->cli_fd[i] = connfd;
+                        tcp_man->cli_exit[i] = 0; // 为新会话重置退出标志
+                        tcp_man->cli_num++;
+                        assigned_idx = i;
+                        break;
+                    }
+                }
+            } // else { 客户端已满，assigned_idx 仍然是 -1 }
+            pthread_mutex_unlock(&g_tcp_man_mutex);
+
+            if (assigned_idx != -1) {
+                // 成功分配槽位，唤醒对应的工作线程
+                dedicated_worker_info_t *target_worker = &g_workers[assigned_idx];
+                pthread_mutex_lock(&target_worker->mutex);
+                target_worker->new_data_flag = 1;
+                pthread_cond_signal(&target_worker->cond);
+                pthread_mutex_unlock(&target_worker->mutex);
+                LOGI("Client fd %d accepted, assigned to worker %d. Total clients: %d\n", connfd, assigned_idx, tcp_man->cli_num);
+            } else {
+                // 客户端已满或没有可用槽位 (理论上 cli_num < SC_TCP_CLIENT_NUM 保证了有槽位)
+                LOGW("Could not assign client fd %d. Client num: %d (Max: %d). Closing connection.\n", connfd, tcp_man->cli_num, SC_TCP_CLIENT_NUM);
+                if (setsockopt(connfd, SOL_SOCKET, SO_LINGER, (const void *)&tcp_linger, sizeof(struct linger)) != 0) {
+                    LOGE("setsockopt SO_LINGER fail for rejected fd %d\n", connfd);
+                }
+                close(connfd);
+            }
+        } // end if FD_ISSET for accept
+    } // end while(!g_shutdown_all_workers_flag)
+
+    // ----- 优雅关闭 -----
+    LOGI("TCP Listen thread initiating shutdown of worker threads...\n");
+    g_shutdown_all_workers_flag = 1; // 设置全局关闭标志
+
+    // 唤醒所有可能在等待的工作线程，以便它们能检测到关闭标志
+    for (k = 0; k < SC_TCP_CLIENT_NUM; k++) {
+        pthread_mutex_lock(&g_workers[k].mutex);
+        // g_workers[k].shutdown_flag = 1; // 如果有单线程关闭标志
+        pthread_cond_signal(&g_workers[k].cond); // 唤醒等待的线程
+        pthread_mutex_unlock(&g_workers[k].mutex);
+    }
+
+    // 等待所有工作线程结束
+    for (k = 0; k < SC_TCP_CLIENT_NUM; k++) {
+        pthread_join(g_workers[k].tid, NULL);
+        pthread_mutex_destroy(&g_workers[k].mutex);
+        pthread_cond_destroy(&g_workers[k].cond);
+        LOGI("Worker thread %d joined.\n", k);
+    }
+
+    pthread_mutex_destroy(&g_tcp_man_mutex);
+    LOGI("All worker threads shut down. TCP Listen thread exiting.\n");
+    return NULL;
+}
+
+关键点和逻辑严谨性保证：
+ * 独立的工作线程状态： 每个 dedicated_worker_info_t 包含独立的互斥锁和条件变量，确保监听线程可以精确唤醒某一个空闲的工作线程，而工作线程之间不会相互干扰等待。
+ * g_tcp_man_mutex 的作用：
+   * 监听线程在查找空闲槽位 (tcp_man->cli_fd[i] == -1)、更新 tcp_man->cli_fd[i]、tcp_man->cli_num++ 时使用。
+   * 工作线程（通过 sc_gvmp_client_processing_logic）在完成任务后，更新 tcp_man->cli_fd[i] = -1、tcp_man->cli_num-- 时使用。
+   * 这确保了对客户端连接数和槽位状态的原子性操作。
+ * new_data_flag： 这个标志用于防止条件变量的“惊群”效应（虽然此处每个线程有自己的条件变量，问题不大）和处理虚假唤醒。工作线程被唤醒后，检查此标志确认是真的有任务。
+ * 线程启动与关闭：
+   * 监听线程负责一次性创建所有工作线程。
+   * 优雅关闭通过设置全局标志 g_shutdown_all_workers_flag，然后逐个唤醒并 join 工作线程来实现。
+ * sc_gvmp_client_processing_logic 的职责： 此函数封装了单个客户端的完整生命周期管理，包括 select 循环、调用 sc_file_access_proc，以及最终在 g_tcp_man_mutex 保护下的资源清理。
+ * 错误处理： 在 pthread_create、mutex_init、cond_init 等地方应有更健壮的错误处理。在 accept、select 失败时也打印了 errno。
+ * cli_exit[i] 的维护： tcp_listen_thread 在分配槽位时将 cli_exit[i] 置0，sc_gvmp_client_processing_logic 在处理结束时将其置1。
+这种方法比通用的任务队列式线程池在实现上可能稍微直接一些，因为它将工作线程与潜在的客户端“槽位”进行了更紧密的（逻辑上的）对应。请务必仔细测试并发访问和边界条件。
