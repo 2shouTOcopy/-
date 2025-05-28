@@ -1,257 +1,94 @@
-#include <iostream>
-#include <fstream>
+#ifndef THREAD_PLUGIN_H
+#define THREAD_PLUGIN_H
+
 #include <string>
-#include <cstdio>     // 用于 popen, pclose, ferror, remove
-#include <memory>     // 用于 std::unique_ptr
-#include <array>      // 用于 executeCommandAndGetOutput 中的缓冲区
-#include <sys/wait.h> // 用于 WIFEXITED, WEXITSTATUS (在某些系统上需要)
+#include <vector>
+#include <cstdint>
+#include <map> // For aggregate stats by state
 
-// 假设 ConfigManager, ERROR, OUTPUT_FILENAME, 和 m_bCommInfo 在别处定义
-// 例如:
-#define OUTPUT_FILENAME "memory_module_output_final_cn.txt" // 输出文件名示例
-#define TEMP_CMD2_OUTPUT_FILENAME "memory_module_temp_cmd2_cn.txt" // command2的临时输出文件名
-// 简单的错误宏定义 (在实际项目中建议使用更完善的日志库)
-#define ERROR(fmt, ...) fprintf(stderr, "[错误] " fmt "\n", ##__VA_ARGS__)
-
-// 模拟的 ConfigManager 类
-class ConfigManager {
-public:
-    static ConfigManager& Instance() {
-        static ConfigManager instance;
-        return instance;
-    }
-    std::string GetGlobalOption(const std::string& option) {
-        if (option == "BaseDir") {
-            return "./"; // 示例 BaseDir，当前目录
-        }
-        return "";
-    }
-private:
-    ConfigManager() = default;
+// 线程状态枚举 (Linux specific)
+// Based on /proc/[pid]/stat, field 3 (state)
+enum class ThreadState {
+    RUNNING,      // R
+    SLEEPING,     // S (interruptible sleep)
+    DISK_SLEEP,   // D (uninterruptible disk sleep)
+    ZOMBIE,       // Z
+    TRACED_STOPPED, // T (stopped by job control signal or because it is being traced)
+    PAGING,       // W (paging - pre-2.6 kernels)
+    DEAD,         // X (should not be seen)
+    IDLE,         // I (Idle kernel thread - Linux 4.14+)
+    UNKNOWN
 };
 
-// CMemoryModule 类定义
-class CMemoryModule {
-public:
-    CMemoryModule() : m_bCommInfo(true) {} // 示例: m_bCommInfo 默认为 true
-    int flush();
-private:
-    bool m_bCommInfo; // 用于步骤3的成员变量
+// 调度策略枚举 (Linux specific)
+// Based on /proc/[pid]/sched, or constants from sched.h
+enum class SchedulingPolicy {
+    SCHED_OTHER,    // 0
+    SCHED_FIFO,     // 1
+    SCHED_RR,       // 2
+    SCHED_BATCH,    // 3
+    SCHED_ISO,      // 4 (deprecated)
+    SCHED_IDLE,     // 5
+    SCHED_DEADLINE, // 6
+    UNKNOWN
 };
 
-// 辅助函数：执行命令并获取其标准输出
-std::string executeCommandAndGetOutput(const std::string& command) {
-    std::string data;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command.c_str(), "r"), pclose);
-    if (!pipe) {
-        ERROR("执行命令 '%s' 失败 (popen)", command.c_str());
-        return "";
-    }
-    std::array<char, 256> buffer;
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        data += buffer.data();
-    }
-    if (ferror(pipe.get())) {
-        ERROR("读取命令 '%s' 的输出时出错", command.c_str());
-    }
-    // 注意: pclose 的返回值可以检查命令退出状态，这里简化了。
-    // 在实际应用中，应该检查 pclose(&*pipe) 的结果。
-    // 但是 unique_ptr 会在作用域结束时自动调用 pclose(pipe.get())。
-    // 如果需要立即获取状态，需要更复杂的处理，比如 pipe.release() 然后手动 pclose。
-    // 或者在函数末尾检查 pipe.get() 是否仍然有效，如果不是，说明已关闭。
-    // 为简单起见，此辅助函数主要关注捕获输出。
-    return data;
-}
+struct ThreadInfo {
+    // 1. 基础线程信息
+    int32_t id;                       // 线程ID (TID)
+    std::string name;                 // 线程名称 (comm)
+    ThreadState state;                // 线程状态
+    long priority;                    // 优先级 (from /proc/[pid]/task/[tid]/stat, field 18)
+    long nice_value;                  // Nice值 (from /proc/[pid]/task/[tid]/stat, field 19)
+    SchedulingPolicy policy;          // 调度策略
 
-int CMemoryModule::flush() {
-    const std::string strDir = ConfigManager::Instance().GetGlobalOption("BaseDir");
-    if (strDir.empty()) {
-        ERROR("memory 插件: DataDir 未配置。");
-        return -1;
-    }
-    const std::string outPath = strDir + "/" + OUTPUT_FILENAME;
-    const std::string tmpPath = strDir + "/" + TEMP_CMD2_OUTPUT_FILENAME; // 定义 tmpPath
-    std::ofstream outFile;
+    // 2. CPU 和资源占用
+    double cpu_usage_user_avg_percent; // 平均CPU使用率 (用户态百分比, 自进程启动以来)
+    double cpu_usage_system_avg_percent; // 平均CPU使用率 (内核态百分比, 自进程启动以来)
+    uint64_t runtime_user_ms;         // 用户态CPU耗时 (毫秒)
+    uint64_t runtime_system_ms;       // 内核态CPU耗时 (毫秒)
+    uint64_t memory_stack_kb;         // 栈大小 (KB, VmStk from status)
+    // 共享内存通常是进程级别的，此处不单独列出线程的贡献
+    int open_files_count;             // 打开的文件描述符数量
 
-    // --- 步骤1: 执行 command1 并将其输出写入 outPath ---
-    // 这个command1的指令只需要将返回值接受并写入即可
-    const std::string command1 = "/mnt/app/toolbox mp_stat 1 mmz_comm_pool ";
-    std::cout << "步骤1: 执行 command1: " << command1 << std::endl;
+    // 3. 阻塞与锁状态
+    // std::vector<std::string> held_locks; // 难以从/proc获取，留空
+    // std::string waiting_for_lock;     // 难以从/proc获取，留空
+    std::string wchan;                // 若阻塞，内核等待的函数名 (requires kptr_restrict=0 or root)
+    std::vector<std::string> call_stack; // 调用栈 (非常复杂，这里将是占位符)
 
-    outFile.open(outPath, std::ios::out | std::ios::trunc);
-    if (!outFile.is_open()) {
-        ERROR("memory 插件: 为 command1 打开输出文件 '%s' 失败。", outPath.c_str());
-        return -1;
-    }
+    // 4. 调度与延迟
+    // uint64_t scheduling_delay_ns;     // 难以从/proc获取
+    uint64_t voluntary_context_switches;   // 自愿上下文切换次数
+    uint64_t nonvoluntary_context_switches; // 非自愿上下文切换次数
 
-    std::string command1_output = executeCommandAndGetOutput(command1);
-    if (!command1_output.empty()) {
-        outFile << command1_output;
-    } else {
-        // 根据 executeCommandAndGetOutput 的实现，空输出可能表示错误或命令无输出
-        // 此处假设如果 command1 必须有输出，那么空输出是个问题
-        // 但如果 command1 本身可能无输出，则此逻辑需要调整
-        // 为了安全，我们检查一下文件流状态
-        if (!outFile.good()) {
-             ERROR("memory 插件: 写入 command1 输出到 '%s' 时发生错误。", outPath.c_str());
-             outFile.close();
-             remove(outPath.c_str()); // 清理部分写入的文件
-             return -1;
-        }
-        // 如果命令确实没有输出，这并非错误。
-    }
-    outFile.close(); // 完成 command1 的写入后关闭文件
+    std::string state_to_string() const;
+    std::string policy_to_string() const;
+};
 
-    // --- 步骤2: command2 的输出到 tmpPath，然后合并到 outPath，并删除 tmpPath ---
-    // 这个command2的指令所输出内容过长，所以只能输出到tmpPath路径，能否将内容合并到outPath，处理完后，需要删除tmpPath
-    const std::string command2_str = "/mnt/app/toolbox mp_print 1 mmz_comm_pool " + tmpPath;
-    std::cout << "步骤2: 执行 command2: " << command2_str << " (输出到 " << tmpPath << ")" << std::endl;
+struct AggregateStats {
+    size_t total_threads;
+    std::map<ThreadState, size_t> threads_by_state;
+    std::vector<int32_t> cpu_hot_thread_ids; // CPU占用高的线程ID列表 (按总CPU时间排序)
+    // 可以在此添加更多聚合信息
+};
 
-    // 先确保 tmpPath 不存在或为空，避免旧数据干扰（尽管 command2 可能会覆盖它）
-    remove(tmpPath.c_str()); // 尝试删除，忽略错误（如果文件不存在）
+class ThreadPlugin {
+public:
+    ThreadPlugin();
+    ~ThreadPlugin();
 
-    std::unique_ptr<FILE, decltype(&pclose)> pipe_cmd2(
-        popen(command2_str.c_str(), "r"), pclose); // "r" 是为了捕获 command2 本身的 stdout/stderr
+    std::pair<std::vector<ThreadInfo>, AggregateStats> flush();
 
-    if (!pipe_cmd2) {
-        ERROR("memory 插件: 执行命令 '%s' 失败 (popen)。", command2_str.c_str());
-        return -1; // command2 执行失败，无法继续
-    } else {
-        // 检查 command2 本身的执行状态，而不是它写入 tmpPath 的内容
-        char buffer[256];
-        std::string cmd2_diag_output; // 用于收集 command2 的诊断输出
-        while (fgets(buffer, sizeof(buffer), pipe_cmd2.get()) != nullptr) {
-            cmd2_diag_output += buffer;
-        }
+private:
+    long clock_ticks_per_second_; // For converting jiffies to ms
+    double get_process_uptime_seconds(long process_start_jiffies);
+    
+    // Helper to read /proc files
+    static std::string read_file_to_string(const std::string& path);
+    static std::vector<std::string> split_string(const std::string& s, char delimiter);
+    static ThreadState char_to_thread_state(char c);
+    static SchedulingPolicy int_to_sched_policy(int p);
+};
 
-        int cmd2_status = pclose(pipe_cmd2.release()); // 获取 command2 的退出状态
-
-        if (cmd2_status == -1) {
-            ERROR("memory 插件: 命令 '%s' 的 pclose 失败。", command2_str.c_str());
-            // tmpPath 可能未生成或不完整，但还是尝试清理
-            remove(tmpPath.c_str());
-            return -1;
-        } else if (WIFEXITED(cmd2_status)) {
-            int exit_code = WEXITSTATUS(cmd2_status);
-            if (exit_code != 0) {
-                ERROR("memory 插件: 命令 '%s' 以状态 %d 退出。诊断输出: %s", command2_str.c_str(), exit_code, cmd2_diag_output.c_str());
-                remove(tmpPath.c_str()); // 清理 tmpPath，因为它可能包含错误或不完整的数据
-                return -1; // command2 执行有误
-            }
-            // command2 成功退出
-            if (!cmd2_diag_output.empty()) {
-                 std::cout << "Command2 诊断输出: " << cmd2_diag_output << std::endl;
-            }
-        } else if (WIFSIGNALED(cmd2_status)) {
-            ERROR("memory 插件: 命令 '%s' 被信号 %d 终止。诊断输出: %s", command2_str.c_str(), WTERMSIG(cmd2_status), cmd2_diag_output.c_str());
-            remove(tmpPath.c_str());
-            return -1;
-        } else {
-            ERROR("memory 插件: 命令 '%s' 异常终止。诊断输出: %s", command2_str.c_str(), cmd2_diag_output.c_str());
-            remove(tmpPath.c_str());
-            return -1;
-        }
-    }
-
-    // 现在 command2 应该已经成功执行并将其输出写入了 tmpPath
-    // 接下来，将 tmpPath 的内容追加到 outPath
-    std::cout << "步骤2: 将 " << tmpPath << " 的内容合并到 " << outPath << std::endl;
-    std::ifstream tempFile(tmpPath, std::ios::in | std::ios::binary);
-    if (!tempFile.is_open()) {
-        ERROR("memory 插件: 打开临时文件 '%s' 失败（用于合并）。command2 可能未生成文件。", tmpPath.c_str());
-        // outPath 此时包含 command1 的内容，根据需求决定是否保留
-        remove(tmpPath.c_str()); // 尝试清理（尽管可能不存在）
-        return -1;
-    }
-
-    outFile.open(outPath, std::ios::out | std::ios::app | std::ios::binary); // 以追加模式打开 outPath
-    if (!outFile.is_open()) {
-        ERROR("memory 插件: 为追加内容打开输出文件 '%s' 失败。", outPath.c_str());
-        tempFile.close();
-        remove(tmpPath.c_str());
-        return -1;
-    }
-
-    outFile << "\n--- Command 2 Output ---\n"; // 可选的分隔符
-    outFile << tempFile.rdbuf(); // 高效地流式传输文件内容
-
-    if (tempFile.bad() || !outFile.good()) {
-        ERROR("memory 插件: 从 '%s' 读取或写入到 '%s' 时发生错误。", tmpPath.c_str(), outPath.c_str());
-        tempFile.close();
-        outFile.close();
-        remove(tmpPath.c_str());
-        // outPath 可能部分写入了 command2 的内容，需要考虑如何处理
-        return -1;
-    }
-
-    tempFile.close();
-    outFile.close();
-
-    // 删除 tmpPath
-    if (remove(tmpPath.c_str()) != 0) {
-        ERROR("memory 插件: 删除临时文件 '%s' 失败。", tmpPath.c_str());
-        // 这通常不是致命错误，但应记录下来
-    } else {
-        std::cout << "步骤2: 临时文件 " << tmpPath << " 已删除。" << std::endl;
-    }
-
-    // --- 步骤3: 如果 m_bCommInfo 为 true, 那么还需要把 "/proc/hdal/comm/info" 内容刷到 outPath 文件最后 ---
-    if (m_bCommInfo) {
-        const std::string commInfoPath = "/proc/hdal/comm/info";
-        std::cout << "步骤3: 将内容从 " << commInfoPath << " 追加到 " << outPath << std::endl;
-
-        std::ifstream commInfoFile(commInfoPath, std::ios::in | std::ios::binary);
-        if (!commInfoFile.is_open()) {
-            ERROR("memory 插件: 打开 comm info 文件 '%s' 失败。", commInfoPath.c_str());
-            return -1; // 如果此步骤关键，则返回错误
-        }
-
-        outFile.open(outPath, std::ios::out | std::ios::app | std::ios::binary); // 再次以追加模式打开 outPath
-        if (!outFile.is_open()) {
-            ERROR("memory 插件: 为追加 comm info 打开输出文件 '%s' 失败。", outPath.c_str());
-            commInfoFile.close();
-            return -1;
-        }
-
-        outFile << "\n--- Comm Info ---\n"; // 可选的分隔符
-        outFile << commInfoFile.rdbuf();
-
-        if (commInfoFile.bad() || !outFile.good()) {
-            ERROR("memory 插件: 从 comm info 文件 '%s' 读取或写入到 '%s' 时出错。", commInfoPath.c_str(), outPath.c_str());
-            commInfoFile.close();
-            outFile.close();
-            return -1;
-        }
-
-        commInfoFile.close();
-        outFile.close();
-    }
-
-    std::cout << "memory 插件: Flush 操作完成。最终输出位于 " << outPath << std::endl;
-    return 0; // 成功
-}
-
-int main() {
-    // 示例用法
-    // 注意: 为了让这个 main 函数能够运行并通过编译，
-    // /mnt/app/toolbox 等路径和命令需要是实际存在的，或者用模拟的命令代替。
-    // 例如，在Linux或macOS上，你可以创建一些简单的shell脚本来模拟这些命令:
-    // echo "mp_stat output for mmz_comm_pool" > ./mp_stat_sim.sh
-    // echo "long output from mp_print for mmz_comm_pool to file \$1" > ./mp_print_sim.sh
-    // chmod +x ./mp_stat_sim.sh ./mp_print_sim.sh
-    // 然后在代码中将 command1 和 command2 的路径替换为 ./mp_stat_sim.sh 和 ./mp_print_sim.sh
-    //
-    // 还需要创建 /proc/hdal/comm/info 文件或类似内容的模拟文件。
-    // echo "HDAL Comm Info Content" > ./proc_hdal_comm_info_sim
-    // 然后在代码中修改 commInfoPath
-
-    CMemoryModule memModule;
-    int result = memModule.flush();
-    if (result == 0) {
-        std::cout << "Flush 操作成功。" << std::endl;
-        // 你可以检查 ./memory_module_output_final_cn.txt 的内容
-    } else {
-        std::cout << "Flush 操作失败。" << std::endl;
-    }
-    return 0;
-}
+#endif // THREAD_PLUGIN_H
