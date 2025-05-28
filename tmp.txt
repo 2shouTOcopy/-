@@ -1,191 +1,268 @@
-#include <cstdio>
-#include <memory>
+#include <iostream>
 #include <fstream>
 #include <string>
-#include <cassert>
-#include <vector> // 为未来潜在使用添加，当前方案非必需
+#include <cstdio> // 用于 popen, pclose, ferror
+#include <memory> // 用于 std::unique_ptr
+#include <vector> // 用于读取命令输出 (在此版本中未使用，但通常有用)
+#include <array>  // 用于 executeCommandAndGetOutput 中的缓冲区
+#include <sys/wait.h> // 用于 WIFEXITED, WEXITSTATUS (在某些系统上需要)
 
-#include "network.h" // 假设 CNetworkModule 和 CAbstractUserModule 在此声明
-#include "../daemon/PluginService.h" // 假设 PluginService 在此定义
-#include "../daemon/utils/utils.h" // 假设 ERROR 宏在此定义
+// 假设 ConfigManager, ERROR, OUTPUT_FILENAME, 和 m_bCommInfo 在别处定义
+// 例如:
+#define OUTPUT_FILENAME "memory_module_output_cn.txt" // 输出文件名示例
+// 简单的错误宏定义 (在实际项目中建议使用更完善的日志库)
+#define ERROR(fmt, ...) fprintf(stderr, "[错误] " fmt "\n", ##__VA_ARGS__)
 
-static constexpr char const *OUTPUT_FILENAME = "network_status.txt";
+// 模拟的 ConfigManager 类
+class ConfigManager {
+public:
+    static ConfigManager& Instance() {
+        static ConfigManager instance;
+        return instance;
+    }
+    std::string GetGlobalOption(const std::string& option) {
+        if (option == "BaseDir") {
+            return "./"; // 示例 BaseDir，当前目录
+        }
+        return "";
+    }
+private:
+    ConfigManager() = default;
+};
 
-// 匿名命名空间，用于辅助函数
-namespace
-{
-	inline void rstripSlash(std::string &s)
-	{
-		while (!s.empty() && s.back() == '/')
-			s.pop_back();
-	}
+// CMemoryModule 类定义
+class CMemoryModule {
+public:
+    CMemoryModule() : m_bCommInfo(true) {} // 示例: m_bCommInfo 默认为 true
+    int flush();
+private:
+    bool m_bCommInfo; // 用于步骤3的成员变量
+};
 
-	// 辅助函数：执行命令并将其输出写入 ofstream
-	void executeCommandAndWriteOutput(std::ofstream &ofs, const char *command, const char *errorContext)
-	{
-		std::unique_ptr<FILE, decltype(&pclose)> pipe(
-			popen(command, "r"), pclose);
-		if (!pipe)
-		{
-			// 假设 ERROR 是一个 printf 风格的宏: ERROR(format, ...)
-			if (errorContext && command) {
-				ERROR("network plugin: %s: Failed to execute command '%s'", errorContext, command);
-			} else if (command) {
-				ERROR("network plugin: Failed to execute command '%s'", command);
-			} else {
-				ERROR("network plugin: Failed to execute command (unknown)");
-			}
-			ofs << "[执行命令 " << (command ? command : "未知") << " 出错]\n\n";
-		}
-		else
-		{
-			char buf[4096];
-			while (fgets(buf, sizeof(buf), pipe.get()) != nullptr)
-			{
-				ofs << buf;
-			}
-			if (ferror(pipe.get())) {
-                if (errorContext && command) {
-				    ERROR("network plugin: %s: Error reading output from command '%s'", errorContext, command);
-                } else if (command) {
-                    ERROR("network plugin: Error reading output from command '%s'", command);
-                } else {
-                    ERROR("network plugin: Error reading output from command (unknown)");
+// 辅助函数：执行命令并获取其标准输出
+std::string executeCommandAndGetOutput(const std::string& command) {
+    std::string data;
+    // 使用 unique_ptr 自动管理 FILE* 指针
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command.c_str(), "r"), pclose);
+    if (!pipe) {
+        ERROR("执行命令 '%s' 失败 (popen)", command.c_str());
+        return ""; // 返回空字符串表示失败
+    }
+    std::array<char, 256> buffer;
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        data += buffer.data();
+    }
+    if (ferror(pipe.get())) {
+        ERROR("读取命令 '%s' 的输出时出错", command.c_str());
+        // 此时 data 可能包含部分输出，根据需求决定是否清空
+    }
+    // pclose 的返回值可以用于检查命令执行状态，这里省略以简化，
+    // 但在生产代码中应该检查。
+    return data;
+}
+
+int CMemoryModule::flush() {
+    const std::string strDir = ConfigManager::Instance().GetGlobalOption("BaseDir");
+    if (strDir.empty()) {
+        ERROR("memory 插件: DataDir 未配置。");
+        return -1;
+    }
+    const std::string outPath = strDir + "/" + OUTPUT_FILENAME;
+    std::ofstream outFile; // 在这里声明 outFile，以便在多个步骤中使用
+
+    // --- 步骤1: 执行 command1 并将其输出写入 outPath ---
+    // 这个command1的指令只需要将返回值接受并写入即可
+    const std::string command1 = "/mnt/app/toolbox mp_stat 1 mmz_comm_pool ";
+    std::cout << "执行 command1: " << command1 << std::endl; // 用于调试
+
+    // 通常，最好只打开文件一次，并在需要时追加。
+    // 对于步骤1，我们将覆盖或创建文件。
+    outFile.open(outPath, std::ios::out | std::ios::trunc); // trunc 会清空已存在的文件内容
+    if (!outFile.is_open()) {
+        ERROR("memory 插件: 为 command1 打开输出文件 '%s' 失败。", outPath.c_str());
+        return -1;
+    }
+
+    std::string command1_output = executeCommandAndGetOutput(command1);
+    if (!command1_output.empty()) {
+        outFile << command1_output;
+    } else {
+        // 检查 executeCommandAndGetOutput 是否已经记录了错误
+        // 如果 popen 失败或读取时出错 (ferror)，executeCommandAndGetOutput 会返回空字符串
+        // 并且应该已经在内部记录了错误。这里我们假设如果输出为空且没有错误，
+        // 命令本身可能就没有输出。如果命令执行失败是关键的，executeCommandAndGetOutput
+        // 应提供更明确的错误指示。
+        // 对于某些命令，空输出可能是正常的。
+        // 如果命令执行失败是严重问题，executeCommandAndGetOutput 应该有办法指示这一点，
+        // 例如通过抛出异常或返回一个包含错误状态的结构体。
+        // 当前的实现中，如果 popen 失败，会打印错误并返回空字符串。
+        if (errno != 0 && command1_output.empty() && !outFile.good()) { // 更细致的错误检查可能需要
+            // 错误已由 executeCommandAndGetOutput 记录或 popen 失败
+             outFile.close(); // 返回前关闭文件
+            // 可选：如果文件是空的或部分写入，则删除 outPath
+            // remove(outPath.c_str());
+            return -1; // 指示命令执行严重失败
+        }
+    }
+    // outFile.flush(); // 可选：如果需要，立即刷新
+
+
+    // --- 步骤2: 执行 command2，将其输出合并到 outPath，然后“删除” outPath ---
+    // "删除 outPath" 的要求比较棘手，如果你需要合并后的内容。
+    // 通常，你会处理文件，然后删除它。
+    // 在这里，我们将追加 command2 的输出。删除逻辑可能在此函数之外，
+    // 或者“删除”意味着内容现在已被“处理”，并且在所有操作完成后或内容被其他地方读取后，
+    // 文件可以被移除。
+    // 目前，我们只是追加到 outPath。
+
+    // 在 popen 在 command2 中使用它之前，确保从步骤1关闭 outFile
+    // 或者确保 command2 不会尝试直接写入相同的文件名（如果 popen 内部处理它）。
+    // 所提供的 command2 结构本身就写入到 outPath。如果 outFile (ofstream) 已将其打开，则这有问题。
+    // 因此，我们先关闭C++流。
+    outFile.close();
+
+    // 这个command2的指令由于内容过长，所以只能输出到outPath路径，能否将内容合并到outPath，处理完后，需要删除outPath
+    const std::string command2_str = "/mnt/app/toolbox mp_print 1 mmz_comm_pool " + outPath; // command2 将输出追加到 outPath
+    std::cout << "执行 command2: " << command2_str << std::endl; // 用于调试
+
+    // 由于 command2 本身写入到 outPath，我们只需执行它。
+    // 我们需要确保 command2 正确地追加到 outPath。
+    // 这里的 popen 调用是用于读取 command2 本身的输出（如状态消息），
+    // 而不是用于重定向文件输出，因为 command2 已经在这样做了。
+    std::unique_ptr<FILE, decltype(&pclose)> pipe_cmd2(
+        popen(command2_str.c_str(), "r"), pclose); // "r" 用于读取 command2 的 stdout/stderr（如果有的话），而不是它的文件输出。
+
+    if (!pipe_cmd2) {
+        ERROR("memory 插件: 执行命令 '%s' 失败 (popen)", command2_str.c_str());
+        // outPath 可能已被 command1 部分写入。
+        // 根据需求，你可能想要删除它。
+        // remove(outPath.c_str());
+        return -1;
+    } else {
+        // 检查 command2 执行的错误，而不是它的文件写入（它在内部执行）。
+        // 我们可以读取 command2 产生的任何标准输出。
+        char buffer[256];
+        std::string cmd2_stdout_stderr; // 用于收集 command2 的标准输出或错误输出
+        while (fgets(buffer, sizeof(buffer), pipe_cmd2.get()) != nullptr) {
+            cmd2_stdout_stderr += buffer;
+        }
+
+        int cmd2_status = pclose(pipe_cmd2.release()); // 释放并关闭以获取状态
+                                                      // 注意：在调用 pclose 之前，pipe_cmd2.get() 已经因为循环结束（fgets 返回 nullptr）或错误而关闭了管道读取端。
+                                                      // release() 是为了转移所有权，避免 unique_ptr 在析构时再次调用 pclose。
+
+        if (cmd2_status == -1) {
+            ERROR("memory 插件: 命令 '%s' 的 pclose 失败", command2_str.c_str());
+            // 这通常意味着 wait4 调用失败，可以检查 errno。
+        } else if (WIFEXITED(cmd2_status)) { // 检查子进程是否正常退出
+            int exit_code = WEXITSTATUS(cmd2_status);
+            if (exit_code != 0) {
+                ERROR("memory 插件: 命令 '%s' 以状态 %d 退出。输出: %s", command2_str.c_str(), exit_code, cmd2_stdout_stderr.c_str());
+                // 根据这个错误是否致命来决定 flush 操作的结果。
+            } else {
+                 if (!cmd2_stdout_stderr.empty()) {
+                    std::cout << "Command2 标准输出/错误: " << cmd2_stdout_stderr << std::endl; // 记录 command2 的任何输出
                 }
-				ofs << "[读取命令 " << (command ? command : "未知") << " 输出时出错]\n";
-			}
-			ofs << "\n"; // 在命令输出后添加换行符以增加间距
-		}
-	}
+            }
+        } else if (WIFSIGNALED(cmd2_status)) { // 检查子进程是否因为信号而终止
+            ERROR("memory 插件: 命令 '%s' 被信号 %d 终止。输出: %s", command2_str.c_str(), WTERMSIG(cmd2_status), cmd2_stdout_stderr.c_str());
+        }
 
-	// 辅助函数：读取文件内容并将其写入 ofstream
-	void readFileAndWriteOutput(std::ofstream &ofs, const char *filepath, const char *errorContext)
-	{
-		std::ifstream ifs_file(filepath);
-		if (ifs_file.is_open())
-		{
-			ofs << ifs_file.rdbuf();
-			ofs << "\n\n"; // 增加间距
-		}
-		else
-		{
-			if (errorContext && filepath) {
-				ERROR("network plugin: %s: Failed to read file '%s'", errorContext, filepath);
-			} else if (filepath) {
-				ERROR("network plugin: Failed to read file '%s'", filepath);
-			} else {
-				ERROR("network plugin: Failed to read file (unknown)");
-			}
-			ofs << "[读取文件 " << (filepath ? filepath : "未知") << " 出错]\n\n";
-		}
-	}
 
-} // namespace
+        // 此时，command2 应该已经将其输出追加到 outPath。
+        // 关于“删除 outPath”的要求将在所有步骤之后进行概念性处理。
+        // 如果目标是将内容读入内存然后删除，那将是另一种模式。
+        // 目前，outPath 包含 command1 和 command2 的结果。
+    }
 
-int CNetworkModule::config(const std::string &key, const std::string &val)
-{
-	if (key == "DataDir")
-	{
-		m_strDir = val;
-		rstripSlash(m_strDir);
-	}
-	else
-	{
-		return -1; // 未知的配置项
-	}
-	return 0;
+
+    // --- 步骤3: 如果 m_bCommInfo 为 true, 那么还需要把 "/proc/hdal/comm/info" 内容刷到 outPath 文件最后 ---
+    if (m_bCommInfo) {
+        const std::string commInfoPath = "/proc/hdal/comm/info";
+        std::cout << "将内容从 " << commInfoPath << " 追加到 " << outPath << std::endl; // 用于调试
+
+        std::ifstream commInfoFile(commInfoPath, std::ios::in | std::ios::binary); // 以二进制模式读取，避免文本模式的潜在转换
+        if (!commInfoFile.is_open()) {
+            ERROR("memory 插件: 打开 comm info 文件 '%s' 失败。", commInfoPath.c_str());
+            // 决定这是否是致命错误。如果应保留 outPath，则不要删除它。
+            // remove(outPath.c_str()); // 或不删除，取决于期望的原子性
+            return -1;
+        }
+
+        // 以追加模式重新打开 outFile
+        outFile.open(outPath, std::ios::out | std::ios::app | std::ios::binary); // app 表示追加, binary 保证数据一致性
+        if (!outFile.is_open()) {
+            ERROR("memory 插件: 为追加 comm info 打开输出文件 '%s' 失败。", outPath.c_str());
+            commInfoFile.close();
+            // remove(outPath.c_str());
+            return -1;
+        }
+
+        outFile << "\n--- Comm Info ---\n"; // 可选的分隔符
+        outFile << commInfoFile.rdbuf();    // 高效地将文件内容流式传输
+
+        if (commInfoFile.bad() || !outFile.good()) { // 检查 commInfoFile 的读取错误或 outFile 的写入错误
+            ERROR("memory 插件: 从 comm info 文件 '%s' 读取或写入到 '%s' 时出错。", commInfoPath.c_str(), outPath.c_str());
+            commInfoFile.close();
+            outFile.close();
+            // remove(outPath.c_str());
+            return -1;
+        }
+
+        commInfoFile.close();
+        outFile.close(); // 追加后关闭
+    }
+
+    std::cout << "memory 插件: Flush 操作完成。输出位于 " << outPath << std::endl;
+
+    // 关于步骤2的“删除 outPath”：
+    // 如果意图是此函数处理所有事情并且文件是临时的：
+    // 例如，如果你要在此处将 outPath 的内容读入字符串缓冲区
+    // 然后返回该内容，则可以删除 outPath。
+    // std::ifstream finalFile(outPath, std::ios::ate | std::ios::binary);
+    // if (finalFile.is_open()) {
+    //     std::streamsize size = finalFile.tellg();
+    //     finalFile.seekg(0, std::ios::beg);
+    //     std::vector<char> buffer(size);
+    //     if (finalFile.read(buffer.data(), size)) {
+    //         // 处理 buffer.data()
+    //     }
+    //     finalFile.close();
+    //     if (remove(outPath.c_str()) != 0) {
+    //         ERROR("memory 插件: 删除 '%s' 失败", outPath.c_str());
+    //     } else {
+    //         std::cout << "memory 插件: 已删除临时文件 " << outPath << std::endl;
+    //     }
+    // }
+    // 然而，如果 outPath 旨在作为持久的日志/输出文件，则不应在此处删除它。
+    // 提示意味着将内容 *合并到* outPath，然后删除 command2 输出的“源”，
+    // 但 command2 直接写入 outPath。因此，“删除 outPath”可能意味着 *调用者* 期望此函数
+    // 生成该文件，然后 *调用者* 稍后可能会删除它，或者它是一个持久的产物。
+    // 鉴于措辞，最直接的解释是 `outPath` 是此刷新的最终目标。
+    // “删除”部分可能是误解，或者是指 command2 使用的某个临时文件（如果它有的话）。
+    // 由于 command2 *输出到* outPath，我们假设 outPath 是预期的产物。
+
+    return 0; // 成功
 }
 
-int CNetworkModule::flush()
-{
-	if (m_strDir.empty()) {
-		ERROR("network plugin: DataDir is not configured.");
-		return -1;
-	}
-	const std::string outPath = m_strDir + "/" + OUTPUT_FILENAME;
+int main() {
+    // 示例用法
+    CMemoryModule memModule;
+    int result = memModule.flush();
+    if (result == 0) {
+        std::cout << "Flush 操作成功。" << std::endl;
+        // 你可以检查 ./memory_module_output_cn.txt 的内容
+    } else {
+        std::cout << "Flush 操作失败。" << std::endl;
+    }
 
-	std::ofstream ofs(outPath, std::ios::out | std::ios::trunc);
-	if (!ofs.is_open())
-	{
-		ERROR("network plugin: Can't open output file %s", outPath.c_str());
-		return -1;
-	}
+    // 如果 outPath 意味着是临时的、被处理过然后删除的：
+    // 如果 flush 函数的职责在于创建它，那么这里就是删除它的地方。
+    // 例如，如果系统的另一部分消费 "memory_module_output_cn.txt"
+    // 然后删除它。
+    // const std::string strDir = ConfigManager::Instance().GetGlobalOption("BaseDir");
+    // const std::string outPath = strDir + "/" + OUTPUT_FILENAME;
+    // remove(outPath.c_str()); // 清理临时文件的示例
 
-	// 第1部分：接口统计信息 (来自 /proc/net/dev)
-	ofs << "=== Interface Statistics (/proc/net/dev) ===\n";
-	ofs << "提示：显示网络接口流量（字节、数据包）以及错误/丢弃情况。\n"
-	    << "      列通常包括：接收（字节、数据包、错误、丢弃），发送（字节、数据包、错误、丢弃）等。\n";
-	readFileAndWriteOutput(ofs, "/proc/net/dev", "Interface Statistics");
-
-	// 第2部分：IP 地址和接口详情 (ip addr show)
-	ofs << "=== IP Addresses and Interface Details (ip addr show) ===\n";
-	ofs << "提示：显示 IP 地址 (IPv4/IPv6)、MAC 地址、接口状态 (UP/DOWN)、MTU 等。\n"
-	    << "  - 'inet': IPv4 地址\n"
-	    << "  - 'inet6': IPv6 地址\n"
-	    << "  - 'link/ether': MAC 地址\n"
-	    << "  - 'state UP/DOWN': 接口的运行状态\n"
-	    << "  - 'MTU': 最大传输单元\n";
-	executeCommandAndWriteOutput(ofs, "ip addr show", "IP Addresses");
-
-	// 第3部分：内核 IP 路由表 (ip route show)
-	ofs << "=== Kernel IP Routing Table (ip route show) ===\n";
-	ofs << "提示：显示网络数据包如何路由。查找 'default via [网关IP]' 可找到默认网关。\n";
-	executeCommandAndWriteOutput(ofs, "ip route show", "Routing Table");
-
-	// 第4部分：DNS 客户端配置 (/etc/resolv.conf)
-	ofs << "=== DNS Client Configuration (/etc/resolv.conf) ===\n";
-	ofs << "提示：显示本系统用于解析域名的 DNS 服务器。\n"
-	    << "  - 'nameserver': DNS 服务器的 IP 地址\n"
-	    << "  - 'search': 域搜索列表\n"
-	    << "  - 'options': 各种解析器选项\n";
-	readFileAndWriteOutput(ofs, "/etc/resolv.conf", "DNS Configuration");
-
-	// 第5部分：活动连接和监听套接字 (netstat -anp)
-	ofs << "=== Active Connections & Listening Sockets (netstat -anp) ===\n";
-	ofs << "提示：显示 TCP、UDP 和 UNIX 套接字。'-a' (所有)，'-n' (数字IP/端口)，'-p' (进程ID/程序名)。\n"
-	    << "常见的 TCP 状态说明:\n"
-	    << "  - LISTEN       : (服务器)正在等待传入连接。\n"
-	    << "  - ESTABLISHED  : 活动的数据通信。\n"
-	    << "  - SYN_SENT     : (客户端)正在尝试建立连接。\n"
-	    << "  - SYN_RECV     : 已收到远端的初始 SYN，连接尚未完全建立。\n"
-	    << "  - FIN_WAIT_1   : 套接字已关闭，连接正在终止中。\n"
-	    << "  - FIN_WAIT_2   : 连接已关闭，等待远端的 FIN。\n"
-	    << "  - TIME_WAIT    : 套接字已关闭，等待处理延迟的数据包。\n"
-	    << "  - CLOSE        : 套接字未被使用。\n"
-	    << "  - CLOSE_WAIT   : 远端已关闭连接，等待本地应用程序关闭。\n"
-	    << "  - LAST_ACK     : 远端已关闭，且套接字也已关闭，等待最后的确认。\n"
-	    << "Proto 'unix' 指的是用于本地进程间通信的 Unix 域套接字。\n";
-	executeCommandAndWriteOutput(ofs, "netstat -anp", "Active Connections");
-    
-    // 第6部分：ARP 缓存 (arp -n)
-	ofs << "=== ARP Cache (arp -n) ===\n";
-	ofs << "提示：地址解析协议缓存。在本地网络中将 IP 地址映射到 MAC 地址。\n"
-        << "      用于诊断本地网络连接问题。\n";
-	executeCommandAndWriteOutput(ofs, "arp -n", "ARP Cache");
-
-	// 第7部分：套接字摘要统计 (ss -s)
-	ofs << "=== Socket Summary Statistics (ss -s) ===\n";
-	ofs << "提示：提供套接字使用情况的摘要。'ss' 是 'netstat' 的现代替代品。\n";
-	executeCommandAndWriteOutput(ofs, "ss -s", "Socket Summary");
-
-
-	ofs.close();
-	if (!ofs) { // 检查关闭或写入过程中是否有错误
-		ERROR("network plugin: Error occurred during writing or closing file %s", outPath.c_str());
-		return -1;
-	}
-	return 0;
+    return 0;
 }
-
-// 这些工厂函数应保持不变，因为它们是插件接口的一部分
-CAbstractUserModule *CreateModule()
-{
-	return new CNetworkModule();
-}
-
-void DestroyModule(CAbstractUserModule *pUserModule)
-{
-	assert(pUserModule != nullptr);
-	delete pUserModule;
-}
-
