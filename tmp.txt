@@ -1,45 +1,54 @@
-#define _GNU_SOURCE // For program_invocation_short_name
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <sstream>
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <errno.h> // For errno
+#include <algorithm> // For std::remove
+#include <iomanip>   // For std::setw, std::left
 
-// 假设的 os_get_pid_by_name 函数声明
+// 假设的 os_get_pid_by_name 函数声明 (C风格)
 // 实际项目中，你需要链接包含此函数实现的库或源文件
-// pid_t *pids: 用于存储找到的PID数组
-// int *count: 输入时表示pids数组的大小，输出时表示找到的PID数量
-// 返回值：0表示成功，其他表示失败
-extern int os_get_pid_by_name(const char *process_name, pid_t *pids, int *count);
+extern "C" int os_get_pid_by_name(const char *process_name, pid_t *pids, int *count);
+
+struct ThreadInfo {
+    pid_t tid;
+    std::string name;
+    std::string state_str;
+    char state_char;
+    long nice_val;
+    long policy_val;
+    std::string policy_str;
+};
 
 // --- 辅助函数 ---
 
 // 根据状态字符获取可读的状态字符串
-const char* get_thread_state_str(char state_char) {
+std::string get_thread_state_str_cpp(char state_char) {
     switch (state_char) {
         case 'R': return "RUNNING";
         case 'S': return "SLEEPING (Interruptible)";
-        case 'D': return "SLEEPING (Uninterruptible)"; // 通常是IO等待，可能导致BLOCKED观感
+        case 'D': return "SLEEPING (Uninterruptible)";
         case 'Z': return "ZOMBIE";
         case 'T': return "STOPPED";
         case 't': return "TRACING_STOP";
-        case 'X': return "DEAD"; // (should not be seen)
-        case 'I': return "IDLE"; // (Kernel 5.14+)
-        // 可以根据需要添加更多，DEADLOCK 状态无法直接从 'state' 字段获得，需要更复杂的分析
+        case 'X': return "DEAD";
+        case 'I': return "IDLE"; // Kernel 5.14+
+        case 'P': return "PARKED"; // Kernel 5.10+
         default:  return "UNKNOWN";
     }
 }
 
 // 根据调度策略数字获取可读的策略字符串
-const char* get_scheduler_policy_str(int policy_num) {
+std::string get_scheduler_policy_str_cpp(long policy_num) {
     switch (policy_num) {
         case 0:  return "SCHED_OTHER";
         case 1:  return "SCHED_FIFO";
         case 2:  return "SCHED_RR";
         case 3:  return "SCHED_BATCH";
-        case 4:  return "SCHED_ISO"; // (deprecated)
+        case 4:  return "SCHED_ISO"; // (通常已弃用)
         case 5:  return "SCHED_IDLE";
         case 6:  return "SCHED_DEADLINE";
         default: return "UNKNOWN_POLICY";
@@ -49,245 +58,226 @@ const char* get_scheduler_policy_str(int policy_num) {
 // --- 插件核心函数 ---
 
 /**
- * @brief 刷新并打印指定进程的线程信息
+ * @brief 刷新并打印指定进程的线程信息 (C++ 版本)
  *
  * @param target_process_name 要查询的目标进程名称
  * @return 0 成功, -1 失败
  */
-int thread_plugin_flush(const char *target_process_name) {
-    pid_t pids[10]; // 假设最多返回10个同名进程的PID，通常应该只有一个
+int thread_plugin_flush_cpp(const char *target_process_name) {
+    pid_t pids[10]; // 假设最多返回10个同名进程的PID
     int pid_count = 10;
     int ret;
 
-    printf("--- Thread Plugin: Flushing info for process \"%s\" ---\n", target_process_name);
+    std::cout << "--- Thread Plugin (C++): Flushing info for process \"" << target_process_name << "\" ---" << std::endl;
 
     ret = os_get_pid_by_name(target_process_name, pids, &pid_count);
     if (ret != 0 || pid_count == 0) {
-        fprintf(stderr, "Error: Could not get PID for process \"%s\". os_get_pid_by_name returned %d, pid_count %d.\n",
-                target_process_name, ret, pid_count);
+        std::cerr << "Error: Could not get PID for process \"" << target_process_name
+                  << "\". os_get_pid_by_name returned " << ret << ", pid_count " << pid_count << "." << std::endl;
         if (pid_count == 0 && ret == 0) {
-             fprintf(stderr, "Process \"%s\" not found.\n", target_process_name);
+            std::cerr << "Process \"" << target_process_name << "\" not found." << std::endl;
         }
         return -1;
     }
 
-    // 我们只处理找到的第一个PID，实际应用中可能需要选择或遍历
-    pid_t target_pid = pids[0];
-    printf("Target Process: %s (PID: %d)\n", target_process_name, target_pid);
-    printf("------------------------------------------------------------------------------------\n");
-    printf("| %-8s | %-20s | %-25s | %-8s | %-15s |\n", "TID", "Name", "State", "Nice", "Policy");
-    printf("------------------------------------------------------------------------------------\n");
+    pid_t target_pid = pids[0]; // 只处理找到的第一个PID
+    std::cout << "Target Process: " << target_process_name << " (PID: " << target_pid << ")" << std::endl;
+    std::cout << "---------------------------------------------------------------------------------------------------" << std::endl;
+    std::cout << "| " << std::left << std::setw(8) << "TID"
+              << "| " << std::left << std::setw(20) << "Name"
+              << "| " << std::left << std::setw(28) << "State"
+              << "| " << std::left << std::setw(8) << "Nice"
+              << "| " << std::left << std::setw(15) << "Policy"
+              << "| " << std::left << std::setw(10) << "RawPolicy" << "|" << std::endl;
+    std::cout << "---------------------------------------------------------------------------------------------------" << std::endl;
 
-
-    char task_path[256];
-    snprintf(task_path, sizeof(task_path), "/proc/%d/task", target_pid);
-
-    DIR *dir = opendir(task_path);
+    std::string task_path_str = "/proc/" + std::to_string(target_pid) + "/task";
+    DIR *dir = opendir(task_path_str.c_str());
     if (!dir) {
         perror("Error opening task directory");
-        fprintf(stderr, "Failed to open: %s (PID: %d). Do you have permissions? Is the process running?\n", task_path, target_pid);
+        std::cerr << "Failed to open: " << task_path_str << " (PID: " << target_pid
+                  << "). Do you have permissions? Is the process running?" << std::endl;
         return -1;
     }
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR) { // 每个子目录是一个线程
+        if (entry->d_type == DT_DIR) {
             char *endptr;
             long tid_long = strtol(entry->d_name, &endptr, 10);
-            if (*endptr == '\0') { // 确保是纯数字目录名
-                pid_t tid = (pid_t)tid_long;
+            if (*endptr == '\0') { // 是纯数字目录名
+                pid_t tid = static_cast<pid_t>(tid_long);
+                ThreadInfo info;
+                info.tid = tid;
+                info.nice_val = 0; // Default
+                info.policy_val = -1; // Default to indicate error or not found
+                info.state_char = '?';
 
-                char stat_path[512];
-                char comm_path[512];
-                FILE *fp_stat, *fp_comm;
-                char line_buffer[1024];
-                char thread_name[256] = "N/A"; // 线程名，来自 /comm
-                char state_char = '?';          // 线程状态字符
-                int nice_val = 0;               // Nice 值
-                int policy = 0;                 // 调度策略
-
-                // 1. 获取线程名称
-                snprintf(comm_path, sizeof(comm_path), "/proc/%d/task/%d/comm", target_pid, tid);
-                fp_comm = fopen(comm_path, "r");
-                if (fp_comm) {
-                    if (fgets(thread_name, sizeof(thread_name), fp_comm) != NULL) {
-                        // 去除末尾的换行符
-                        thread_name[strcspn(thread_name, "\n")] = 0;
-                    }
-                    fclose(fp_comm);
+                // 1. 获取线程名称 from /comm
+                std::string comm_path_str = task_path_str + "/" + entry->d_name + "/comm";
+                std::ifstream comm_file(comm_path_str);
+                if (comm_file.is_open()) {
+                    std::getline(comm_file, info.name);
+                    comm_file.close();
                 } else {
-                    // 如果读取 comm 失败，可以尝试从 stat 文件中获取（但 stat 中的 comm 可能被截断）
-                    // fprintf(stderr, "Warning: Could not open %s for TID %d\n", comm_path, tid);
+                    info.name = "N/A";
                 }
 
+                // 2. 获取线程状态、优先级、调度策略 from /stat
+                std::string stat_path_str = task_path_str + "/" + entry->d_name + "/stat";
+                std::ifstream stat_file(stat_path_str);
+                if (stat_file.is_open()) {
+                    std::string line;
+                    std::getline(stat_file, line);
+                    stat_file.close();
 
-                // 2. 获取线程状态、优先级、调度策略
-                snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", target_pid, tid);
-                fp_stat = fopen(stat_path, "r");
-                if (fp_stat) {
-                    if (fgets(line_buffer, sizeof(line_buffer), fp_stat) != NULL) {
-                        // 解析 stat 文件
-                        // 格式: tid (comm) state ppid pgrp session ... nice ... priority ... policy ...
-                        // 我们需要第3个字段 (state), 第19个字段 (nice), 第40个字段 (policy, 0-indexed)
-                        // sscanf 对于括号内的 comm 解析比较麻烦，我们主要依赖 /comm 文件获取名字
-                        // 这里我们跳过前面两个字段，直接取 state
-                        char comm_in_stat[256]; // 用于消耗 stat 文件中的 comm 字段
-                        int ppid, pgrp, session, tty_nr, tpgid;
-                        unsigned int flags;
-                        unsigned long minflt, cminflt, majflt, cmajflt;
-                        unsigned long utime, stime; // user time, system time (clock ticks)
-                        long cutime, cstime;
-                        long priority_val; // 这个 priority 不是 nice 值，是内核内部优先级
+                    std::stringstream ss(line);
+                    std::vector<std::string> fields;
+                    std::string field_val;
+                    while (ss >> field_val) {
+                        fields.push_back(field_val);
+                    }
+                    
+                    // /proc/[pid]/stat fields (1-indexed from man page, 0-indexed for vector)
+                    // Field 1 (index 0): TID (already have)
+                    // Field 2 (index 1): (comm) (name in parens, already read from /comm, more reliable)
+                    // Field 3 (index 2): state
+                    // ...
+                    // Field 19 (index 18): nice value
+                    // ...
+                    // Field 40 (index 39): policy
 
-                        // 使用更稳健的方式解析，避免 comm 中有空格导致 sscanf 出错
-                        char *token;
-                        char *saveptr;
-                        int field_count = 0;
+                    if (fields.size() > 2) { // Need at least TID, (comm), state
+                        info.state_char = fields[2][0]; // State is the 3rd field
+                    }
 
-                        token = strtok_r(line_buffer, " ", &saveptr); // 1. tid
-                        if(token) token = strtok_r(NULL, " ", &saveptr); // 2. (comm)
-                        // comm 字段比较特殊，它被括号包围，且内容可能包含空格（虽然内核会替换为空格）
-                        // 为了简化，我们假设 comm 文件已经正确读取了线程名
-
-                        if(token) { // 确保 (comm) 字段存在
-                             token = strtok_r(NULL, " ", &saveptr); // 3. state
-                             if(token) state_char = token[0];
-                        }
-
-
-                        // 继续解析到 nice (第19个字段, 0-indexed 是18) 和 policy (第40个字段, 0-indexed 是39)
-                        // stat 文件字段较多，这里用循环跳过中间字段
-                        // 从第3个字段 (state) 开始，要到第19个字段 (nice) 需要跳过 19 - 3 = 16 个字段
-                        for(int i = 0; i < 15 && token; ++i) { // 跳过 15 个字段 (field 4 to field 18)
-                            token = strtok_r(NULL, " ", &saveptr);
-                        }
-                        if(token) { // 第19个字段 (nice)
-                             nice_val = atoi(token);
-                        }
-
-                        // 从 nice (19) 到 policy (40) 需要跳过 40 - 19 = 21 个字段
-                        for(int i = 0; i < 20 && token; ++i) { // 跳过 20 个字段 (field 20 to field 39)
-                             token = strtok_r(NULL, " ", &saveptr);
-                        }
-                        if(token) { // 第40个字段 (policy)
-                             policy = atoi(token);
+                    if (fields.size() > 18) { // Check if nice field exists
+                        try {
+                            info.nice_val = std::stol(fields[18]); // Nice value is the 19th field
+                        } catch (const std::exception& e) {
+                            // std::cerr << "Warning: Could not parse nice value for TID " << tid << ": " << fields[18] << std::endl;
+                            info.nice_val = -999; // Indicate parsing error
                         }
                     }
-                    fclose(fp_stat);
-                } else {
-                    fprintf(stderr, "Warning: Could not open %s for TID %d. errno: %d (%s)\n",
-                            stat_path, tid, errno, strerror(errno));
-                }
 
-                printf("| %-8d | %-20s | %-25s | %-8d | %-15s |\n",
-                       tid,
-                       thread_name,
-                       get_thread_state_str(state_char),
-                       nice_val,
-                       get_scheduler_policy_str(policy));
+                    if (fields.size() > 39) { // Check if policy field exists
+                         try {
+                            info.policy_val = std::stol(fields[39]); // Policy is the 40th field
+                        } catch (const std::exception& e) {
+                            // std::cerr << "Warning: Could not parse policy value for TID " << tid << ": " << fields[39] << std::endl;
+                            // info.policy_val remains -1 (or some other error indicator)
+                        }
+                    }
+                } else {
+                     // std::cerr << "Warning: Could not open " << stat_path_str << " for TID " << tid << std::endl;
+                }
+                
+                info.state_str = get_thread_state_str_cpp(info.state_char);
+                info.policy_str = get_scheduler_policy_str_cpp(info.policy_val);
+
+                std::cout << "| " << std::left << std::setw(8) << info.tid
+                          << "| " << std::left << std::setw(20) << info.name
+                          << "| " << std::left << std::setw(28) << (info.state_str + " ('" + info.state_char + "')")
+                          << "| " << std::left << std::setw(8) << info.nice_val
+                          << "| " << std::left << std::setw(15) << info.policy_str
+                          << "| " << std::left << std::setw(10) << info.policy_val << "|" << std::endl;
             }
         }
     }
     closedir(dir);
-    printf("------------------------------------------------------------------------------------\n");
-    printf("--- Thread Plugin: Flush complete ---\n\n");
+    std::cout << "---------------------------------------------------------------------------------------------------" << std::endl;
+    std::cout << "--- Thread Plugin (C++): Flush complete ---" << std::endl << std::endl;
     return 0;
 }
-
 
 // --- main 函数用于测试插件 ---
-// 实际使用时，你需要一个 os_get_pid_by_name 的具体实现
-// 这里我们模拟一个简单的实现，或者你可以用 `pgrep` 的输出来手动指定PID进行测试
+#ifdef THREAD_PLUGIN_TEST_MAIN_CPP
+// 模拟的 os_get_pid_by_name (与C版本相同)
+#include <cstdio>  // For popen, pclose, fscanf in C-style mock
+#include <cstring> // For strcmp in C-style mock
+#include <libgen.h> // For basename in C-style mock (might need to link -lgen or ensure POSIX)
 
-#ifdef THREAD_PLUGIN_TEST_MAIN
-// 模拟的 os_get_pid_by_name
-// 在真实环境中，这应该是一个查找进程PID的健壮函数
-// 例如，它可以执行 "pidof m320_app" 或遍历 /proc 查找
-int os_get_pid_by_name(const char *process_name, pid_t *pids, int *count) {
-    if (strcmp(process_name, "m320_app") == 0) {
-        // 示例：假设 "m320_app" 的PID是 12345
-        // 你可以通过 `pgrep <some_existing_process_name>` 找到一个正在运行的进程PID来测试
-        // 例如，如果你的系统上有 `gnome-shell` 进程：
-        // FILE *fp = popen("pidof gnome-shell", "r");
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "pidof %s", process_name);
-        FILE *fp = popen(cmd, "r");
-        if (fp == NULL) {
-            perror("Failed to run pidof");
-            *count = 0;
-            return -1;
-        }
-        if (fscanf(fp, "%d", &pids[0]) == 1) {
-            *count = 1;
-            pclose(fp);
-            return 0; // Success
-        } else {
-             // 如果 pidof 没找到，尝试从 /proc 暴力搜索 (效率较低)
-            DIR *proc_dir = opendir("/proc");
-            if (!proc_dir) {
-                *count = 0;
-                pclose(fp);
-                return -2;
-            }
-            struct dirent *entry;
-            int found_count = 0;
-            while ((entry = readdir(proc_dir)) != NULL && found_count < *count) {
-                char *endptr;
-                long pid_long = strtol(entry->d_name, &endptr, 10);
-                if (*endptr == '\0') { // Is a process directory
-                    char exe_path[512];
-                    char exe_link[512];
-                    snprintf(exe_path, sizeof(exe_path), "/proc/%ld/exe", pid_long);
-                    ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
-                    if (len != -1) {
-                        exe_link[len] = '\0';
-                        char *basename_exe = basename(exe_link); // #include <libgen.h> for basename
-                        if (basename_exe && strcmp(basename_exe, process_name) == 0) {
-                            pids[found_count++] = (pid_t)pid_long;
-                        }
-                    }
+extern "C" int os_get_pid_by_name(const char *process_name, pid_t *pids, int *count) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "pidof %s", process_name);
+    FILE *fp = popen(cmd, "r");
+    
+    if (fp == NULL) {
+        perror("Failed to run pidof");
+        *count = 0;
+        return -1;
+    }
+
+    int found_pids = 0;
+    while (found_pids < *count && fscanf(fp, "%d", &pids[found_pids]) == 1) {
+        found_pids++;
+    }
+    
+    int status = pclose(fp);
+    if (status == -1) {
+        perror("pclose failed");
+    }
+
+    if (found_pids > 0) {
+        *count = found_pids;
+        return 0; // Success
+    }
+
+    // Fallback: pidof failed or found nothing, try to search /proc (less efficient)
+    // std::cout << "pidof failed for " << process_name << " or found no PIDs, trying /proc scan." << std::endl;
+    DIR *proc_dir = opendir("/proc");
+    if (!proc_dir) {
+        *count = 0;
+        return -2;
+    }
+    struct dirent *entry;
+    found_pids = 0; // Reset for /proc scan
+    char target_exe_name[256];
+    strncpy(target_exe_name, process_name, sizeof(target_exe_name) -1);
+    target_exe_name[sizeof(target_exe_name)-1] = '\0';
+
+
+    while ((entry = readdir(proc_dir)) != NULL && found_pids < *count) {
+        char *endptr;
+        long pid_long = strtol(entry->d_name, &endptr, 10);
+        if (*endptr == '\0') { // Is a process directory
+            char exe_path[512];
+            char exe_link[512];
+            snprintf(exe_path, sizeof(exe_path), "/proc/%ld/exe", pid_long);
+            ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
+            if (len != -1) {
+                exe_link[len] = '\0';
+                char *bname = basename(exe_link); // basename might modify its argument if not POSIX standard.
+                                                  // It's safer to pass a copy if exe_link is needed later.
+                if (bname && strcmp(bname, target_exe_name) == 0) {
+                    pids[found_pids++] = static_cast<pid_t>(pid_long);
                 }
             }
-            closedir(proc_dir);
-            pclose(fp);
-            if(found_count > 0){
-                *count = found_count;
-                return 0;
-            }
-            *count = 0;
-            return -3; // Not found
         }
-    } else if (strcmp(process_name, "systemd") == 0) { // Test with a common process
-        pids[0] = 1;
-        *count = 1;
+    }
+    closedir(proc_dir);
+    
+    if(found_pids > 0){
+        *count = found_pids;
         return 0;
     }
+
     *count = 0;
-    return -1; // Not found
+    return -3; // Not found
 }
 
-#include <libgen.h> // For basename in os_get_pid_by_name mock
 int main() {
-    printf("Attempting to get thread info for 'systemd' (usually PID 1)...\n");
-    thread_plugin_flush("systemd");
+    std::cout << "Attempting to get thread info for 'systemd' (usually PID 1)..." << std::endl;
+    thread_plugin_flush_cpp("systemd");
 
-    // 替换 "your_test_app_name" 为你系统中实际运行的某个多线程程序名来测试
-    // 比如 'chrome', 'firefox', 'code', 或者你自己编译运行的一个简单多线程程序
-    // 你也可以自己写一个简单的 "m320_app" 多线程程序来测试
-    printf("\nAttempting to get thread info for 'm320_app' (replace with a running app name if needed)...\n");
-    printf("Please ensure 'm320_app' or another test app is running.\n");
-    printf("You can compile and run a simple multi-threaded test program.\n");
-    thread_plugin_flush("m320_app"); // 如果 "m320_app" 不存在或pidof找不到，会报错
-
-    // 示例：尝试查找当前shell的线程信息
-    // char shell_name_buff[64];
-    // readlink("/proc/self/exe", shell_name_buff, sizeof(shell_name_buff)-1);
-    // char *shell_base_name = basename(shell_name_buff);
-    // if(shell_base_name){
-    //    printf("\nAttempting to get thread info for current shell '%s'...\n", shell_base_name);
-    //    thread_plugin_flush(shell_base_name);
-    // }
+    // 替换 "your_test_app_name"
+    std::cout << "\nAttempting to get thread info for 'm320_app' (replace with a running app name if needed)..." << std::endl;
+    std::cout << "Please ensure 'm320_app' or another test app is running." << std::endl;
+    thread_plugin_flush_cpp("m320_app");
+    
+    // Example: try to find info for a common desktop process if you have one
+    // thread_plugin_flush_cpp("gnome-shell"); // or "kwin_x11", "Xorg", etc.
 
     return 0;
 }
-#endif // THREAD_PLUGIN_TEST_MAIN
+#endif // THREAD_PLUGIN_TEST_MAIN_CPP
