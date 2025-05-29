@@ -1,132 +1,395 @@
-// ... (其他部分，包括 ThreadInfo, helper functions, os_get_pid_by_name 保持不变) ...
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <algorithm>
+#include <iomanip>
+#include <map>
+#include <chrono> // For time points
+#include <set>    // For managing current TIDs
+
+// 假设的 os_get_pid_by_name 函数声明 (C风格)
+extern "C" int os_get_pid_by_name(const char *process_name, pid_t *pids, int *count);
+
+// Clock ticks per second - initialized once
+static long HZ = 0;
+
+struct ThreadInfo {
+    pid_t tid;
+    std::string name;
+    std::string state_str;
+    char state_char;
+    long nice_val;
+    long policy_val;
+    std::string policy_str;
+    long rt_priority_val;
+
+    // CPU and Resource Occupation
+    unsigned long utime_ticks;      // User mode time in clock ticks from /stat
+    unsigned long stime_ticks;      // Kernel mode time in clock ticks from /stat
+    double user_cpu_time_sec;     // Total user CPU time in seconds
+    double system_cpu_time_sec;   // Total system CPU time in seconds
+    double total_cpu_time_sec;    // Total CPU time in seconds
+
+    double cpu_usage_percent_interval; // CPU usage % over the last interval
+
+    unsigned long vm_stack_kb;      // Stack size in KB from /status VmStk
+    int fd_count;                 // Number of open file descriptors from /fd
+
+    // Constructor
+    ThreadInfo() : tid(0), nice_val(0), policy_val(-1), rt_priority_val(0),
+                   utime_ticks(0), stime_ticks(0),
+                   user_cpu_time_sec(0.0), system_cpu_time_sec(0.0), total_cpu_time_sec(0.0),
+                   cpu_usage_percent_interval(0.0),
+                   vm_stack_kb(0), fd_count(0), state_char('?') {}
+};
+
+// For CPU % calculation - state between calls
+// Key: TID, Value: pair<utime_ticks, stime_ticks> from previous run
+static std::map<pid_t, std::pair<unsigned long, unsigned long>> prev_thread_cpu_times_map;
+static std::chrono::steady_clock::time_point prev_interval_time_point;
+static bool first_call = true;
+
+
+// --- 辅助函数 (get_thread_state_str_cpp, get_scheduler_policy_str_cpp 保持不变) ---
+std::string get_thread_state_str_cpp(char state_char) {
+    switch (state_char) {
+        case 'R': return "RUNNING";
+        case 'S': return "SLEEPING (Interruptible)";
+        case 'D': return "SLEEPING (Uninterruptible)";
+        case 'Z': return "ZOMBIE";
+        case 'T': return "STOPPED";
+        case 't': return "TRACING_STOP";
+        case 'X': return "DEAD";
+        case 'I': return "IDLE"; 
+        case 'P': return "PARKED";
+        default:  return "UNKNOWN";
+    }
+}
+
+std::string get_scheduler_policy_str_cpp(long policy_num) {
+    switch (policy_num) {
+        case 0:  return "SCHED_OTHER";
+        case 1:  return "SCHED_FIFO";
+        case 2:  return "SCHED_RR";
+        case 3:  return "SCHED_BATCH";
+        case 4:  return "SCHED_ISO";
+        case 5:  return "SCHED_IDLE";
+        case 6:  return "SCHED_DEADLINE";
+        default: return "UNKNOWN_POLICY";
+    }
+}
+
 
 // --- 插件核心函数 ---
 int thread_plugin_flush_cpp(const char *target_process_name) {
-    pid_t pids[10];
-    int pid_count = 10;
-    int ret;
-
-    std::cout << "--- Thread Plugin (C++ V2 - Corrected Policy Index): Flushing info for process \"" << target_process_name << "\" ---" << std::endl;
-
-    ret = os_get_pid_by_name(target_process_name, pids, &pid_count);
-    if (ret != 0 || pid_count == 0) {
-        std::cerr << "Error: Could not get PID for process \"" << target_process_name
-                  << "\". os_get_pid_by_name returned " << ret << ", pid_count " << pid_count << "." << std::endl;
-        if (pid_count == 0 && ret == 0) {
-            std::cerr << "Process \"" << target_process_name << "\" not found." << std::endl;
+    if (HZ == 0) {
+        HZ = sysconf(_SC_CLK_TCK);
+        if (HZ <= 0) {
+            std::cerr << "Error: Could not get system clock ticks per second (HZ)." << std::endl;
+            HZ = 100; // Fallback, though calculations might be off
         }
-        return -1;
     }
 
+    // For CPU % calculation
+    auto current_interval_time_point = std::chrono::steady_clock::now();
+    double time_delta_seconds = 0;
+    if (!first_call) {
+        std::chrono::duration<double> time_span = 
+            std::chrono::duration_cast<std::chrono::duration<double>>(current_interval_time_point - prev_interval_time_point);
+        time_delta_seconds = time_span.count();
+    }
+
+
+    pid_t pids[10];
+    int pid_count = 10;
+    if (os_get_pid_by_name(target_process_name, pids, &pid_count) != 0 || pid_count == 0) {
+        std::cerr << "Error: Could not get PID for process \"" << target_process_name << "\"." << std::endl;
+        return -1;
+    }
     pid_t target_pid = pids[0];
-    std::cout << "Target Process: " << target_process_name << " (PID: " << target_pid << ")" << std::endl;
-    std::cout << "--------------------------------------------------------------------------------------------------------------------" << std::endl; // Adjusted width
-    std::cout << "| " << std::left << std::setw(8) << "TID"
-              << "| " << std::left << std::setw(20) << "Name"
-              << "| " << std::left << std::setw(28) << "State"
-              << "| " << std::left << std::setw(8) << "Nice"
-              << "| " << std::left << std::setw(10) << "RT Prio" // Added RT Priority column
-              << "| " << std::left << std::setw(15) << "Policy"
-              << "| " << std::left << std::setw(10) << "RawPolicy" << "|" << std::endl;
-    std::cout << "--------------------------------------------------------------------------------------------------------------------" << std::endl; // Adjusted width
 
-
+    std::cout << "--- Thread Plugin (C++ V3 - CPU/Resource/Aggregate): Flushing info for process \""
+              << target_process_name << "\" (PID: " << target_pid << ") ---" << std::endl;
+    
     std::string task_path_str = "/proc/" + std::to_string(target_pid) + "/task";
     DIR *dir = opendir(task_path_str.c_str());
     if (!dir) {
-        perror("Error opening task directory");
-        std::cerr << "Failed to open: " << task_path_str << " (PID: " << target_pid
-                  << "). Do you have permissions? Is the process running?" << std::endl;
+        perror(("Error opening task directory: " + task_path_str).c_str());
         return -1;
     }
 
+    std::vector<ThreadInfo> current_threads_info;
+    std::set<pid_t> current_tids_found; // To track TIDs present in this scan
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR) {
-            char *endptr;
-            long tid_long = strtol(entry->d_name, &endptr, 10);
-            if (*endptr == '\0') {
-                pid_t tid = static_cast<pid_t>(tid_long);
-                ThreadInfo info;
-                info.tid = tid;
-                info.nice_val = 0;
-                info.policy_val = -1; // Default to indicate error or not found
-                info.state_char = '?';
-                long rt_priority_val = 0; // Store RT Priority
+        if (entry->d_type != DT_DIR) continue;
 
-                std::string comm_path_str = task_path_str + "/" + entry->d_name + "/comm";
-                std::ifstream comm_file(comm_path_str);
-                if (comm_file.is_open()) {
-                    std::getline(comm_file, info.name);
-                    comm_file.close();
-                } else {
-                    info.name = "N/A";
-                }
+        char *endptr;
+        long tid_long = strtol(entry->d_name, &endptr, 10);
+        if (*endptr != '\0') continue; // Not a numeric directory name
 
-                std::string stat_path_str = task_path_str + "/" + entry->d_name + "/stat";
-                std::ifstream stat_file(stat_path_str);
-                if (stat_file.is_open()) {
-                    std::string line;
-                    std::getline(stat_file, line);
-                    stat_file.close();
+        pid_t tid = static_cast<pid_t>(tid_long);
+        current_tids_found.insert(tid);
+        ThreadInfo info;
+        info.tid = tid;
 
-                    std::stringstream ss(line);
-                    std::vector<std::string> fields;
-                    std::string field_val_str;
-                    while (ss >> field_val_str) {
-                        fields.push_back(field_val_str);
-                    }
-                    
-                    // Field indices (0-based for vector from 1-based man page)
-                    // fields[2]  (Man page field 3): state
-                    // fields[18] (Man page field 19): nice
-                    // fields[39] (Man page field 40): rt_priority  <-- CORRECTED
-                    // fields[40] (Man page field 41): policy       <-- CORRECTED
+        // 1. Get thread name from /comm
+        std::string comm_path_str = task_path_str + "/" + entry->d_name + "/comm";
+        std::ifstream comm_file(comm_path_str);
+        if (comm_file.is_open()) std::getline(comm_file, info.name); else info.name = "N/A";
+        if (comm_file.is_open()) comm_file.close();
 
-                    if (fields.size() > 2) {
-                        info.state_char = fields[2][0];
-                    }
 
-                    if (fields.size() > 18) {
-                        try { info.nice_val = std::stol(fields[18]); }
-                        catch (const std::exception&) { info.nice_val = -999; }
-                    }
+        // 2. Parse /stat for state, nice, policy, utime, stime
+        std::string stat_path_str = task_path_str + "/" + entry->d_name + "/stat";
+        std::ifstream stat_file(stat_path_str);
+        if (stat_file.is_open()) {
+            std::string line;
+            std::getline(stat_file, line);
+            stat_file.close();
 
-                    // Read Real-Time Priority (field 40, index 39)
-                    if (fields.size() > 39) {
-                         try { rt_priority_val = std::stol(fields[39]); }
-                         catch (const std::exception&) { rt_priority_val = -999; } // Error parsing rt_priority
-                    }
+            std::stringstream ss(line);
+            std::vector<std::string> fields;
+            std::string field_val_str;
+            while (ss >> field_val_str) fields.push_back(field_val_str);
+            
+            // Field indices (0-based for vector from 1-based man page)
+            if (fields.size() > 2)  info.state_char = fields[2][0];
+            if (fields.size() > 13) try { info.utime_ticks = std::stoul(fields[13]); } catch (...) {} // utime (field 14)
+            if (fields.size() > 14) try { info.stime_ticks = std::stoul(fields[14]); } catch (...) {} // stime (field 15)
+            if (fields.size() > 18) try { info.nice_val = std::stol(fields[18]); } catch (...) {}     // nice (field 19)
+            if (fields.size() > 39) try { info.rt_priority_val = std::stol(fields[39]); } catch (...) {}// rt_priority (field 40)
+            if (fields.size() > 40) try { info.policy_val = std::stol(fields[40]); } catch (...) {}    // policy (field 41)
+        }
+        info.state_str = get_thread_state_str_cpp(info.state_char);
+        info.policy_str = get_scheduler_policy_str_cpp(info.policy_val);
+        if (HZ > 0) {
+            info.user_cpu_time_sec = static_cast<double>(info.utime_ticks) / HZ;
+            info.system_cpu_time_sec = static_cast<double>(info.stime_ticks) / HZ;
+            info.total_cpu_time_sec = info.user_cpu_time_sec + info.system_cpu_time_sec;
+        }
 
-                    // Read Policy (field 41, index 40)  <--- *** THIS IS THE CRITICAL FIX ***
-                    if (fields.size() > 40) {
-                         try { info.policy_val = std::stol(fields[40]); } // Use fields[40]
-                         catch (const std::exception&) { /* info.policy_val remains -1 */ }
-                    } else {
-                        // Not enough fields to get policy
-                        // std::cerr << "Warning: Not enough fields in stat for TID " << tid << " to get policy. Fields available: " << fields.size() << std::endl;
-                    }
-                }
-                
-                info.state_str = get_thread_state_str_cpp(info.state_char);
-                info.policy_str = get_scheduler_policy_str_cpp(info.policy_val);
-
-                std::cout << "| " << std::left << std::setw(8) << info.tid
-                          << "| " << std::left << std::setw(20) << info.name
-                          << "| " << std::left << std::setw(28) << (info.state_str + " ('" + info.state_char + "')")
-                          << "| " << std::left << std::setw(8) << info.nice_val
-                          << "| " << std::left << std::setw(10) << rt_priority_val // Display RT Prio
-                          << "| " << std::left << std::setw(15) << info.policy_str
-                          << "| " << std::left << std::setw(10) << info.policy_val << "|" << std::endl;
+        // Calculate CPU % over interval
+        if (!first_call && time_delta_seconds > 0.001) { // Avoid division by zero or tiny interval
+            auto it = prev_thread_cpu_times_map.find(tid);
+            if (it != prev_thread_cpu_times_map.end()) {
+                unsigned long prev_utime = it->second.first;
+                unsigned long prev_stime = it->second.second;
+                unsigned long cpu_delta_ticks = (info.utime_ticks - prev_utime) + (info.stime_ticks - prev_stime);
+                info.cpu_usage_percent_interval = (static_cast<double>(cpu_delta_ticks) / HZ) / time_delta_seconds * 100.0;
             }
         }
+        // Store current ticks for next interval's calculation
+        prev_thread_cpu_times_map[tid] = {info.utime_ticks, info.stime_ticks};
+
+
+        // 3. Parse /status for VmStk
+        std::string status_path_str = task_path_str + "/" + entry->d_name + "/status";
+        std::ifstream status_file(status_path_str);
+        if (status_file.is_open()) {
+            std::string status_line;
+            while (std::getline(status_file, status_line)) {
+                if (status_line.rfind("VmStk:", 0) == 0) {
+                    try { info.vm_stack_kb = std::stoul(status_line.substr(6));} catch (...) {}
+                    break;
+                }
+            }
+            status_file.close();
+        }
+
+        // 4. Count FDs in /fd
+        std::string fd_path_str = task_path_str + "/" + entry->d_name + "/fd";
+        DIR* fd_dir = opendir(fd_path_str.c_str());
+        if (fd_dir) {
+            struct dirent* fd_entry;
+            while ((fd_entry = readdir(fd_dir)) != NULL) {
+                if (strcmp(fd_entry->d_name, ".") != 0 && strcmp(fd_entry->d_name, "..") != 0) {
+                    info.fd_count++;
+                }
+            }
+            closedir(fd_dir);
+        }
+        current_threads_info.push_back(info);
     }
     closedir(dir);
-    std::cout << "--------------------------------------------------------------------------------------------------------------------" << std::endl; // Adjusted width
-    std::cout << "--- Thread Plugin (C++ V2 - Corrected Policy Index): Flush complete ---" << std::endl << std::endl;
+
+    // Cleanup prev_thread_cpu_times_map for TIDs that no longer exist
+    for (auto it = prev_thread_cpu_times_map.begin(); it != prev_thread_cpu_times_map.end(); ) {
+        if (current_tids_found.find(it->first) == current_tids_found.end()) {
+            it = prev_thread_cpu_times_map.erase(it); // Erase and get next iterator
+        } else {
+            ++it;
+        }
+    }
+    
+    // Update state for next call
+    prev_interval_time_point = current_interval_time_point;
+    if (first_call) first_call = false;
+
+
+    // --- Display Individual Thread Info ---
+    std::cout << std::fixed << std::setprecision(2);
+    const int name_w = 20, state_w = 28, policy_w = 15;
+    std::cout << "--------------------------------------------------------------------------------------------------------------------------------------------------------------------" << std::endl;
+    std::cout << "| " << std::left << std::setw(8) << "TID"
+              << "| " << std::left << std::setw(name_w) << "Name"
+              << "| " << std::left << std::setw(state_w) << "State"
+              << "| " << std::left << std::setw(8) << "Nice"
+              << "| " << std::left << std::setw(8) << "RT Prio"
+              << "| " << std::left << std::setw(policy_w) << "Policy"
+              << "| " << std::left << std::setw(10) << "CPU %"
+              << "| " << std::left << std::setw(10) << "User(s)"
+              << "| " << std::left << std::setw(10) << "Sys(s)"
+              << "| " << std::left << std::setw(10) << "Stack(KB)"
+              << "| " << std::left << std::setw(8) << "FDs" << "|" << std::endl;
+    std::cout << "--------------------------------------------------------------------------------------------------------------------------------------------------------------------" << std::endl;
+
+    for (const auto& info : current_threads_info) {
+        std::cout << "| " << std::left << std::setw(8) << info.tid
+                  << "| " << std::left << std::setw(name_w) << info.name.substr(0, name_w)
+                  << "| " << std::left << std::setw(state_w) << (info.state_str + " ('" + info.state_char + "')").substr(0,state_w)
+                  << "| " << std::right << std::setw(8) << info.nice_val
+                  << "| " << std::right << std::setw(8) << info.rt_priority_val
+                  << "| " << std::left << std::setw(policy_w) << info.policy_str.substr(0, policy_w)
+                  << "| " << std::right << std::setw(9) << info.cpu_usage_percent_interval << "%"
+                  << "| " << std::right << std::setw(10) << info.user_cpu_time_sec
+                  << "| " << std::right << std::setw(10) << info.system_cpu_time_sec
+                  << "| " << std::right << std::setw(10) << info.vm_stack_kb
+                  << "| " << std::right << std::setw(8) << info.fd_count << "|" << std::endl;
+    }
+    std::cout << "--------------------------------------------------------------------------------------------------------------------------------------------------------------------" << std::endl;
+
+
+    // --- Aggregated Analysis ---
+    std::cout << "\n--- Aggregated Analysis ---" << std::endl;
+
+    // 1. Thread State Statistics
+    std::map<std::string, int> state_counts;
+    for (const auto& info : current_threads_info) {
+        state_counts[info.state_str]++;
+    }
+    std::cout << "Thread States:" << std::endl;
+    for (const auto& pair : state_counts) {
+        std::cout << "  - " << std::left << std::setw(30) << pair.first << ": " << pair.second << std::endl;
+    }
+    std::cout << "  - " << std::left << std::setw(30) << "Total Threads" << ": " << current_threads_info.size() << std::endl;
+
+    // 2. CPU Hot-Spot Threads (Top 5)
+    std::vector<ThreadInfo> sorted_threads = current_threads_info;
+    std::sort(sorted_threads.begin(), sorted_threads.end(), [](const ThreadInfo& a, const ThreadInfo& b) {
+        return a.cpu_usage_percent_interval > b.cpu_usage_percent_interval;
+    });
+
+    std::cout << "\nTop CPU Consuming Threads (by % usage in last interval):" << std::endl;
+    int top_n = 5;
+    for (int i = 0; i < std::min((int)sorted_threads.size(), top_n); ++i) {
+        const auto& info = sorted_threads[i];
+        if (info.cpu_usage_percent_interval > 0.01 || first_call) { // Show if meaningful usage or first call (where % might be 0)
+             std::cout << "  " << i+1 << ". TID: " << std::left << std::setw(7) << info.tid
+                       << " Name: " << std::left << std::setw(name_w) << info.name.substr(0,name_w)
+                       << " CPU %: " << std::right << std::setw(6) << info.cpu_usage_percent_interval << "%"
+                       << " (Total CPU s: " << info.total_cpu_time_sec << ")" << std::endl;
+        }
+    }
+    if (first_call && !current_threads_info.empty()){
+         std::cout << "  (CPU % is calculated from the second call onwards)" << std::endl;
+    }
+
+
+    std::cout << "\n--- Thread Plugin (C++ V3): Flush complete ---" << std::endl << std::endl;
     return 0;
 }
 
-// Ensure the main function (if you're using the test main) and other helper functions
-// (get_thread_state_str_cpp, get_scheduler_policy_str_cpp, os_get_pid_by_name)
-// are included when you compile.
+// --- main 函数用于测试插件 (需要链接包含 os_get_pid_by_name 的实现) ---
+#ifdef THREAD_PLUGIN_TEST_MAIN_CPP_V3
+#include <cstdio>  // For popen, pclose, fscanf in C-style mock
+#include <cstring> // For strcmp in C-style mock
+#include <libgen.h> // For basename
+#include <thread>   // For std::this_thread::sleep_for in main
+
+// Mock os_get_pid_by_name (same as before)
+extern "C" int os_get_pid_by_name(const char *process_name, pid_t *pids, int *count) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "pidof %s", process_name);
+    FILE *fp = popen(cmd, "r");
+    if (fp == NULL) { *count = 0; return -1; }
+    int found_pids = 0;
+    while (found_pids < *count && fscanf(fp, "%d", &pids[found_pids]) == 1) found_pids++;
+    pclose(fp);
+    if (found_pids > 0) { *count = found_pids; return 0; }
+    // Fallback to /proc scan (simplified from previous, more robust version can be used)
+    DIR *proc_dir = opendir("/proc");
+    if (!proc_dir) { *count = 0; return -2;}
+    struct dirent *entry_p;
+    found_pids = 0;
+    while ((entry_p = readdir(proc_dir)) != NULL && found_pids < *count) {
+        char *endptr;
+        long pid_long = strtol(entry_p->d_name, &endptr, 10);
+        if (*endptr == '\0') {
+            char exe_path[512], exe_link[512];
+            snprintf(exe_path, sizeof(exe_path), "/proc/%ld/exe", pid_long);
+            ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
+            if (len != -1) {
+                exe_link[len] = '\0';
+                char exe_name_copy[512]; // basename might modify its argument
+                strncpy(exe_name_copy, exe_link, sizeof(exe_name_copy)-1);
+                exe_name_copy[sizeof(exe_name_copy)-1] = '\0';
+                char *bname = basename(exe_name_copy);
+                if (bname && strcmp(bname, process_name) == 0) pids[found_pids++] = (pid_t)pid_long;
+            }
+        }
+    }
+    closedir(proc_dir);
+    *count = found_pids;
+    return (found_pids > 0) ? 0 : -3;
+}
+
+void busy_thread_func() {
+    auto start = std::chrono::steady_clock::now();
+    while(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() < 10) {
+        // Keep CPU busy
+        for (volatile int i = 0; i < 100000; ++i);
+    }
+}
+
+int main() {
+    // Create a dummy busy thread for testing CPU usage
+    std::thread dummy_busy_thread(busy_thread_func);
+    pthread_setname_np(dummy_busy_thread.native_handle(), "dummy_cpu_eater");
+
+
+    std::cout << "Attempting to get thread info for 'systemd'..." << std::endl;
+    thread_plugin_flush_cpp("systemd"); // First call, CPU % might be 0
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    thread_plugin_flush_cpp("systemd"); // Second call, CPU % should be calculated
+
+    // Test with a process name that is likely to be this test program itself
+    // Get current executable name
+    char self_path[1024];
+    ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    std::string self_name_str = "THIS_APP_UNKNOWN";
+    if (len != -1) {
+        self_path[len] = '\0';
+        char self_path_copy[1024];
+        strncpy(self_path_copy, self_path, sizeof(self_path_copy)-1);
+        self_path_copy[sizeof(self_path_copy)-1] = '\0';
+        self_name_str = basename(self_path_copy);
+    }
+    
+    std::cout << "\nAttempting to get thread info for current application ('" << self_name_str << "')..." << std::endl;
+    thread_plugin_flush_cpp(self_name_str.c_str());
+    std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to allow CPU usage to accumulate
+    thread_plugin_flush_cpp(self_name_str.c_str());
+
+    std::cout << "Dummy busy thread will finish soon..." << std::endl;
+    dummy_busy_thread.join();
+    return 0;
+}
+#endif // THREAD_PLUGIN_TEST_MAIN_CPP_V3
+
