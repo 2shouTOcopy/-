@@ -1,147 +1,74 @@
-下面整理了一份「抓包常用语法速查表」，涵盖 tcpdump（命令行）和 Wireshark / TShark（图形界面 + CLI）在常见场景下最常用、最实用的指令与过滤写法，并附带简要说明。你可以直接复制到终端或 Wireshark 的 Filter 栏使用。
+下面是一份 「tcpdump 入门级指令速查表」（已包含 -C ‑W ‑U 等文件轮转与实时刷新相关选项），直接复制即可使用。
 
 ⸻
 
-1  抓包基础概念
+1. tcpdump 基础选项表
 
-概念	tcpdump	Wireshark
-捕获过滤器 (Capture Filter)	在 命令行直接写在 tcpdump 末尾；使用 BPF 语法，过滤的包 不会被写入 pcap	在 “Capture → Options → Capture Filter” 编写；同样是 BPF 语法
-显示过滤器 (Display Filter)	n/a（tcpdump 只有捕获过滤）	抓到包后在 Wireshark 顶部 “Display Filter” 输入；语法更丰富，字段名更直观
-
-BPF 过滤语法：host / net / port / proto / and / or / not
-Wireshark 显示过滤：字段名（ip.addr, tcp.port …）+ 关系运算符(==, !=, &&, ||, matches, contains …)
-
-⸻
-
-2  tcpdump 常用选项速查
-
--i eth0          # 指定接口
--nn              # 不解析主机名、不解析端口名（提高速度）
--s 0             # 抓取完整数据，不截断
--X               # 同时以 HEX + ASCII 显示包体
--XX              # 再额外显示链路层头
--v / -vv / -vvv  # 递增详细度
--c 100           # 抓 100 包就退出
--w file.pcap     # 保存为 pcap（常与 -G / -W 分片一起用）
--r file.pcap     # 读 pcap 文件
-
-组合范例
-tcpdump -i eth0 -nn -s 0 -XX -w capture.pcap
-
-⸻
-
-3  常见过滤写法对照
-
-需求	tcpdump 捕获过滤（BPF）	Wireshark 显示过滤
-指定 IP	host 192.168.1.10	ip.addr == 192.168.1.10
-指定子网	net 10.0.0.0/24	ip.addr == 10.0.0.0/24
-指定端口	tcp port 80	tcp.port == 80
-指定协议	udp / icmp / arp	udp / icmp / arp
-多条件 AND	host 10.0.0.5 and tcp port 22	ip.addr==10.0.0.5 && tcp.port==22
-多条件 OR	(tcp port 80 or 443)	tcp.port in {80 443} 或 `tcp.port == 80
-排除条件	not port 22	!(tcp.port == 22)
-IPv6 地址	ip6 host fe80::1	ipv6.addr == fe80::1
-仅 SYN	tcp[tcpflags] & tcp-syn != 0	tcp.flags.syn == 1 && tcp.flags.ack == 0
-包长度	less 512 / greater 1200	frame.len > 1200
-VLAN ID 10	vlan 10	vlan.id == 10
-指定 MAC	ether host aa:bb:cc:dd:ee:ff	eth.addr == aa:bb:cc:dd:ee:ff
+选项	含义	常见取值 / 示例
+-i <接口>	选择抓包网卡	-i eth0 / -i any
+-nn	不解析主机名与端口别名	常与 -i 一起用
+-s 0	抓取完整包（不截断）	-s 0
+-X	HEX+ASCII 同时显示数据	调试应用层时方便
+-v / -vv / -vvv	递增详细度	协议字段信息更全
+-c <N>	抓 N 个包后自动退出	-c 100
+-w <file>	将数据写入 pcap 文件	-w capture.pcap
+-r <file>	读取 pcap 文件并解析	-r capture.pcap
 
 
 ⸻
 
-4  典型场景示例
+2. 文件轮转相关选项（重点：-C ‑W ‑U）
 
-4.1 抓取某台服务器的 HTTP/HTTPS
+选项	功能	典型示例
+-C <MiB>	按文件大小 轮转。当前 pcap 达到指定 MiB 即关闭并起新文件	-C 100 → 文件达到 100 MiB 切换
+-W <N>	固定文件个数。与 -C/-G 连用，形成 环形缓冲；超出 N 个文件后覆盖最旧的	-W 10 → 只保留最近 10 份
+-G <秒>	按时间 轮转。每隔 秒数启动一个新文件，文件名可用 strftime 格式	-G 300 → 每 5 分钟
+-U	实时写盘（packet‑buffered I/O）。抓到包立即写入文件，可配合实时分析工具；轻微增加磁盘 IO	常与 -w 一起用
+-z <cmd>	每次轮转后执行外部命令（如压缩）	-z gzip → 轮转后立即 gzip
+-Z <user>	抓包开始后把进程甩给指定用户运行，提升安全性	-Z nobody
 
-# tcpdump
-tcpdump -i eth0 -nn -s 0 tcp port 80 or 443 and host 203.0.113.5 -w web.pcap
-
-Wireshark 抓完后输入显示过滤：
-
-http || tls && ip.addr == 203.0.113.5
-
-4.2 抓 DNS 解析
-
-tcpdump -i any -nn udp port 53 -vvv
-
-Wireshark 显示过滤：dns
-
-4.3 抓指定进程发出的包（Linux）
-
-sudo tcpdump -i any -nn -s 0 -w out.pcap 'tcp and port 12345' \
-  --direction=outbound \
-  --pid=<PID>
-# --pid 需要较新的 tcpdump (>=4.99); 或者用 iptables owner 模块
-
-4.4 持续轮转文件，每 5 分钟一份
-
-tcpdump -i eth0 -G 300 -w 'capture-%Y%m%d%H%M%S.pcap'
-
-4.5 只抓 TCP 三次握手
-
-tcpdump -i eth0 'tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn'
-
-4.6 抓包后立即查看（实时）
-
-tcpdump -i eth0 -nn -s 0 -l -A 'port 80'
-# -l: 让 stdout 变行缓冲，可管道到 grep/less
-
-4.7 抓取本机发往公网的大包 (>1200B)
-
-tcpdump -i eth0 'greater 1200 and src net 192.168.0.0/16 and dst net not 192.168.0.0/16'
-
-4.8 抓取 TCP 重传
-
-Wireshark 显示过滤：
-
-tcp.analysis.retransmission || tcp.analysis.fast_retransmission
-
+小贴士
+	•	-C 按 MiB 计算，1 GiB≈1024 MiB。
+	•	-W 只在与 -C 或 -G 同时使用 时生效，否则无意义。
+	•	文件名中可用 %Y%m%d%H%M%S 等 strftime 占位符（需 -G）。
 
 ⸻
 
-5  Wireshark 实用快捷键 & 技巧
+3. 完整范例（直接可用）
 
-动作	快捷键
-开始 / 停止捕获	Ctrl + E
-重新启动捕获	Ctrl + R
-跳到下一/上一报错	Ctrl + → / Ctrl + ←
-跟踪 TCP 流	选中包 → 右键 → Follow → TCP Stream
-着色规则	View → Coloring Rules (自定义高亮)
-“Expert Info” 总览	Ctrl + Shift + E
-IO Graph	Statistics → IO Graph
+3.1 按 大小 轮转：10 × 100 MiB 环形缓冲
 
-提示：使用 “抓取过滤 + 显示过滤” 的双层过滤策略：
-捕获过滤 先把垃圾包挡在 pcap 之外，显示过滤 再对剩余数据做精细分析，效率最高。
+sudo tcpdump -i eth0 -nn -s 0 \
+  -C 100 -W 10 -U \
+  -w /var/log/pcap/capture.pcap
+
+	•	最多占用 ≈ 1 GiB 空间，超出 10 个文件自动覆盖最旧。
 
 ⸻
 
-6  抓包调试小贴士
-	1.	接口名称
-Linux 用 ip link / ifconfig -a 查看；
-Windows 在 tcpdump -D / Wireshark “Capture → Options” 可见。
-	2.	权限
-Linux 建议 sudo setcap cap_net_raw,cap_net_admin=eip /usr/sbin/tcpdump，免 root 运行。
-	3.	丢包
-高速抓包可加 --immediate-mode（tcpdump >=4.9）或在 Wireshark 的 Capture Options 勾选。
-	4.	文件大小
-长时间抓包务必用 -G+-w 滚动或 -C 按大小切片，避免单个 pcap 巨大导致难以分析。
-	5.	与 tshark 联动
-tshark -r big.pcap -Y 'tcp.port==1883 && mqtt' -T fields -e ip.src -e mqtt.topic
-	6.	性能排查
-抓包时 top 关注 %wa (IO wait)，磁盘写入慢同样会丢包；必要时使用更高性能的 ring‑buffer 工具 (e.g. pcap-ng, PF_RING, dpdk‑capture).
+3.2 按 时间 轮转：每 5 分钟 + 实时写盘
+
+sudo tcpdump -i any -nn -s 0 \
+  -G 300 -w 'trace-%Y%m%d%H%M%S.pcap' -U
+
+	•	生成文件名如 trace-20250607-162500.pcap，适合长时间监控。
 
 ⸻
 
-快捷备忘（10 秒内想好过滤语法）
+3.3 抓 HTTPS（443）+ 大小轮转 + 自动压缩
 
-who / where / how
-主机/网段/端口 → and/or/not → 协议
-先写 tcpdump 捕获过滤，再把主机、端口直接改成 ip.addr / tcp.port 放到 Wireshark 显示过滤即可。
+sudo tcpdump -i eth0 -nn tcp port 443 \
+  -s 0 -C 200 -W 5 -z gzip -U \
+  -w 'https-%H%M%S.pcap'
+
+	•	5 个 200 MiB 文件循环，轮转后立即 gzip，节省磁盘。
 
 ⸻
 
-把上面内容保存成 cheatsheet.md，再记住两条口诀：
-	1.	“tcpdump 抓少量 + Wireshark 精过滤”
-	2.	“Capture Filter 拦脏包，Display Filter 查真相”
+4. 快速记忆口诀
 
-这样大部分抓包场景都能快速上手、定位问题。祝调试顺利!
+「抓包两件事：抓多少、存多久」
+	•	抓多少 → 过滤语法（host / port / proto …）
+	•	存多久 → -C（大小）或 -G（时间） ＋ -W（文件个数）
+
+掌握 -C ‑W ‑U 组合后，就能在绝大多数场景下快速启动、稳定保存、避免磁盘爆满。祝抓包顺利！
