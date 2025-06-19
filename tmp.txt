@@ -1,50 +1,48 @@
-# toolchain file for ARM AArch64 (CA53) Linux with gnueabihf ABI
-
-# This is the target system name, which should be Linux
-set(CMAKE_SYSTEM_NAME Linux)
-
-# This is the target processor architecture
-set(CMAKE_SYSTEM_PROCESSor aarch64)
-
-# Define the full path to your toolchain's bin directory
-# Based on your provided information: /opt/aarch/aarch64-ca53-linux-gnueabihf-8.4/bin
-set(TOOLCHAIN_BIN_DIR "/opt/aarch/aarch64-ca53-linux-gnueabihf-8.4/bin")
-
-# Specify the cross compilers using the detected prefix
-# The prefix is 'aarch64-ca53-linux-gnueabihf-'
-set(CMAKE_C_COMPILER "${TOOLCHAIN_BIN_DIR}/aarch64-ca53-linux-gnueabihf-gcc")
-set(CMAKE_CXX_COMPILER "${TOOLCHAIN_BIN_DIR}/aarch64-ca53-linux-gnueabihf-g++")
-set(CMAKE_ASM_COMPILER "${TOOLCHAIN_BIN_DIR}/aarch64-ca53-linux-gnueabihf-gcc") # For assembly files if any
-
-# Define the sysroot for the target system.
-# This is where your target system's headers and libraries are located.
+# Copyright 2019 gRPC authors.
 #
-# IMPORTANT: YOU MUST VERIFY THIS PATH!
-# It's commonly found at: <toolchain_root>/<target_triple>/sysroot/
-# Or sometimes just: <toolchain_root>/sysroot/
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Based on '/opt/aarch/aarch64-ca53-linux-gnueabihf-8.4/bin',
-# a common sysroot path would be:
-set(CMAKE_FIND_ROOT_PATH "/opt/aarch/aarch64-ca53-linux-gnueabihf-8.4/aarch64-ca53-linux-gnueabihf/sysroot")
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# Instruct CMake to search for programs in the host environment and
-# for libraries/headers only in the target environment (sysroot).
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER) # Never look for programs in the sysroot
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)  # Only look for libraries in the sysroot
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)  # Only look for includes in the sysroot
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)  # Only look for packages in the sysroot
-
-# Optional: if you need to pass specific compiler flags for the target architecture (e.g., for Cortex-A53)
-# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=cortex-a53" CACHE STRING "C Compiler Flags" FORCE)
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=cortex-a53" CACHE STRING "C++ Compiler Flags" FORCE)
-
-# This helps CMake find shared libraries correctly when cross-compiling
-# Ensures that RPATH is not set to absolute paths on the host system,
-# which would be incorrect for the target.
-set(CMAKE_SKIP_INSTALL_RPATH TRUE)
-set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)
-
-# Optionally, if your toolchain requires specific environment variables to be set,
-# you might add them here, though CMAKE_TOOLCHAIN_FILE typically handles most needs.
-# For example, if you had custom pkg-config paths for your target:
-# set(ENV{PKG_CONFIG_PATH} "${CMAKE_FIND_ROOT_PATH}/usr/lib/pkgconfig:${CMAKE_FIND_ROOT_PATH}/usr/share/pkgconfig")
+if(TARGET absl::strings)
+  # If absl is included already, skip including it.
+  # (https://github.com/grpc/grpc/issues/29608)
+# 修改这里：将原来的 elseif 条件修改为 OR "package"
+elseif(gRPC_ABSL_PROVIDER STREQUAL "module" OR gRPC_ABSL_PROVIDER STREQUAL "package")
+  if(NOT ABSL_ROOT_DIR)
+    # GRPC的third_party/abseil-cpp通常是其子模块
+    set(ABSL_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/abseil-cpp)
+  endif()
+  if(EXISTS "${ABSL_ROOT_DIR}/CMakeLists.txt")
+    if(gRPC_INSTALL)
+      # When gRPC_INSTALL is enabled and Abseil will be built as a module,
+      # Abseil will be installed along with gRPC for convenience.
+      set(ABSL_ENABLE_INSTALL ON)
+    endif()
+    set(ABSL_PROPAGATE_CXX_STD ON)
+    add_subdirectory(${ABSL_ROOT_DIR} third_party/abseil-cpp)
+  else()
+    message(WARNING "gRPC_ABSL_PROVIDER is \"module\" but ABSL_ROOT_DIR is wrong")
+  endif()
+  if(gRPC_INSTALL AND NOT _gRPC_INSTALL_SUPPORTED_FROM_MODULE)
+    message(WARNING "gRPC_INSTALL will be forced to FALSE because gRPC_ABSL_PROVIDER is \"module\" and CMake version (${CMAKE_VERSION}) is less than 3.13.")
+    set(gRPC_INSTALL FALSE)
+  endif()
+# 注释掉原来的 'package' 分支
+# elseif(gRPC_ABSL_PROVIDER STREQUAL "package")
+  # Use "CONFIG" as there is no built-in cmake module for absl.
+  # find_package(absl REQUIRED CONFIG)
+# 添加一个 else() 块来处理其他未预期的 provider 值，并执行 find_package
+else()
+  # Fallback to original find_package behavior if needed for other providers
+  find_package(absl REQUIRED CONFIG)
+endif()
+set(_gRPC_FIND_ABSL "if(NOT TARGET absl::strings)\n  find_package(absl CONFIG)\nendif()")
