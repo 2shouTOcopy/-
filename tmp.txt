@@ -8,8 +8,9 @@ if (POLICY CMP0077)
   cmake_policy(SET CMP0077 NEW)
 endif (POLICY CMP0077)
 
-option (utf8_range_ENABLE_TESTS "Build test suite" OFF) # <--- 修改为 OFF
-option (utf8_range_ENABLE_INSTALL "Configure installation" ON)
+# 强制禁用测试和安装，因为这通常是由上层项目控制的
+option (utf8_range_ENABLE_TESTS "Build test suite" OFF) # <--- 强制 OFF
+option (utf8_range_ENABLE_INSTALL "Configure installation" OFF) # <--- 强制 OFF
 
 ##
 # Create the lightweight C library
@@ -19,25 +20,36 @@ add_library (utf8_range
 
 ##
 # A heavier-weight C++ wrapper that supports Abseil.
-add_library (utf8_validity utf8_range.c) # 这行保持不动，但请注意，它将 utf8_range.c 编译为 C++ 库，这不寻常
+add_library (utf8_validity utf8_range.c) # 这行保持不动
 
-# --- 修改 set_target_properties，移除可能导致问题的变量 ---
-set_target_properties(utf8_range PROPERTIES
-  VERSION 1.0 # 使用固定版本号或移除此行，避免依赖 protobuf_VERSION
-  OUTPUT_NAME utf8_range # <--- 移除 ${LIB_PREFIX}
-)
-set_target_properties(utf8_validity PROPERTIES
-  VERSION 1.0 # 使用固定版本号或移除此行
-  OUTPUT_NAME utf8_validity # <--- 移除 ${LIB_PREFIX}
-)
-# -----------------------------------------------------------
+# --- 关键修改：在设置属性前检查目标是否存在 ---
+# 这两个 set_target_properties 错误在于目标不存在，我们判断后执行
+# 如果 utf8_range 目标存在，就设置其属性
+if (TARGET utf8_range)
+  set_target_properties(utf8_range PROPERTIES
+    # 移除 VERSION 和 OUTPUT_NAME，让上层项目决定
+    # 这些属性可能依赖于外部变量，直接设置固定值或移除它们，避免参数错误
+    # 如果 Protobuf_VERSION 和 LIB_PREFIX 在这里未定义，则会导致参数错误。
+    # 最稳妥是删除或设为固定值
+    VERSION 1.0 # 例如固定版本号
+  )
+endif()
+
+# 如果 utf8_validity 目标存在，就设置其属性
+if (TARGET utf8_validity)
+  set_target_properties(utf8_validity PROPERTIES
+    VERSION 1.0 # 例如固定版本号
+    OUTPUT_NAME utf8_validity # <--- 移除 ${LIB_PREFIX}，或者确保它被正确定义
+  )
+endif()
+# ---------------------------------------------------
 
 # Load Abseil dependency.
 if (NOT TARGET absl::strings)
   # 定义 Abseil 源码路径，相对于当前 utf8_range 目录
   set(UTF8_RANGE_ABSL_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../abseil-cpp")
   if (EXISTS "${UTF8_RANGE_ABSL_ROOT_DIR}/CMakeLists.txt")
-    set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL})
+    set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL}) # 这会是 OFF
     set(ABSL_PROPAGATE_CXX_STD ON)
     add_subdirectory(${UTF8_RANGE_ABSL_ROOT_DIR} third_party/abseil-cpp)
     message(STATUS "utf8_range: Manually added Abseil as subdirectory.")
@@ -48,23 +60,23 @@ endif ()
 target_link_libraries(utf8_validity PUBLIC absl::strings)
 
 # Configure tests.
+# --- 整个测试部分，如果 utf8_range_ENABLE_TESTS 是 OFF，将不会执行 ---
 if (utf8_range_ENABLE_TESTS) # 这个条件现在是 OFF，所以下面的 GTest 逻辑不会执行
   enable_testing()
-
-  # find_package(GTest REQUIRED) # <-- 这一行应该被跳过
-
+  find_package(GTest REQUIRED) # <-- 这行将不会被执行
   add_executable(tests utf8_validity_test.cc)
   target_link_libraries(tests utf8_validity GTest::gmock_main)
-
   add_test(NAME utf8_validity_test COMMAND tests)
-
   add_custom_target(check
     COMMAND tests
     DEPENDS tests
   )
+else() # <--- 新增，明确表示跳过测试配置
+  message(STATUS "utf8_range: Skipping test configuration as utf8_range_ENABLE_TESTS is OFF.")
 endif ()
 
 # Configure installation.
+# --- 整个安装部分，如果 utf8_range_ENABLE_INSTALL 是 OFF，将不会执行 ---
 if (utf8_range_ENABLE_INSTALL)
   include(CMakePackageConfigHelpers)
   include(GNUInstallDirs)
@@ -84,7 +96,7 @@ if (utf8_range_ENABLE_INSTALL)
     "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
   )
-  install(FILES "${PROJECT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
+  install(FILES "${CMAKE_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
   )
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/utf8_range.pc.cmake
@@ -97,4 +109,6 @@ if (utf8_range_ENABLE_INSTALL)
   install(FILES utf8_range.h utf8_validity.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   )
+else() # <--- 新增，明确表示跳过安装配置
+  message(STATUS "utf8_range: Skipping install configuration as utf8_range_ENABLE_INSTALL is OFF.")
 endif ()
