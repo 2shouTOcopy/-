@@ -1,114 +1,56 @@
-# /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.73.0/third_party/utf8_range/CMakeLists.txt
+# /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.73.0/cmake/ssl.cmake
 
-cmake_minimum_required (VERSION 3.16)
-project (utf8_range C CXX)
-
-# option() honor variables
-if (POLICY CMP0077)
-  cmake_policy(SET CMP0077 NEW)
-endif (POLICY CMP0077)
-
-# 强制禁用测试和安装，因为这通常是由上层项目控制的
-option (utf8_range_ENABLE_TESTS "Build test suite" OFF) # <--- 强制 OFF
-option (utf8_range_ENABLE_INSTALL "Configure installation" OFF) # <--- 强制 OFF
-
-##
-# Create the lightweight C library
-add_library (utf8_range
-  utf8_range.c
-)
-
-##
-# A heavier-weight C++ wrapper that supports Abseil.
-add_library (utf8_validity utf8_range.c) # 这行保持不动
-
-# --- 关键修改：在设置属性前检查目标是否存在 ---
-# 这两个 set_target_properties 错误在于目标不存在，我们判断后执行
-# 如果 utf8_range 目标存在，就设置其属性
-if (TARGET utf8_range)
-  set_target_properties(utf8_range PROPERTIES
-    # 移除 VERSION 和 OUTPUT_NAME，让上层项目决定
-    # 这些属性可能依赖于外部变量，直接设置固定值或移除它们，避免参数错误
-    # 如果 Protobuf_VERSION 和 LIB_PREFIX 在这里未定义，则会导致参数错误。
-    # 最稳妥是删除或设为固定值
-    VERSION 1.0 # 例如固定版本号
-  )
-endif()
-
-# 如果 utf8_validity 目标存在，就设置其属性
-if (TARGET utf8_validity)
-  set_target_properties(utf8_validity PROPERTIES
-    VERSION 1.0 # 例如固定版本号
-    OUTPUT_NAME utf8_validity # <--- 移除 ${LIB_PREFIX}，或者确保它被正确定义
-  )
-endif()
-# ---------------------------------------------------
-
-# Load Abseil dependency.
-if (NOT TARGET absl::strings)
-  # 定义 Abseil 源码路径，相对于当前 utf8_range 目录
-  set(UTF8_RANGE_ABSL_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../abseil-cpp")
-  if (EXISTS "${UTF8_RANGE_ABSL_ROOT_DIR}/CMakeLists.txt")
-    set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL}) # 这会是 OFF
-    set(ABSL_PROPAGATE_CXX_STD ON)
-    add_subdirectory(${UTF8_RANGE_ABSL_ROOT_DIR} third_party/abseil-cpp)
-    message(STATUS "utf8_range: Manually added Abseil as subdirectory.")
-  else()
-    message(FATAL_ERROR "utf8_range: Abseil source not found at ${UTF8_RANGE_ABSL_ROOT_DIR}. Cannot proceed.")
+If(gRPC_SSL_PROVIDER STREQUAL "module" OR gRPC_SSL_PROVIDER STREQUAL "package") # <--- 修改这一行，合并 module 和 package
+  # Building the openssl tests require gmock what is not part of a standard openssl checkout.
+  # Disable them unless they are explicitly requested from the cmake command line (when we assume
+  # gmock is downloaded to the right location inside openssl).
+  if(NOT openssl_BUILD_TESTS)
+    set(openssl_BUILD_TESTS OFF CACHE BOOL "Build openssl tests") # 注意：这个变量名可能因OpenSSL版本而异，但通常是类似
   endif()
-endif ()
-target_link_libraries(utf8_validity PUBLIC absl::strings)
+  if(NOT OPENSSL_ROOT_DIR)
+    # 假设 BoringSSL 源码路径在 third_party/boringssl
+    set(OPENSSL_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/boringssl) # <--- 修正为 BoringSSL 路径
+  endif()
 
-# Configure tests.
-# --- 整个测试部分，如果 utf8_range_ENABLE_TESTS 是 OFF，将不会执行 ---
-if (utf8_range_ENABLE_TESTS) # 这个条件现在是 OFF，所以下面的 GTest 逻辑不会执行
-  enable_testing()
-  find_package(GTest REQUIRED) # <-- 这行将不会被执行
-  add_executable(tests utf8_validity_test.cc)
-  target_link_libraries(tests utf8_validity GTest::gmock_main)
-  add_test(NAME utf8_validity_test COMMAND tests)
-  add_custom_target(check
-    COMMAND tests
-    DEPENDS tests
-  )
-else() # <--- 新增，明确表示跳过测试配置
-  message(STATUS "utf8_range: Skipping test configuration as utf8_range_ENABLE_TESTS is OFF.")
-endif ()
-
-# Configure installation.
-# --- 整个安装部分，如果 utf8_range_ENABLE_INSTALL 是 OFF，将不会执行 ---
-if (utf8_range_ENABLE_INSTALL)
-  include(CMakePackageConfigHelpers)
-  include(GNUInstallDirs)
-
-  install(EXPORT ${PROJECT_NAME}-targets
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
-    NAMESPACE utf8_range::
-  )
-  install(TARGETS utf8_validity utf8_range EXPORT ${PROJECT_NAME}-targets
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  )
-
-  configure_package_config_file(
-    cmake/${PROJECT_NAME}-config.cmake.in
-    "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
-    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
-  )
-  install(FILES "${CMAKE_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
-  )
-  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/utf8_range.pc.cmake
-                 ${CMAKE_CURRENT_BINARY_DIR}/utf8_range.pc @ONLY)
-  install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/utf8_range.pc
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
-
-  # Install public headers explicitly.
-  install(FILES utf8_range.h utf8_validity.h
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  )
-else() # <--- 新增，明确表示跳过安装配置
-  message(STATUS "utf8_range: Skipping install configuration as utf8_range_ENABLE_INSTALL is OFF.")
-endif ()
+  if(EXISTS "${OPENSSL_ROOT_DIR}/CMakeLists.txt")
+    if(gRPC_INSTALL)
+      # When gRPC_INSTALL is enabled and OpenSSL will be built as a module,
+      # OpenSSL will be installed along with gRPC for convenience.
+      set(OPENSSL_ENABLE_INSTALL ON)
+    endif()
+    add_subdirectory(${OPENSSL_ROOT_DIR} third_party/boringssl) # <--- 修正为 add_subdirectory BoringSSL
+    
+    # 确保 CMake 知道 OpenSSL/BoringSSL 已被处理
+    # BoringSSL 内部会将 ssl 和 crypto 目标注册为 GLOBAL target
+    # 我们可以通过 TARGET 关键字来引用它们。
+    set(OPENSSL_SSL_LIBRARY ssl)
+    set(OPENSSL_CRYPTO_LIBRARY crypto)
+    set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include") # 根据BoringSSL的头文件路径调整
+    set(OpenSSL_FOUND TRUE) # 告诉CMake已经找到OpenSSL
+    
+  else()
+    message(WARNING "gRPC_SSL_PROVIDER is \"module\" but OPENSSL_ROOT_DIR is wrong")
+  endif()
+  if(gRPC_INSTALL AND NOT _gRPC_INSTALL_SUPPORTED_FROM_MODULE)
+    message(WARNING "gRPC_INSTALL will be forced to FALSE because gRPC_SSL_PROVIDER is \"module\" and CMake version (${CMAKE_VERSION}) is less than 3.13.")
+    set(gRPC_INSTALL FALSE)
+  endif()
+# 注释掉原来的 'package' 分支
+# elseif(gRPC_SSL_PROVIDER STREQUAL "package")
+  # OpenSSL installation directory can be configured by setting OPENSSL_ROOT_DIR
+  # We expect to locate OpenSSL using the built-in cmake module as the openssl
+  # project itself does not provide installation support in its CMakeLists.txt
+  # See https://cmake.org/cmake/help/v3.6/module/FindOpenSSL.html
+  # find_package(OpenSSL REQUIRED) # <--- 注释掉这一行
+  
+  # if(TARGET OpenSSL::SSL)
+  #   set(_gRPC_SSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+  # else()
+  #   set(_gRPC_SSL_LIBRARIES ${OPENSSL_LIBRARIES})
+  # endif()
+  # set(_gRPC_SSL_INCLUDE_DIR ${OPENSSL_INCLUDE_DIR})
+  
+  # set(_gRPC_FIND_SSL "if(NOT OPENSSL_FOUND)\n  find_package(OpenSSL)\nendif()")
+else() # <--- 添加一个 else() 块来处理其他未预期的 provider 值，并执行 find_package (可选，通常不会被触发)
+    find_package(OpenSSL REQUIRED)
+endif()
