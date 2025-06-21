@@ -1,48 +1,66 @@
-# Copyright 2019 gRPC authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.73.0/third_party/utf8_range/CMakeLists.txt
 
-if(TARGET absl::strings)
-  # If absl is included already, skip including it.
-  # (https://github.com/grpc/grpc/issues/29608)
-# 修改这里：将原来的 elseif 条件修改为 OR "package"
-elseif(gRPC_ABSL_PROVIDER STREQUAL "module" OR gRPC_ABSL_PROVIDER STREQUAL "package")
-  if(NOT ABSL_ROOT_DIR)
-    # GRPC的third_party/abseil-cpp通常是其子模块
-    set(ABSL_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/abseil-cpp)
+if (NOT TARGET utf8_range) # This original check means utf8_range might be defined elsewhere
+  # --- DELETE THIS LINE (If you added it previously for issue #1) ---
+  # add_library(utf8_range STATIC utf8_range.c)
+  # -------------------------------------------------------------------
+
+  set(utf8_range_ENABLE_TESTS OFF CACHE BOOL "Disable utf8_range tests" FORCE) # <--- ADD FORCE to ensure it's OFF
+  # Set up Abseil dependency for utf8_range (fixes error #3 for Abseil)
+  # ABSL_ROOT_DIR needs to be defined relative to this CMakeLists.txt
+  set(ABSL_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../abseil-cpp") # Relative path to gRPC's Abseil submodule
+  set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL}) # This variable might be passed down, or set here
+  set(ABSL_PROPAGATE_CXX_STD ON)
+
+  # Check if Abseil's CMakeLists.txt exists at the calculated path
+  if (NOT EXISTS "${ABSL_ROOT_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "Abseil source for utf8_range not found at ${ABSL_ROOT_DIR}")
   endif()
-  if(EXISTS "${ABSL_ROOT_DIR}/CMakeLists.txt")
-    if(gRPC_INSTALL)
-      # When gRPC_INSTALL is enabled and Abseil will be built as a module,
-      # Abseil will be installed along with gRPC for convenience.
-      set(ABSL_ENABLE_INSTALL ON)
-    endif()
-    set(ABSL_PROPAGATE_CXX_STD ON)
-    add_subdirectory(${ABSL_ROOT_DIR} third_party/abseil-cpp)
-  else()
-    message(WARNING "gRPC_ABSL_PROVIDER is \"module\" but ABSL_ROOT_DIR is wrong")
-  endif()
-  if(gRPC_INSTALL AND NOT _gRPC_INSTALL_SUPPORTED_FROM_MODULE)
-    message(WARNING "gRPC_INSTALL will be forced to FALSE because gRPC_ABSL_PROVIDER is \"module\" and CMake version (${CMAKE_VERSION}) is less than 3.13.")
-    set(gRPC_INSTALL FALSE)
-  endif()
-# 注释掉原来的 'package' 分支
-# elseif(gRPC_ABSL_PROVIDER STREQUAL "package")
-  # Use "CONFIG" as there is no built-in cmake module for absl.
-  # find_package(absl REQUIRED CONFIG)
-# 添加一个 else() 块来处理其他未预期的 provider 值，并执行 find_package
+  
+  # Ensure Abseil is added as a subdirectory, no find_package
+  add_subdirectory(${ABSL_ROOT_DIR} third_party/abseil-cpp)
+  message(STATUS "utf8_range: Manually added Abseil as subdirectory.")
+endif() # End of if (NOT TARGET utf8_range) block
+
+
+## (Keep the rest of the original file, it defines utf8_validity and sets its properties)
+# A heavier-weight C++ wrapper that supports Abseil.
+add_library (utf8_validity utf8_range.c) # This line is from original file
+
+set_target_properties(utf8_range PROPERTIES # This target should be defined outside this file.
+  VERSION ${protobuf_VERSION}
+  OUTPUT_NAME ${LIB_PREFIX}utf8_range
+)
+set_target_properties(utf8_validity PROPERTIES
+  VERSION ${protobuf_VERSION}
+  OUTPUT_NAME ${LIB_PREFIX}utf8_validity
+)
+
+# --- Remove or comment out the original Abseil Load logic (as we added it above) ---
+# if (NOT TARGET absl::strings)
+#   if (NOT ABSL_ROOT_DIR)
+#     find_package(absl REQUIRED CONFIG)
+#   else ()
+#     set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL})
+#     set(ABSL_PROPAGATE_CXX_STD ON)
+#     add_subdirectory(${ABSL_ROOT_DIR} third_party/abseil-cpp)
+#   endif ()
+# endif ()
+# ----------------------------------------------------------------------------------
+
+target_link_libraries(utf8_validity PUBLIC absl::strings)
+
+# --- ADD THIS BLOCK TO DISABLE GTEST ---
+# Original line 54: find_package(GTest REQUIRED)
+# Disable GTest if tests are explicitly off.
+# This assumes that `utf8_range_ENABLE_TESTS` is correctly set to OFF earlier.
+if (utf8_range_ENABLE_TESTS) # Only include gtest if tests are enabled
+  # Keep original GTest logic here if you want tests
+  find_package(GTest REQUIRED) # This line should now be protected
+  target_link_libraries(utf8_validity PRIVATE GTest::gtest_main)
 else()
-  # Fallback to original find_package behavior if needed for other providers
-  find_package(absl REQUIRED CONFIG)
+  message(STATUS "Skipping GTest setup in utf8_range as utf8_range_ENABLE_TESTS is OFF.")
 endif()
-set(_gRPC_FIND_ABSL "if(NOT TARGET absl::strings)\n  find_package(absl CONFIG)\nendif()")
+# ------------------------------------
+
+# (Remaining part of the original file)
