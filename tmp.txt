@@ -1,66 +1,100 @@
 # /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.73.0/third_party/utf8_range/CMakeLists.txt
 
-if (NOT TARGET utf8_range) # This original check means utf8_range might be defined elsewhere
-  # --- DELETE THIS LINE (If you added it previously for issue #1) ---
-  # add_library(utf8_range STATIC utf8_range.c)
-  # -------------------------------------------------------------------
+cmake_minimum_required (VERSION 3.16)
+project (utf8_range C CXX)
 
-  set(utf8_range_ENABLE_TESTS OFF CACHE BOOL "Disable utf8_range tests" FORCE) # <--- ADD FORCE to ensure it's OFF
-  # Set up Abseil dependency for utf8_range (fixes error #3 for Abseil)
-  # ABSL_ROOT_DIR needs to be defined relative to this CMakeLists.txt
-  set(ABSL_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../abseil-cpp") # Relative path to gRPC's Abseil submodule
-  set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL}) # This variable might be passed down, or set here
-  set(ABSL_PROPAGATE_CXX_STD ON)
+# option() honor variables
+if (POLICY CMP0077)
+  cmake_policy(SET CMP0077 NEW)
+endif (POLICY CMP0077)
 
-  # Check if Abseil's CMakeLists.txt exists at the calculated path
-  if (NOT EXISTS "${ABSL_ROOT_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "Abseil source for utf8_range not found at ${ABSL_ROOT_DIR}")
-  endif()
-  
-  # Ensure Abseil is added as a subdirectory, no find_package
-  add_subdirectory(${ABSL_ROOT_DIR} third_party/abseil-cpp)
-  message(STATUS "utf8_range: Manually added Abseil as subdirectory.")
-endif() # End of if (NOT TARGET utf8_range) block
+option (utf8_range_ENABLE_TESTS "Build test suite" OFF) # <--- 修改为 OFF
+option (utf8_range_ENABLE_INSTALL "Configure installation" ON)
 
+##
+# Create the lightweight C library
+add_library (utf8_range
+  utf8_range.c
+)
 
-## (Keep the rest of the original file, it defines utf8_validity and sets its properties)
+##
 # A heavier-weight C++ wrapper that supports Abseil.
-add_library (utf8_validity utf8_range.c) # This line is from original file
+add_library (utf8_validity utf8_range.c) # 这行保持不动，但请注意，它将 utf8_range.c 编译为 C++ 库，这不寻常
 
-set_target_properties(utf8_range PROPERTIES # This target should be defined outside this file.
-  VERSION ${protobuf_VERSION}
-  OUTPUT_NAME ${LIB_PREFIX}utf8_range
+# --- 修改 set_target_properties，移除可能导致问题的变量 ---
+set_target_properties(utf8_range PROPERTIES
+  VERSION 1.0 # 使用固定版本号或移除此行，避免依赖 protobuf_VERSION
+  OUTPUT_NAME utf8_range # <--- 移除 ${LIB_PREFIX}
 )
 set_target_properties(utf8_validity PROPERTIES
-  VERSION ${protobuf_VERSION}
-  OUTPUT_NAME ${LIB_PREFIX}utf8_validity
+  VERSION 1.0 # 使用固定版本号或移除此行
+  OUTPUT_NAME utf8_validity # <--- 移除 ${LIB_PREFIX}
 )
+# -----------------------------------------------------------
 
-# --- Remove or comment out the original Abseil Load logic (as we added it above) ---
-# if (NOT TARGET absl::strings)
-#   if (NOT ABSL_ROOT_DIR)
-#     find_package(absl REQUIRED CONFIG)
-#   else ()
-#     set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL})
-#     set(ABSL_PROPAGATE_CXX_STD ON)
-#     add_subdirectory(${ABSL_ROOT_DIR} third_party/abseil-cpp)
-#   endif ()
-# endif ()
-# ----------------------------------------------------------------------------------
-
+# Load Abseil dependency.
+if (NOT TARGET absl::strings)
+  # 定义 Abseil 源码路径，相对于当前 utf8_range 目录
+  set(UTF8_RANGE_ABSL_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../abseil-cpp")
+  if (EXISTS "${UTF8_RANGE_ABSL_ROOT_DIR}/CMakeLists.txt")
+    set(ABSL_ENABLE_INSTALL ${utf8_range_ENABLE_INSTALL})
+    set(ABSL_PROPAGATE_CXX_STD ON)
+    add_subdirectory(${UTF8_RANGE_ABSL_ROOT_DIR} third_party/abseil-cpp)
+    message(STATUS "utf8_range: Manually added Abseil as subdirectory.")
+  else()
+    message(FATAL_ERROR "utf8_range: Abseil source not found at ${UTF8_RANGE_ABSL_ROOT_DIR}. Cannot proceed.")
+  endif()
+endif ()
 target_link_libraries(utf8_validity PUBLIC absl::strings)
 
-# --- ADD THIS BLOCK TO DISABLE GTEST ---
-# Original line 54: find_package(GTest REQUIRED)
-# Disable GTest if tests are explicitly off.
-# This assumes that `utf8_range_ENABLE_TESTS` is correctly set to OFF earlier.
-if (utf8_range_ENABLE_TESTS) # Only include gtest if tests are enabled
-  # Keep original GTest logic here if you want tests
-  find_package(GTest REQUIRED) # This line should now be protected
-  target_link_libraries(utf8_validity PRIVATE GTest::gtest_main)
-else()
-  message(STATUS "Skipping GTest setup in utf8_range as utf8_range_ENABLE_TESTS is OFF.")
-endif()
-# ------------------------------------
+# Configure tests.
+if (utf8_range_ENABLE_TESTS) # 这个条件现在是 OFF，所以下面的 GTest 逻辑不会执行
+  enable_testing()
 
-# (Remaining part of the original file)
+  # find_package(GTest REQUIRED) # <-- 这一行应该被跳过
+
+  add_executable(tests utf8_validity_test.cc)
+  target_link_libraries(tests utf8_validity GTest::gmock_main)
+
+  add_test(NAME utf8_validity_test COMMAND tests)
+
+  add_custom_target(check
+    COMMAND tests
+    DEPENDS tests
+  )
+endif ()
+
+# Configure installation.
+if (utf8_range_ENABLE_INSTALL)
+  include(CMakePackageConfigHelpers)
+  include(GNUInstallDirs)
+
+  install(EXPORT ${PROJECT_NAME}-targets
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
+    NAMESPACE utf8_range::
+  )
+  install(TARGETS utf8_validity utf8_range EXPORT ${PROJECT_NAME}-targets
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  )
+
+  configure_package_config_file(
+    cmake/${PROJECT_NAME}-config.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
+  )
+  install(FILES "${PROJECT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
+  )
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/utf8_range.pc.cmake
+                 ${CMAKE_CURRENT_BINARY_DIR}/utf8_range.pc @ONLY)
+  install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/utf8_range.pc
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+
+  # Install public headers explicitly.
+  install(FILES utf8_range.h utf8_validity.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  )
+endif ()
