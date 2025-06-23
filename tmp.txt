@@ -1,56 +1,56 @@
-# /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.73.0/cmake/ssl.cmake
+# /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.40.0/third_party/boringssl-with-bazel/CMakeLists.txt
 
-If(gRPC_SSL_PROVIDER STREQUAL "module" OR gRPC_SSL_PROVIDER STREQUAL "package") # <--- 修改这一行，合并 module 和 package
-  # Building the openssl tests require gmock what is not part of a standard openssl checkout.
-  # Disable them unless they are explicitly requested from the cmake command line (when we assume
-  # gmock is downloaded to the right location inside openssl).
-  if(NOT openssl_BUILD_TESTS)
-    set(openssl_BUILD_TESTS OFF CACHE BOOL "Build openssl tests") # 注意：这个变量名可能因OpenSSL版本而异，但通常是类似
-  endif()
-  if(NOT OPENSSL_ROOT_DIR)
-    # 假设 BoringSSL 源码路径在 third_party/boringssl
-    set(OPENSSL_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/boringssl) # <--- 修正为 BoringSSL 路径
-  endif()
+# ... (文件前面部分，保留 copyright, project 等) ...
 
-  if(EXISTS "${OPENSSL_ROOT_DIR}/CMakeLists.txt")
-    if(gRPC_INSTALL)
-      # When gRPC_INSTALL is enabled and OpenSSL will be built as a module,
-      # OpenSSL will be installed along with gRPC for convenience.
-      set(OPENSSL_ENABLE_INSTALL ON)
+# --- Start: Force ARCH to aarch64 for cross-compilation ---
+# This section replaces the complex architecture detection logic in BoringSSL's CMakeLists.txt.
+# We are cross-compiling to aarch64, so we directly set the ARCH variable.
+if(CMAKE_CROSSCOMPILING)
+  set(ARCH "aarch64")
+  message(STATUS "BoringSSL: Forcing ARCH=${ARCH} due to cross-compilation.")
+else()
+  # Retain original logic for native compilation, in case this file is used elsewhere
+  # but for cross-compilation, the above `if(CMAKE_CROSSCOMPILING)` handles it.
+  # If this block still causes issues during native (e.g. host tool) build,
+  # consider copying the original if/elseif/else logic here from the original file.
+
+  # For now, let's copy the original if/elseif/else block here, but it should be
+  # skipped by CMAKE_CROSSCOMPILING.
+  If(OPENSSL_NO_ASM)
+    add_definitions(-DOPENSSL_NO_ASM)
+    set(ARCH "generic")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
+    set(ARCH "x86_64")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "amd64")
+    set(ARCH "x86_64")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "AMD64")
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+      set(ARCH "x86_64")
+    else()
+      set(ARCH "x86")
     endif()
-    add_subdirectory(${OPENSSL_ROOT_DIR} third_party/boringssl) # <--- 修正为 add_subdirectory BoringSSL
-    
-    # 确保 CMake 知道 OpenSSL/BoringSSL 已被处理
-    # BoringSSL 内部会将 ssl 和 crypto 目标注册为 GLOBAL target
-    # 我们可以通过 TARGET 关键字来引用它们。
-    set(OPENSSL_SSL_LIBRARY ssl)
-    set(OPENSSL_CRYPTO_LIBRARY crypto)
-    set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include") # 根据BoringSSL的头文件路径调整
-    set(OpenSSL_FOUND TRUE) # 告诉CMake已经找到OpenSSL
-    
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86")
+    set(ARCH "x86")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i386")
+    set(ARCH "x86")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i686")
+    set(ARCH "x86")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
+    set(ARCH "aarch64")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64")
+    set(ARCH "aarch64")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64e")
+    set(ARCH "aarch64")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^arm*")
+    set(ARCH "arm")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "mips")
+    set(ARCH "generic")
+  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "ppc64le")
+    set(ARCH "ppc64le")
   else()
-    message(WARNING "gRPC_SSL_PROVIDER is \"module\" but OPENSSL_ROOT_DIR is wrong")
+    message(FATAL_ERROR "Unknown processor:" ${CMAKE_SYSTEM_PROCESSOR})
   endif()
-  if(gRPC_INSTALL AND NOT _gRPC_INSTALL_SUPPORTED_FROM_MODULE)
-    message(WARNING "gRPC_INSTALL will be forced to FALSE because gRPC_SSL_PROVIDER is \"module\" and CMake version (${CMAKE_VERSION}) is less than 3.13.")
-    set(gRPC_INSTALL FALSE)
-  endif()
-# 注释掉原来的 'package' 分支
-# elseif(gRPC_SSL_PROVIDER STREQUAL "package")
-  # OpenSSL installation directory can be configured by setting OPENSSL_ROOT_DIR
-  # We expect to locate OpenSSL using the built-in cmake module as the openssl
-  # project itself does not provide installation support in its CMakeLists.txt
-  # See https://cmake.org/cmake/help/v3.6/module/FindOpenSSL.html
-  # find_package(OpenSSL REQUIRED) # <--- 注释掉这一行
-  
-  # if(TARGET OpenSSL::SSL)
-  #   set(_gRPC_SSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
-  # else()
-  #   set(_gRPC_SSL_LIBRARIES ${OPENSSL_LIBRARIES})
-  # endif()
-  # set(_gRPC_SSL_INCLUDE_DIR ${OPENSSL_INCLUDE_DIR})
-  
-  # set(_gRPC_FIND_SSL "if(NOT OPENSSL_FOUND)\n  find_package(OpenSSL)\nendif()")
-else() # <--- 添加一个 else() 块来处理其他未预期的 provider 值，并执行 find_package (可选，通常不会被触发)
-    find_package(OpenSSL REQUIRED)
 endif()
+# --- End: Force ARCH to aarch64 ---
+
+# ... (文件其余部分，包括 add_library 等) ...
