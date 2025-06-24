@@ -1,56 +1,66 @@
-# /data1/zhoufeng20/work/tmp/grpc_install/src/grpc-1.40.0/third_party/boringssl-with-bazel/CMakeLists.txt
+# ======== 手动配置 ========
+INSTALL_PREFIX := /data1/zhoufeng20/work/tmp/grpc_install/install
+HOST_TOOLS     := /data1/zhoufeng20/work/tmp/grpc_install/install_host_tools/bin
+TOOLCHAIN_DIR  := /opt/aarch/aarch64-ca53-linux-gnueabihf-8.4
 
-# ... (文件前面部分，保留 copyright, project 等) ...
+CXX      := $(TOOLCHAIN_DIR)/bin/aarch64-ca53-linux-gnu-g++
+AR       := $(TOOLCHAIN_DIR)/bin/aarch64-ca53-linux-gnu-ar
+STRIP    := $(TOOLCHAIN_DIR)/bin/aarch64-ca53-linux-gnu-strip
 
-# --- Start: Force ARCH to aarch64 for cross-compilation ---
-# This section replaces the complex architecture detection logic in BoringSSL's CMakeLists.txt.
-# We are cross-compiling to aarch64, so we directly set the ARCH variable.
-if(CMAKE_CROSSCOMPILING)
-  set(ARCH "aarch64")
-  message(STATUS "BoringSSL: Forcing ARCH=${ARCH} due to cross-compilation.")
-else()
-  # Retain original logic for native compilation, in case this file is used elsewhere
-  # but for cross-compilation, the above `if(CMAKE_CROSSCOMPILING)` handles it.
-  # If this block still causes issues during native (e.g. host tool) build,
-  # consider copying the original if/elseif/else logic here from the original file.
+CPPFLAGS := -I$(INSTALL_PREFIX)/include -I.                     # ← (1) 把当前目录加进头文件搜索路径
+# 如果没复制 absl 头，就临时追加：
+# CPPFLAGS += -I$(INSTALL_PREFIX)/../src/grpc-1.40.0/third_party/abseil-cpp
+CXXFLAGS := -std=c++14 -O2 -pthread
+LDFLAGS  := -L$(INSTALL_PREFIX)/lib
 
-  # For now, let's copy the original if/elseif/else block here, but it should be
-  # skipped by CMAKE_CROSSCOMPILING.
-  If(OPENSSL_NO_ASM)
-    add_definitions(-DOPENSSL_NO_ASM)
-    set(ARCH "generic")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
-    set(ARCH "x86_64")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "amd64")
-    set(ARCH "x86_64")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "AMD64")
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-      set(ARCH "x86_64")
-    else()
-      set(ARCH "x86")
-    endif()
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86")
-    set(ARCH "x86")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i386")
-    set(ARCH "x86")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i686")
-    set(ARCH "x86")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
-    set(ARCH "aarch64")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64")
-    set(ARCH "aarch64")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64e")
-    set(ARCH "aarch64")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^arm*")
-    set(ARCH "arm")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "mips")
-    set(ARCH "generic")
-  elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "ppc64le")
-    set(ARCH "ppc64le")
-  else()
-    message(FATAL_ERROR "Unknown processor:" ${CMAKE_SYSTEM_PROCESSOR})
-  endif()
-endif()
-# --- End: Force ARCH to aarch64 ---
+GRPC_STATIC  := -lgrpc++ -lgrpc++_reflection -lgrpc++_alts -lgrpc++_unsecure \
+                -lgrpc -lgrpc_unsecure -laddress_sorting
+PROTO_STATIC := -lprotobuf -lprotoc
+SYS_STATIC   := -lz -lssl -lcrypto -lcares -labsl_string -labsl_status \
+                -labsl_wyhash -labsl_random_distributions
 
-# ... (文件其余部分，包括 add_library 等) ...
+LDLIBS := $(GRPC_STATIC) $(PROTO_STATIC) $(SYS_STATIC) -pthread
+# ======== 下面一般不用改 ========
+
+PROTO   := helloworld.proto
+PB_CC   := helloworld.pb.cc
+PB_HDR  := helloworld.pb.h
+GRPC_CC := helloworld.grpc.pb.cc
+GRPC_HDR:= helloworld.grpc.pb.h
+
+SRCS_SERVER := server.cc $(PB_CC) $(GRPC_CC)
+SRCS_CLIENT := client.cc $(PB_CC) $(GRPC_CC)
+
+OBJS_SERVER := $(SRCS_SERVER:.cc=.o)
+OBJS_CLIENT := $(SRCS_CLIENT:.cc=.o)
+
+all: greeter_server greeter_client
+
+# -- 1) 生成代码 ---------------------------------------------------------
+$(PB_CC) $(PB_HDR) $(GRPC_CC) $(GRPC_HDR): $(PROTO)
+	$(HOST_TOOLS)/protoc --cpp_out=. --grpc_out=. \
+	    --plugin=protoc-gen-grpc=$(HOST_TOOLS)/grpc_cpp_plugin $<
+
+# -- 2) 编译：确保 .o 依赖生成的头文件 ------------------------------     # ← (2)
+server.o: server.cc $(PB_HDR) $(GRPC_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+client.o: client.cc $(PB_HDR) $(GRPC_HDR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+%.o: %.cc
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+# -- 3) 链接 -------------------------------------------------------------
+greeter_server: $(OBJS_SERVER)
+	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
+	$(STRIP) -s $@
+
+greeter_client: $(OBJS_CLIENT)
+	$(CXX) $^ $(LDFLAGS) $(LDLIBS) -o $@
+	$(STRIP) -s $@
+
+clean:
+	rm -f *.o greeter_server greeter_client $(PB_CC) $(GRPC_CC) $(PB_HDR) $(GRPC_HDR)
+
+.PHONY: all clean
