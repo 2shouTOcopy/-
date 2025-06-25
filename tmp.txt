@@ -1,53 +1,48 @@
-#include <string>
-#include <ctime>
-#include <cstdlib> // For system()
-#include <iostream> // For logging placeholders like INFO, ERROR
+// Collect.cpp
 
-// --- 假设的日志宏和配置管理器，用于编译和展示 ---
-#define INFO(format, ...)  printf("[INFO] " format "\n", ##__VA_ARGS__)
-#define ERROR(format, ...) fprintf(stderr, "[ERROR] " format "\n", ##__VA_ARGS__)
+#include "Collect.h"
+#include <iostream>  // For logging
+#include <unistd.h>  // For usleep
+#include <sys/wait.h> // For WIFEXITED, WEXITSTATUS
 
-class ConfigManager {
-public:
-    static ConfigManager& Instance() {
-        static ConfigManager instance;
-        return instance;
-    }
-    std::string GetGlobalOption(const std::string& key) {
-        if (key == "BaseDir") {
-            return "/mnt/data/collect/var/"; // 模拟您的情况
-        }
-        return "";
-    }
-};
-// --- 假设的服务 ---
-class PluginService {
-public:
-    static PluginService& Instance() {
-        static PluginService instance;
-        return instance;
-    }
-    void readAll() { /* ... */ }
-    void flushAll() { /* ... */ }
-};
-// --- 以上为辅助代码 ---
+// ... 其他 include 和函数实现 ...
 
+/* ===================================================================
+ * Refactored Core Logic: Perform Flush and Archive (Thread-Safe)
+ * ===================================================================*/
 
-// --- 修改后的核心函数 ---
-void* CollectDaemon_flushThread(void* /*arg*/)
+/**
+ * @brief 执行数据收集、刷写和压缩归档的核心逻辑。
+ * 这个函数是线程安全的，使用互斥锁来防止并发执行。
+ */
+void CollectDaemon::performFlushAndArchive()
 {
-    INFO("Manual flush: start.");
+    // 使用 lock_guard 保证在任何情况下都能正确解锁互斥体
+    std::lock_guard<std::mutex> lock(flush_mutex_);
 
+    INFO("Flush and Archive operation: start.");
+
+    // 1. 收集最新数据
+    INFO("Reading all plugin data...");
     PluginService::Instance().readAll();
+    
+    // 2. 短暂休眠 (可选，但根据您之前的代码保留)
+    // 给予分发器（如果异步）处理队列中数据的时间
+    usleep(100000); // 100ms
+
+    // 3. 将所有插件的缓存数据刷写到磁盘
+    INFO("Flushing all plugin data...");
     PluginService::Instance().flushAll();
 
+    // 4. 压缩归档 BaseDir 目录
     std::string baseDir = ConfigManager::Instance().GetGlobalOption("BaseDir");
     if (baseDir.empty()) {
-        ERROR("BaseDir is not configured.");
-        return nullptr;
+        INFO("BaseDir is not configured, skipping archival.");
+        INFO("Flush and Archive operation: done.");
+        return;
     }
 
-    // 1. 规范化路径：移除尾部的斜杠'/'，使路径处理更可预测
+    // 规范化路径：移除尾部的斜杠'/'
     std::string cleanBaseDir = baseDir;
     while (!cleanBaseDir.empty() && cleanBaseDir.back() == '/') {
         cleanBaseDir.pop_back();
@@ -55,41 +50,32 @@ void* CollectDaemon_flushThread(void* /*arg*/)
 
     if (cleanBaseDir.empty()) {
         ERROR("BaseDir becomes empty after cleaning: %s", baseDir.c_str());
-        return nullptr;
+        return;
     }
 
-    // 2. 安全地提取父目录和目标目录名
     size_t lastSlashPos = cleanBaseDir.find_last_of('/');
     if (lastSlashPos == std::string::npos) {
         ERROR("Invalid BaseDir format. Cannot find parent directory: %s", baseDir.c_str());
-        return nullptr;
+        return;
     }
 
     std::string parentDir = cleanBaseDir.substr(0, lastSlashPos);
     std::string targetDirName = cleanBaseDir.substr(lastSlashPos + 1);
+    if (parentDir.empty()) parentDir = "/";
 
-    // 如果parentDir为空，说明BaseDir在根目录，例如 "/var"。此时父目录就是 "/"
-    if (parentDir.empty()) {
-        parentDir = "/";
-    }
-
-    // 3. 构建压缩包路径和名称
+    // 构建压缩包路径和名称
     time_t now = time(nullptr);
     char timeStr[20];
     strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", localtime(&now));
-    
     std::string archivePath = parentDir + "/collect_data_" + timeStr + ".tar.gz";
-    
-    // 4. 构建健壮的tar命令
-    // 使用 -C 选项，先切换到 parentDir，然后对 targetDirName 进行打包。
-    // 这样做的好处是压缩包里的路径会是 "var/..." 而不是一长串绝对路径。
+
+    // 构建健壮的 tar 命令
     std::string cmd = "tar -zcf " + archivePath + " -C " + parentDir + " " + targetDirName;
     
     INFO("Executing compression command: %s", cmd.c_str());
     int ret = system(cmd.c_str());
     
     if (ret != 0) {
-        // system() 的返回值需要通过 WIFEXITED 和 WEXITSTATUS 来正确解码
         if (WIFEXITED(ret)) {
             ERROR("Failed to compress BaseDir. Command exited with status %d: %s", WEXITSTATUS(ret), cmd.c_str());
         } else {
@@ -99,6 +85,61 @@ void* CollectDaemon_flushThread(void* /*arg*/)
         INFO("Successfully compressed BaseDir to: %s", archivePath.c_str());
     }
 
-    INFO("Manual flush: done.");
-    return nullptr;
+    INFO("Flush and Archive operation: done.");
 }
+
+
+/* ===================================================================
+ * Updated Loop and Signal Handler
+ * ===================================================================*/
+
+int CollectDaemon::loop() 
+{
+    // ... (循环开始部分代码不变) ...
+
+    while (running_.load()) 
+	{
+        if (opt_.test_readall) 
+		{
+            // ... (不变) ...
+            break;
+        }
+		else if (opt_.test_flushall)
+		{
+            // --- 修改点 ---
+            // 直接调用重构后的核心函数
+            performFlushAndArchive();
+            // --- 修改结束 ---
+            break; // test_flushall 执行一次后就退出
+		}
+
+        // ... (主循环的 readAll 和 sleep 部分不变) ...
+    }
+
+    return exit_status;
+}
+
+// SIGUSR1 信号处理线程函数
+void *CollectDaemon::flushThread(void *)
+{
+    // --- 修改点 ---
+    // 这个线程的唯一职责就是调用单例的那个核心函数
+	CollectDaemon::instance().performFlushAndArchive();
+    // --- 修改结束 ---
+	return nullptr;
+}
+
+// SIGUSR1 信号处理器 (不变)
+void CollectDaemon::sigUsr1Handler(int)
+{
+	pthread_t th; 
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	// flushThread 的内容已经简化，但这里的调用方式不变
+	pthread_create(&th, &attr, flushThread, nullptr);
+	pthread_attr_destroy(&attr);
+}
+
+// ... (文件其余部分代码) ...
+
