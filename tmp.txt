@@ -1,145 +1,194 @@
-// Collect.cpp
+好的，理解了您的需求。您希望在 sc_gvmp_proj_callback 处理方案加载（COMIFB_LPRP）的过程中，发送一个事件。然后，CTriggerStatusMonitor 模块接收这个事件，并在此期间阻止 onAppEvent 函数对触发器状态（setStatus）的修改。
+这是一个非常好的设计思路，通过事件总线（Event Bus）来解耦模块间的直接依赖，符合高内聚、低耦合的架构原则。
+下面我将为您分步展示如何实现这个逻辑。
+步骤 1: 定义新的系统事件
+首先，我们需要定义一个新的事件来表示“方案加载”这个状态。这个定义通常放在一个全局的头文件中，例如 ISysEventBus.h 或者一个专门的 event_codes.h 文件。
+假设您的事件定义文件中已有 SYS_EVENT_BS_FLOW_END，我们可以在此基础上增加一个 SYS_EVENT_SCHEME_LOADING。
+// in your_event_definitions.h
+// ... other event codes
+const unsigned int SYS_EVENT_BS_FLOW_END = 0x1001; // 示例值
+const unsigned int SYS_EVENT_SCHEME_LOADING = 0x1002; // 新增：方案加载事件
 
-#include "Collect.h"
-#include <iostream>  // For logging
-#include <unistd.h>  // For usleep
-#include <sys/wait.h> // For WIFEXITED, WEXITSTATUS
+步骤 2: 在回调函数中发布事件
+现在，修改 sc_gvmp_proj_callback 函数。当方案加载开始（例如，进度为0）和结束（例如，进度为100或状态变为完成/失败）时，通过 sys_event_bus_pub 函数发布这个新事件。
+#include "your_event_definitions.h" // 引入事件定义
+#include "Manager/ISysEventBus.h" // 引入Action定义
 
-// ... 其他 include 和函数实现 ...
+// 假设这是信号发送函数的声明
+void sys_event_bus_pub(unsigned int code, int action);
 
-/* ===================================================================
- * Refactored Core Logic: Perform Flush and Archive (Thread-Safe)
- * ===================================================================*/
-
-/**
- * @brief 执行数据收集、刷写和压缩归档的核心逻辑。
- * 这个函数是线程安全的，使用互斥锁来防止并发执行。
- */
-void CollectDaemon::performFlushAndArchive()
+int32_t sc_gvmp_proj_callback(struct proj_push_data *data)
 {
-    // 使用 lock_guard 保证在任何情况下都能正确解锁互斥体
-    std::lock_guard<std::mutex> lock(flush_mutex_);
+	struct sc_push_data sc_data = {0};
+	struct product_data *rt = get_product_data();
 
-    INFO("Flush and Archive operation: start.");
-
-    // 1. 收集最新数据
-    INFO("Reading all plugin data...");
-    PluginService::Instance().readAll();
-    
-    // 2. 短暂休眠 (可选，但根据您之前的代码保留)
-    // 给予分发器（如果异步）处理队列中数据的时间
-    usleep(100000); // 100ms
-
-    // 3. 将所有插件的缓存数据刷写到磁盘
-    INFO("Flushing all plugin data...");
-    PluginService::Instance().flushAll();
-
-    // 4. 压缩归档 BaseDir 目录
-    std::string baseDir = ConfigManager::Instance().GetGlobalOption("BaseDir");
-    if (baseDir.empty()) {
-        INFO("BaseDir is not configured, skipping archival.");
-        INFO("Flush and Archive operation: done.");
-        return;
-    }
-
-    // 规范化路径：移除尾部的斜杠'/'
-    std::string cleanBaseDir = baseDir;
-    while (!cleanBaseDir.empty() && cleanBaseDir.back() == '/') {
-        cleanBaseDir.pop_back();
-    }
-
-    if (cleanBaseDir.empty()) {
-        ERROR("BaseDir becomes empty after cleaning: %s", baseDir.c_str());
-        return;
-    }
-
-    size_t lastSlashPos = cleanBaseDir.find_last_of('/');
-    if (lastSlashPos == std::string::npos) {
-        ERROR("Invalid BaseDir format. Cannot find parent directory: %s", baseDir.c_str());
-        return;
-    }
-
-    std::string parentDir = cleanBaseDir.substr(0, lastSlashPos);
-    std::string targetDirName = cleanBaseDir.substr(lastSlashPos + 1);
-    if (parentDir.empty()) parentDir = "/";
-
-    // 构建压缩包路径和名称
-    time_t now = time(nullptr);
-    char timeStr[20];
-    strftime(timeStr, sizeof(timeStr), "%Y%m%d_%H%M%S", localtime(&now));
-    std::string archivePath = parentDir + "/collect_data_" + timeStr + ".tar.gz";
-
-    // 构建健壮的 tar 命令
-    std::string cmd = "tar -zcf " + archivePath + " -C " + parentDir + " " + targetDirName;
-    
-    INFO("Executing compression command: %s", cmd.c_str());
-    int ret = system(cmd.c_str());
-    
-    if (ret != 0) {
-        if (WIFEXITED(ret)) {
-            ERROR("Failed to compress BaseDir. Command exited with status %d: %s", WEXITSTATUS(ret), cmd.c_str());
-        } else {
-            ERROR("Failed to compress BaseDir. Command terminated abnormally: %s", cmd.c_str());
-        }
-    } else {
-        INFO("Successfully compressed BaseDir to: %s", archivePath.c_str());
-    }
-
-    INFO("Flush and Archive operation: done.");
-}
-
-
-/* ===================================================================
- * Updated Loop and Signal Handler
- * ===================================================================*/
-
-int CollectDaemon::loop() 
-{
-    // ... (循环开始部分代码不变) ...
-
-    while (running_.load()) 
+	if (NULL == data)
 	{
-        if (opt_.test_readall) 
+		LOGE("sc_gvmp_proj_callback proj_push_data point is NULL\r\n");
+		return -1;
+	}
+	
+	sc_data.status = data->status;
+	sc_data.module_id = 0;
+	sc_data.template_id = 0;
+	sc_data.rate_of_process = data->progress;
+
+	LOGI("sc_gvmp_proj_callback %d %d %d\n", data->cmd_data, sc_data.status, sc_data.rate_of_process);		
+
+	if (data->cmd_data == COMIFB_LPRP) /**< 方案加载进度*/
+	{
+		// --- 新增逻辑 ---
+		// 当进度开始时 (progress == 0)，发送开始事件
+		if (data->progress == 0) 
 		{
-            // ... (不变) ...
-            break;
-        }
-		else if (opt_.test_flushall)
-		{
-            // --- 修改点 ---
-            // 直接调用重构后的核心函数
-            performFlushAndArchive();
-            // --- 修改结束 ---
-            break; // test_flushall 执行一次后就退出
+			LOGI("Scheme loading started.\n");
+			sys_event_bus_pub(SYS_EVENT_SCHEME_LOADING, Manager::ISysEventBus::Action::AC_START);
 		}
+		
+		// 当进度完成时 (progress == 100)，发送停止事件
+		// 您也可以根据 data->status 来判断加载成功或失败，并发送停止事件
+		if (data->progress == 100) 
+		{
+			LOGI("Scheme loading finished.\n");
+			sys_event_bus_pub(SYS_EVENT_SCHEME_LOADING, Manager::ISysEventBus::Action::AC_STOP);
+		}
+        // --- 新增逻辑结束 ---
 
-        // ... (主循环的 readAll 和 sleep 部分不变) ...
+		sc_gvmp_cmd_push((uint8_t *)&sc_data, sizeof(sc_data), data->cmd_data);
+	}
+    
+    // 如果有其他类型的回调数据，也可能需要处理
+	// ...
+
+	return 0;
+}
+
+步骤 3: 在 CTriggerStatusMonitor 中处理新事件
+现在，我们需要让 CTriggerStatusMonitor 能够响应该新事件。
+ * 增加一个状态成员变量：用于标记当前是否正在加载方案。考虑到多线程环境，使用 std::atomic<bool> 是最安全的选择。
+ * 增加一个新的事件处理函数：专门用来处理 SYS_EVENT_SCHEME_LOADING 事件。
+ * 订阅新事件：在初始化时，除了订阅 onAppEvent，也要订阅这个新的处理函数。
+ * 修改 onAppEvent：在函数开头检查新添加的状态变量，如果正在加载，则直接返回。
+下面是修改后的 CTriggerStatusMonitor 类定义和实现：
+CTriggerStatusMonitor.h (头文件)
+#include <atomic> // 需要引入 atomic 头文件
+
+class CTriggerStatusMonitor 
+{
+public:
+    // ... 构造函数、析构函数等 ...
+    void init(Manager::ISysEventBus* eventHandler); // 假设在init中订阅
+
+private:
+    void onAppEvent(const Manager::ISysEventBus::Event &eveInfo);
+    
+    // 新增：方案加载事件的处理函数
+    void onSchemeLoadEvent(const Manager::ISysEventBus::Event &eveInfo);
+
+    // ... 其他成员变量 ...
+
+    // 新增：用于标记方案加载状态的原子变量
+    std::atomic<bool> m_isSchemeLoading; 
+};
+
+CTriggerStatusMonitor.cpp (实现文件)
+#include "your_event_definitions.h" // 引入事件定义
+
+// 在构造函数中初始化
+CTriggerStatusMonitor::CTriggerStatusMonitor()
+ : m_isSchemeLoading(false) // 默认初始化为 false
+{
+    // ...
+}
+
+// 在初始化函数中订阅所有事件
+void CTriggerStatusMonitor::init(Manager::ISysEventBus* eventHandler)
+{
+    // 订阅原有的事件
+    eventHandler->sub(Manager::ISysEventBus::Proc(&CTriggerStatusMonitor::onAppEvent, this));
+    
+    // 新增：订阅方案加载事件
+    eventHandler->sub(Manager::ISysEventBus::Proc(&CTriggerStatusMonitor::onSchemeLoadEvent, this));
+}
+
+// 新增的事件处理函数实现
+void CTriggerStatusMonitor::onSchemeLoadEvent(const Manager::ISysEventBus::Event &eveInfo)
+{
+    if (eveInfo.code == SYS_EVENT_SCHEME_LOADING)
+    {
+        if (eveInfo.action == Manager::ISysEventBus::Action::AC_START)
+        {
+            m_isSchemeLoading = true;
+            LOGI("CTriggerStatusMonitor: Detected scheme loading START. Status changes will be blocked.\n");
+            // 您甚至可以在这里强制将状态设置为BUSY，以防止在加载开始前有其他事件改变状态
+            // setStatus(TRIGGER_STATUS_BUSY); 
+        }
+        else if (eveInfo.action == Manager::ISysEventBus::Action::AC_STOP)
+        {
+            m_isSchemeLoading = false;
+            LOGI("CTriggerStatusMonitor: Detected scheme loading STOP. Status changes are now allowed.\n");
+            // 加载结束后，可以根据当前系统状态决定是否需要立即更新一次Trigger状态，
+            // 或者等待下一次 onAppEvent 事件来自然更新。通常等待是更好的选择。
+        }
     }
-
-    return exit_status;
 }
 
-// SIGUSR1 信号处理线程函数
-void *CollectDaemon::flushThread(void *)
-{
-    // --- 修改点 ---
-    // 这个线程的唯一职责就是调用单例的那个核心函数
-	CollectDaemon::instance().performFlushAndArchive();
-    // --- 修改结束 ---
-	return nullptr;
+
+// 修改原有的 onAppEvent 函数
+void CTriggerStatusMonitor::onAppEvent(const Manager::ISysEventBus::Event &eveInfo)
+{	
+    // --- 新增逻辑 ---
+    // 在函数入口处增加保护判断
+    if (m_isSchemeLoading)
+    {
+        // 如果正在加载方案，则记录日志并直接返回，不执行任何状态修改
+        LOGI("Scheme is loading, onAppEvent is ignored.\n");
+        return;
+    }
+    // --- 新增逻辑结束 ---
+
+	int32_t error_code = 0;
+	int32_t trigger_mode = TRIGGER_ON, trigger_source = TRIGGER_SOFTWARE;
+	
+	error_code = appApiGetIntParam(TRIGGER_MODE_PARAM, &trigger_mode);
+	if(error_code != 0)
+	{
+		LOGE("get trigger source error ret = %d\n", error_code);
+	}
+	error_code = appApiGetIntParam(TRIGGER_SOURCE_PARAM, &trigger_source);
+	if(error_code != 0)
+	{
+		LOGE("get trigger source error ret = %d\n", error_code);
+	}
+
+	//内触发下保证一直busy
+	if (SCHEME_RUN_MODE_EDIT != m_schemeEditStatus && trigger_mode == TRIGGER_ON && focus_get_status() == AFS_FINISH)
+	{
+		if (eveInfo.code == SYS_EVENT_BS_FLOW_END)
+		{
+			if(eveInfo.action == Manager::ISysEventBus::Action::AC_START)
+			{				
+				setStatus(TRIGGER_STATUS_BUSY);				
+			}
+			else if(eveInfo.action == Manager::ISysEventBus::Action::AC_STOP)
+			{
+				if(SCHEME_RUN_RUN == m_schemeRunStatus)
+				{
+					//保证外触发-每次方案运行后复位到Ready
+					setStatus(TRIGGER_STATUS_READY);
+				}
+				else if(SCHEME_RUN_SINGAL == m_schemeRunStatus)
+				{
+					setStatus(TRIGGER_STATUS_DEFAULT);
+				}
+			}
+		}
+	}
 }
 
-// SIGUSR1 信号处理器 (不变)
-void CollectDaemon::sigUsr1Handler(int)
-{
-	pthread_t th; 
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-	// flushThread 的内容已经简化，但这里的调用方式不变
-	pthread_create(&th, &attr, flushThread, nullptr);
-	pthread_attr_destroy(&attr);
-}
-
-// ... (文件其余部分代码) ...
-
+设计思路与优势
+ * 解耦 (Decoupling)：CTriggerStatusMonitor 不需要知道是哪个具体的回调函数（sc_gvmp_proj_callback）触发了“方案加载”。它只关心 SYS_EVENT_SCHEME_LOADING 这个系统级的事件。未来如果有其他模块也需要加载方案，它们只需同样发布这个事件即可，CTriggerStatusMonitor 无需任何改动。
+ * 单一职责原则 (Single Responsibility Principle)：每个函数职责更清晰。onAppEvent 负责处理流程结束事件，onSchemeLoadEvent 负责处理方案加载事件。sc_gvmp_proj_callback 负责处理投影数据并通告系统状态。
+ * 线程安全 (Thread Safety)：通过使用 std::atomic<bool>，可以确保在多线程环境中 m_isSchemeLoading 标志的读写是原子的，避免了数据竞争问题。
+ * 可扩展性 (Scalability)：如果未来有其他模块也需要知道“方案是否正在加载”，它们只需要订阅 SYS_EVENT_SCHEME_LOADING 事件即可，而无需修改现有逻辑。
+按照以上步骤修改您的代码，即可实现所需功能。这个方案在架构上是清晰且健壮的。
