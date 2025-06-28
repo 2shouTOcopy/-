@@ -1,194 +1,159 @@
-好的，理解了您的需求。您希望在 sc_gvmp_proj_callback 处理方案加载（COMIFB_LPRP）的过程中，发送一个事件。然后，CTriggerStatusMonitor 模块接收这个事件，并在此期间阻止 onAppEvent 函数对触发器状态（setStatus）的修改。
-这是一个非常好的设计思路，通过事件总线（Event Bus）来解耦模块间的直接依赖，符合高内聚、低耦合的架构原则。
-下面我将为您分步展示如何实现这个逻辑。
-步骤 1: 定义新的系统事件
-首先，我们需要定义一个新的事件来表示“方案加载”这个状态。这个定义通常放在一个全局的头文件中，例如 ISysEventBus.h 或者一个专门的 event_codes.h 文件。
-假设您的事件定义文件中已有 SYS_EVENT_BS_FLOW_END，我们可以在此基础上增加一个 SYS_EVENT_SCHEME_LOADING。
-// in your_event_definitions.h
-// ... other event codes
-const unsigned int SYS_EVENT_BS_FLOW_END = 0x1001; // 示例值
-const unsigned int SYS_EVENT_SCHEME_LOADING = 0x1002; // 新增：方案加载事件
+以下概要设计基于 2shouTOcopy/collect 仓库全部源代码（截至 2025-06-28 main 分支）。文档按照《系统收集模块概要设计模板》扩展，给出模块清单、接口、异常策略、性能与可扩展方案，并在每段末尾标注源码出处。
 
-步骤 2: 在回调函数中发布事件
-现在，修改 sc_gvmp_proj_callback 函数。当方案加载开始（例如，进度为0）和结束（例如，进度为100或状态变为完成/失败）时，通过 sys_event_bus_pub 函数发布这个新事件。
-#include "your_event_definitions.h" // 引入事件定义
-#include "Manager/ISysEventBus.h" // 引入Action定义
+⸻
 
-// 假设这是信号发送函数的声明
-void sys_event_bus_pub(unsigned int code, int action);
+3 软件功能及模块划分
 
-int32_t sc_gvmp_proj_callback(struct proj_push_data *data)
-{
-	struct sc_push_data sc_data = {0};
-	struct product_data *rt = get_product_data();
+本节补充完整功能描述，引用具体实现要点。
 
-	if (NULL == data)
-	{
-		LOGE("sc_gvmp_proj_callback proj_push_data point is NULL\r\n");
-		return -1;
-	}
-	
-	sc_data.status = data->status;
-	sc_data.module_id = 0;
-	sc_data.template_id = 0;
-	sc_data.rate_of_process = data->progress;
+3.2.1 配置管理模块
+	•	功能：负责解析 collect.conf 与包含式文件（如 types.db），构造一棵 OConfigItem 配置树并为其他模块提供查询／热更新。解析入口位于 ConfigParser::parseFile ➜ parseStream → parseBlock 流程，支持字符串、数字、布尔三种值类型。 ￼
+	•	接口：ConfigManager::get(key)、ConfigManager::getGlobalOption(key) 以及按节点枚举 API（后续详细设计）。
+	•	特点：
+	1.	使用 Any-cast 保存动态类型，避免 void*；
+	2.	通过父指针维护层级关系，可在运行时递归下发插件私有段；
+	3.	预留 inotify 热加载钩子，变更后向所有插件广播 config() 回调重载。
 
-	LOGI("sc_gvmp_proj_callback %d %d %d\n", data->cmd_data, sc_data.status, sc_data.rate_of_process);		
+3.2.2 插件管理模块
+	•	功能：动态加载/卸载 .so，调用插件生命周期函数并对外暴露统一分发入口。 ￼
+	•	接口：
+	•	ModuleLoader::Load(name,global) → dlopen + dlsym(CreateModule)；
+	•	PluginService::initAll / readAllOnce / flushAll / shutdownAll; ￼ ￼
+	•	dispatchValues / dispatchMultivalues 进行数据上报。
+	•	特点：
+	•	线程安全：公有方法包裹 std::mutex；
+	•	插件基类 CAbstractUserModule 定义 12 个可选钩子（read / write / flush / shutdown ...）。 ￼
+	•	插件文件名与 <plugin>.so 一致，CreateModule/DestroyModule 导出函数由编译规则自动生成。
 
-	if (data->cmd_data == COMIFB_LPRP) /**< 方案加载进度*/
-	{
-		// --- 新增逻辑 ---
-		// 当进度开始时 (progress == 0)，发送开始事件
-		if (data->progress == 0) 
-		{
-			LOGI("Scheme loading started.\n");
-			sys_event_bus_pub(SYS_EVENT_SCHEME_LOADING, Manager::ISysEventBus::Action::AC_START);
-		}
-		
-		// 当进度完成时 (progress == 100)，发送停止事件
-		// 您也可以根据 data->status 来判断加载成功或失败，并发送停止事件
-		if (data->progress == 100) 
-		{
-			LOGI("Scheme loading finished.\n");
-			sys_event_bus_pub(SYS_EVENT_SCHEME_LOADING, Manager::ISysEventBus::Action::AC_STOP);
-		}
-        // --- 新增逻辑结束 ---
+3.2.3 调度模块
+	•	功能：周期触发所有 reader-plugin 的 read()，将 value_list_t 投递至结果分发器。
+	•	实现：当前版本内嵌在 PluginService::readAll() 主循环，以 sleep(interval) 简易定时；未来可替换为 ThreadPool+TimerWheel。
+	•	异常控制：单插件超时仅熔断该实例，主循环继续。
 
-		sc_gvmp_cmd_push((uint8_t *)&sc_data, sizeof(sc_data), data->cmd_data);
-	}
-    
-    // 如果有其他类型的回调数据，也可能需要处理
-	// ...
+3.2.4 数据采集插件
+	•	目录：module/<name>/*.cpp；每个插件继承 CAbstractUserModule 并重写必要接口。
+	•	已实现插件（见 3.3 列表）：
+	•	cpu 读取 /proc/stat，支持百分比和绝对值两种输出； ￼
+	•	memory 解析 /proc/meminfo 并支持 absolute / percentage 多值写出； ￼
+	•	network 提供一次性诊断 flush()，整合 ip, netstat, arp 等命令； ￼
+	•	uptime, df, thread, dmesg 等基础插件同目录。
 
-	return 0;
-}
+3.2.5 数据处理与存储模块
+	•	现状：读值直接进入 writer-plugin；暂无聚合／告警逻辑；
+	•	预留：在 RstDispatcher::enqueue() 之后插入 filter chain 处理器列表。 ￼
 
-步骤 3: 在 CTriggerStatusMonitor 中处理新事件
-现在，我们需要让 CTriggerStatusMonitor 能够响应该新事件。
- * 增加一个状态成员变量：用于标记当前是否正在加载方案。考虑到多线程环境，使用 std::atomic<bool> 是最安全的选择。
- * 增加一个新的事件处理函数：专门用来处理 SYS_EVENT_SCHEME_LOADING 事件。
- * 订阅新事件：在初始化时，除了订阅 onAppEvent，也要订阅这个新的处理函数。
- * 修改 onAppEvent：在函数开头检查新添加的状态变量，如果正在加载，则直接返回。
-下面是修改后的 CTriggerStatusMonitor 类定义和实现：
-CTriggerStatusMonitor.h (头文件)
-#include <atomic> // 需要引入 atomic 头文件
+3.2.6 数据输出插件
+	•	实现：
+	•	csv——将 value_list_t 落盘为分表 CSV；支持 stdout / stderr / file 三种模式； ￼
+	•	logfile——面向诊断的纯文本输出（TODO）。
+	•	特点：writer 插件仅需实现 write()，其余接口可空实现；由 RstDispatcher 统一异步调用，防止阻塞采集线程。
 
-class CTriggerStatusMonitor 
-{
-public:
-    // ... 构造函数、析构函数等 ...
-    void init(Manager::ISysEventBus* eventHandler); // 假设在init中订阅
+⸻
 
-private:
-    void onAppEvent(const Manager::ISysEventBus::Event &eveInfo);
-    
-    // 新增：方案加载事件的处理函数
-    void onSchemeLoadEvent(const Manager::ISysEventBus::Event &eveInfo);
+3.3 模块划分列表
 
-    // ... 其他成员变量 ...
+编号	名称	形态	简述
+PD-001	ModuleLoader	单例类	.so 动态装载、符号解析、实例缓存
+PD-002	PluginService	单例类	插件生命周期协调、主循环调度、日志封装
+PD-003	RstDispatcher	单例类	value_list_t 环形缓冲 + 工作线程异步写出
+PD-004	ConfigManager	单例类	上层配置缓存与插件参数查询
+PD-005	OConfigParser	组件类	collect.conf 解析器（递归下降）
+PD-006	CpuModule	采集插件	读取 CPU 11 个状态字段，支持百分比
+PD-007	MemoryModule	采集插件	解析 /proc/meminfo，支持多点/百分比
+PD-008	NetworkModule	辅助插件	flush() 输出网卡诊断报告
+PD-009	UptimeModule	采集插件	上报系统启动时长
+PD-010	CsvModule	输出插件	value→CSV 落盘，支持文件/Stdout
+PD-011	Utils	库	字符串、安全分配、格式化、时间工具
+PD-012	collectd-main	可执行	整体守护进程入口与 CLI 解析
 
-    // 新增：用于标记方案加载状态的原子变量
-    std::atomic<bool> m_isSchemeLoading; 
+
+⸻
+
+3.4 可测试性与维护
+	1.	UT：对 ModuleLoader、PluginService、OConfigParser 编写 GoogleTest；使用 LD_PRELOAD mock dlopen/dlsym。
+	2.	IT：Docker-based pipeline 模拟 /proc 和网络栈，跑 cpu/memory 真值比对。
+	3.	CI：GitHub Actions 触发 make all && ctest，并运行 cppcheck + clang-tidy 规则。
+	4.	日志：宏 ERROR/WARNING/INFO/DEBUG 注入日志等级，便于集中采集。 ￼
+
+⸻
+
+4 模块说明（示例）
+
+4.1 PD-001 ModuleLoader
+
+4.1.1 功能描述
+
+ModuleLoader 负责在运行时寻找插件目录(SetDir)→拼接路径→调用 dlopen，随后通过 pfnCreateModule 创建实例并保存到 m_openLibs（std::map<std::string, LibInfo>）。线程安全由 m_mutex 保护。 ￼
+
+4.1.2 关键数据结构
+
+struct LibInfo {
+  void*        handle;   // dlopen 句柄
+  pfnCreateModule fnCreateOpt;
+  pfnDestroyModule fnDestroyOpt;
+  CAbstractUserModule* pUserModuleImpl;
 };
 
-CTriggerStatusMonitor.cpp (实现文件)
-#include "your_event_definitions.h" // 引入事件定义
+GetLoadedPluginNames() 便于 CLI 展示当前已激活插件。
 
-// 在构造函数中初始化
-CTriggerStatusMonitor::CTriggerStatusMonitor()
- : m_isSchemeLoading(false) // 默认初始化为 false
-{
-    // ...
-}
+4.1.3 时序
 
-// 在初始化函数中订阅所有事件
-void CTriggerStatusMonitor::init(Manager::ISysEventBus* eventHandler)
-{
-    // 订阅原有的事件
-    eventHandler->sub(Manager::ISysEventBus::Proc(&CTriggerStatusMonitor::onAppEvent, this));
-    
-    // 新增：订阅方案加载事件
-    eventHandler->sub(Manager::ISysEventBus::Proc(&CTriggerStatusMonitor::onSchemeLoadEvent, this));
-}
+main() ─┬─> ModuleLoader::Load("cpu")
+        │       ├─ dlopen("cpu.so", RTLD_NOW)
+        │       ├─ dlsym("CreateModule")
+        │       └─ 插入 m_openLibs
+        └─> PluginService::initAll()
 
-// 新增的事件处理函数实现
-void CTriggerStatusMonitor::onSchemeLoadEvent(const Manager::ISysEventBus::Event &eveInfo)
-{
-    if (eveInfo.code == SYS_EVENT_SCHEME_LOADING)
-    {
-        if (eveInfo.action == Manager::ISysEventBus::Action::AC_START)
-        {
-            m_isSchemeLoading = true;
-            LOGI("CTriggerStatusMonitor: Detected scheme loading START. Status changes will be blocked.\n");
-            // 您甚至可以在这里强制将状态设置为BUSY，以防止在加载开始前有其他事件改变状态
-            // setStatus(TRIGGER_STATUS_BUSY); 
-        }
-        else if (eveInfo.action == Manager::ISysEventBus::Action::AC_STOP)
-        {
-            m_isSchemeLoading = false;
-            LOGI("CTriggerStatusMonitor: Detected scheme loading STOP. Status changes are now allowed.\n");
-            // 加载结束后，可以根据当前系统状态决定是否需要立即更新一次Trigger状态，
-            // 或者等待下一次 onAppEvent 事件来自然更新。通常等待是更好的选择。
-        }
-    }
-}
+其余 PD-002~PD-012 说明请在详细设计阶段展开，包括协作顺序图。
+
+⸻
+
+5 接口设计
+
+5.1 外部（对主程序 / 插件作者公开）
+
+接口	原型	说明
+插件创建	extern "C" CAbstractUserModule* CreateModule();	返回派生实例；由 Macro 自动导出
+采集回调	int read()	被调度器周期调用；返回 0 成功
+数据分发	int PluginService::dispatchValues(const value_list_t*)	立即入队异步写出
+写回调	int write(const data_set_t*, const value_list_t*)	writer 插件实现
+热刷新	int flush()	支持诊断类插件一次性输出
+配置查询	ConfigManager::get(key)	字符串接口，内部做类型转换
+
+数据结构 value_list_t / data_set_t / notification_t 定义于 ModuleDef.h。 ￼
+
+⸻
+
+6 异常处理
+
+场景	处理策略
+dlopen 失败	Load() 返回 -1 并写 ERROR(...); 不影响继续加载其他插件
+插件 read() 抛异常	捕获后计数并在调度层熔断；最多重试 N=3 次
+队列满	RstDispatcher::enqueue 返回 EAGAIN；调度器记录丢包计数
+I/O 错误（CSV 写盘）	写日志 + 返回 -1；数据行丢弃但不终止进程  ￼
 
 
-// 修改原有的 onAppEvent 函数
-void CTriggerStatusMonitor::onAppEvent(const Manager::ISysEventBus::Event &eveInfo)
-{	
-    // --- 新增逻辑 ---
-    // 在函数入口处增加保护判断
-    if (m_isSchemeLoading)
-    {
-        // 如果正在加载方案，则记录日志并直接返回，不执行任何状态修改
-        LOGI("Scheme is loading, onAppEvent is ignored.\n");
-        return;
-    }
-    // --- 新增逻辑结束 ---
+⸻
 
-	int32_t error_code = 0;
-	int32_t trigger_mode = TRIGGER_ON, trigger_source = TRIGGER_SOFTWARE;
-	
-	error_code = appApiGetIntParam(TRIGGER_MODE_PARAM, &trigger_mode);
-	if(error_code != 0)
-	{
-		LOGE("get trigger source error ret = %d\n", error_code);
-	}
-	error_code = appApiGetIntParam(TRIGGER_SOURCE_PARAM, &trigger_source);
-	if(error_code != 0)
-	{
-		LOGE("get trigger source error ret = %d\n", error_code);
-	}
+7 性能优化
+	1.	环形无锁队列：RstDispatcher 使用 std::vector<shared_ptr> + head/tail 原子索引，单写多读；减少锁冲突。 ￼
+	2.	批量写：writer 插件支持连续 n 条聚合为一次 fwrite；CSV 中表现为 fprintf 批处理。
+	3.	按需采集：对诊断型插件，仅在 SIGUSR1 调用 flush()，减少 CPU 消耗。
+	4.	最小拷贝：value_list_t 上报时使用 shared_ptr 克隆函数 vl_clone()，避免大 struct 深拷贝。 ￼
 
-	//内触发下保证一直busy
-	if (SCHEME_RUN_MODE_EDIT != m_schemeEditStatus && trigger_mode == TRIGGER_ON && focus_get_status() == AFS_FINISH)
-	{
-		if (eveInfo.code == SYS_EVENT_BS_FLOW_END)
-		{
-			if(eveInfo.action == Manager::ISysEventBus::Action::AC_START)
-			{				
-				setStatus(TRIGGER_STATUS_BUSY);				
-			}
-			else if(eveInfo.action == Manager::ISysEventBus::Action::AC_STOP)
-			{
-				if(SCHEME_RUN_RUN == m_schemeRunStatus)
-				{
-					//保证外触发-每次方案运行后复位到Ready
-					setStatus(TRIGGER_STATUS_READY);
-				}
-				else if(SCHEME_RUN_SINGAL == m_schemeRunStatus)
-				{
-					setStatus(TRIGGER_STATUS_DEFAULT);
-				}
-			}
-		}
-	}
-}
+⸻
 
-设计思路与优势
- * 解耦 (Decoupling)：CTriggerStatusMonitor 不需要知道是哪个具体的回调函数（sc_gvmp_proj_callback）触发了“方案加载”。它只关心 SYS_EVENT_SCHEME_LOADING 这个系统级的事件。未来如果有其他模块也需要加载方案，它们只需同样发布这个事件即可，CTriggerStatusMonitor 无需任何改动。
- * 单一职责原则 (Single Responsibility Principle)：每个函数职责更清晰。onAppEvent 负责处理流程结束事件，onSchemeLoadEvent 负责处理方案加载事件。sc_gvmp_proj_callback 负责处理投影数据并通告系统状态。
- * 线程安全 (Thread Safety)：通过使用 std::atomic<bool>，可以确保在多线程环境中 m_isSchemeLoading 标志的读写是原子的，避免了数据竞争问题。
- * 可扩展性 (Scalability)：如果未来有其他模块也需要知道“方案是否正在加载”，它们只需要订阅 SYS_EVENT_SCHEME_LOADING 事件即可，而无需修改现有逻辑。
-按照以上步骤修改您的代码，即可实现所需功能。这个方案在架构上是清晰且健壮的。
+8 可扩展性设计
+
+方向	方案
+新采集项	新建 module/foo/foo.cpp，继承基类，编译后放入 modules 目录并在 collect.conf 添加 LoadPlugin "foo"
+新输出后端	实现 write() 将数据送至 Prometheus Pushgateway / InfluxDB Line-Protocol；无需改动调度器
+配置热加载	在 ConfigManager 监听 inotify；触发后调用每插件 config() 更新
+云端集中监控	追加 grpc_writer 插件，将 value_list_t 转 protobuf stream
+
+
+⸻
+
+结语
+
+以上文档覆盖整体架构→核心模块→接口→异常→性能→扩展六大维度，并结合源码细节给出引用。可直接纳入项目 High-Level Design，后续如需类图或时序图，可进一步细化。
