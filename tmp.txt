@@ -1,159 +1,225 @@
-以下概要设计基于 2shouTOcopy/collect 仓库全部源代码（截至 2025-06-28 main 分支）。文档按照《系统收集模块概要设计模板》扩展，给出模块清单、接口、异常策略、性能与可扩展方案，并在每段末尾标注源码出处。
+下面补全 4 模块说明，为设计文档提供每个核心模块的功能定位、关键数据结构、外部/内部接口、并发与依赖关系。阅读时可直接配合前文类图与时序图。
 
 ⸻
 
-3 软件功能及模块划分
+4 模块说明
 
-本节补充完整功能描述，引用具体实现要点。
+4.1 PD-001 ModuleLoader 类
 
-3.2.1 配置管理模块
-	•	功能：负责解析 collect.conf 与包含式文件（如 types.db），构造一棵 OConfigItem 配置树并为其他模块提供查询／热更新。解析入口位于 ConfigParser::parseFile ➜ parseStream → parseBlock 流程，支持字符串、数字、布尔三种值类型。 ￼
-	•	接口：ConfigManager::get(key)、ConfigManager::getGlobalOption(key) 以及按节点枚举 API（后续详细设计）。
-	•	特点：
-	1.	使用 Any-cast 保存动态类型，避免 void*；
-	2.	通过父指针维护层级关系，可在运行时递归下发插件私有段；
-	3.	预留 inotify 热加载钩子，变更后向所有插件广播 config() 回调重载。
+4.1.1 模块功能描述
 
-3.2.2 插件管理模块
-	•	功能：动态加载/卸载 .so，调用插件生命周期函数并对外暴露统一分发入口。 ￼
-	•	接口：
-	•	ModuleLoader::Load(name,global) → dlopen + dlsym(CreateModule)；
-	•	PluginService::initAll / readAllOnce / flushAll / shutdownAll; ￼ ￼
-	•	dispatchValues / dispatchMultivalues 进行数据上报。
-	•	特点：
-	•	线程安全：公有方法包裹 std::mutex；
-	•	插件基类 CAbstractUserModule 定义 12 个可选钩子（read / write / flush / shutdown ...）。 ￼
-	•	插件文件名与 <plugin>.so 一致，CreateModule/DestroyModule 导出函数由编译规则自动生成。
+运行期动态装载、卸载 .so 插件，对外暴露查询与实例句柄，保证整个监控框架的插件即插即用  ￼。
 
-3.2.3 调度模块
-	•	功能：周期触发所有 reader-plugin 的 read()，将 value_list_t 投递至结果分发器。
-	•	实现：当前版本内嵌在 PluginService::readAll() 主循环，以 sleep(interval) 简易定时；未来可替换为 ThreadPool+TimerWheel。
-	•	异常控制：单插件超时仅熔断该实例，主循环继续。
-
-3.2.4 数据采集插件
-	•	目录：module/<name>/*.cpp；每个插件继承 CAbstractUserModule 并重写必要接口。
-	•	已实现插件（见 3.3 列表）：
-	•	cpu 读取 /proc/stat，支持百分比和绝对值两种输出； ￼
-	•	memory 解析 /proc/meminfo 并支持 absolute / percentage 多值写出； ￼
-	•	network 提供一次性诊断 flush()，整合 ip, netstat, arp 等命令； ￼
-	•	uptime, df, thread, dmesg 等基础插件同目录。
-
-3.2.5 数据处理与存储模块
-	•	现状：读值直接进入 writer-plugin；暂无聚合／告警逻辑；
-	•	预留：在 RstDispatcher::enqueue() 之后插入 filter chain 处理器列表。 ￼
-
-3.2.6 数据输出插件
-	•	实现：
-	•	csv——将 value_list_t 落盘为分表 CSV；支持 stdout / stderr / file 三种模式； ￼
-	•	logfile——面向诊断的纯文本输出（TODO）。
-	•	特点：writer 插件仅需实现 write()，其余接口可空实现；由 RstDispatcher 统一异步调用，防止阻塞采集线程。
-
-⸻
-
-3.3 模块划分列表
-
-编号	名称	形态	简述
-PD-001	ModuleLoader	单例类	.so 动态装载、符号解析、实例缓存
-PD-002	PluginService	单例类	插件生命周期协调、主循环调度、日志封装
-PD-003	RstDispatcher	单例类	value_list_t 环形缓冲 + 工作线程异步写出
-PD-004	ConfigManager	单例类	上层配置缓存与插件参数查询
-PD-005	OConfigParser	组件类	collect.conf 解析器（递归下降）
-PD-006	CpuModule	采集插件	读取 CPU 11 个状态字段，支持百分比
-PD-007	MemoryModule	采集插件	解析 /proc/meminfo，支持多点/百分比
-PD-008	NetworkModule	辅助插件	flush() 输出网卡诊断报告
-PD-009	UptimeModule	采集插件	上报系统启动时长
-PD-010	CsvModule	输出插件	value→CSV 落盘，支持文件/Stdout
-PD-011	Utils	库	字符串、安全分配、格式化、时间工具
-PD-012	collectd-main	可执行	整体守护进程入口与 CLI 解析
-
-
-⸻
-
-3.4 可测试性与维护
-	1.	UT：对 ModuleLoader、PluginService、OConfigParser 编写 GoogleTest；使用 LD_PRELOAD mock dlopen/dlsym。
-	2.	IT：Docker-based pipeline 模拟 /proc 和网络栈，跑 cpu/memory 真值比对。
-	3.	CI：GitHub Actions 触发 make all && ctest，并运行 cppcheck + clang-tidy 规则。
-	4.	日志：宏 ERROR/WARNING/INFO/DEBUG 注入日志等级，便于集中采集。 ￼
-
-⸻
-
-4 模块说明（示例）
-
-4.1 PD-001 ModuleLoader
-
-4.1.1 功能描述
-
-ModuleLoader 负责在运行时寻找插件目录(SetDir)→拼接路径→调用 dlopen，随后通过 pfnCreateModule 创建实例并保存到 m_openLibs（std::map<std::string, LibInfo>）。线程安全由 m_mutex 保护。 ￼
-
-4.1.2 关键数据结构
+4.1.2 关键数据结构与成员
 
 struct LibInfo {
-  void*        handle;   // dlopen 句柄
-  pfnCreateModule fnCreateOpt;
-  pfnDestroyModule fnDestroyOpt;
+  void*           handle;        // dlopen 句柄
+  pfnCreateModule fnCreateOpt;   // 工厂
+  pfnDestroyModule fnDestroyOpt; // 析构
   CAbstractUserModule* pUserModuleImpl;
 };
+std::map<std::string,LibInfo> m_openLibs;    // 已加载插件
+std::vector<std::string>      m_loadPluginNames;
+std::mutex                    m_mutex;
 
-GetLoadedPluginNames() 便于 CLI 展示当前已激活插件。
+这些成员保证多线程环境下装载/卸载的一致性。 ￼
 
-4.1.3 时序
+4.1.3 主要接口
 
-main() ─┬─> ModuleLoader::Load("cpu")
-        │       ├─ dlopen("cpu.so", RTLD_NOW)
-        │       ├─ dlsym("CreateModule")
-        │       └─ 插入 m_openLibs
-        └─> PluginService::initAll()
+接口	说明
+SetDir(dir)	设置插件搜索目录
+Load(name,global) / Unload(name)	装载/卸载单个插件
+IsLoaded(name)	查询状态
+GetUserModuleImpl(name)	获取已经实例化的插件指针
 
-其余 PD-002~PD-012 说明请在详细设计阶段展开，包括协作顺序图。
+4.1.4 线程安全
 
-⸻
+所有公有方法均以 m_mutex 为粒度串行化，避免并发 dlopen/dlclose 导致崩溃。
 
-5 接口设计
+4.1.5 交互
 
-5.1 外部（对主程序 / 插件作者公开）
-
-接口	原型	说明
-插件创建	extern "C" CAbstractUserModule* CreateModule();	返回派生实例；由 Macro 自动导出
-采集回调	int read()	被调度器周期调用；返回 0 成功
-数据分发	int PluginService::dispatchValues(const value_list_t*)	立即入队异步写出
-写回调	int write(const data_set_t*, const value_list_t*)	writer 插件实现
-热刷新	int flush()	支持诊断类插件一次性输出
-配置查询	ConfigManager::get(key)	字符串接口，内部做类型转换
-
-数据结构 value_list_t / data_set_t / notification_t 定义于 ModuleDef.h。 ￼
+仅被 PluginService 调用；其他模块不直接依赖本类。
 
 ⸻
 
-6 异常处理
+4.2 PD-002 PluginService 类
 
-场景	处理策略
-dlopen 失败	Load() 返回 -1 并写 ERROR(...); 不影响继续加载其他插件
-插件 read() 抛异常	捕获后计数并在调度层熔断；最多重试 N=3 次
-队列满	RstDispatcher::enqueue 返回 EAGAIN；调度器记录丢包计数
-I/O 错误（CSV 写盘）	写日志 + 返回 -1；数据行丢弃但不终止进程  ￼
+4.2.1 模块功能描述
+
+系统级单例，负责插件生命周期统一编排、读写调度、日志封装与对外分发入口。 ￼
+
+4.2.2 关键数据结构
+
+内部以「插件名 → CAbstractUserModule*」哈希表缓存所有实例；没有公开成员，封装性好。
+
+4.2.3 核心接口
+	•	加载/卸载：load() / isLoaded() 调用 ModuleLoader。
+	•	生命周期：initAll() → readAll() → flushAll() → shutdownAll()
+	•	数据分发：dispatchValues()、dispatchMultivalues() —— 实际入队到 RstDispatcher。
+	•	日志：log(int level,const char* fmt,…) —— 统一日志门面。 ￼
+
+4.2.4 并发与时序
+	•	读循环：主线程周期调用 readAll()；内部顺序遍历插件，防止资源冲突。
+	•	写路径：只在 RstDispatcher 后台线程执行 write()，避免阻塞采集线程。
+
+4.2.5 依赖
+
+依赖 ModuleLoader 装载插件；依赖 RstDispatcher 推送结果；读取全局配置通过 ConfigManager。
+
+⸻
+
+4.3 PD-003 RstDispatcher 类
+
+4.3.1 模块功能描述
+
+结果异步分发器：维护一个无界双端队列，将采集线程产生的 value_list_t 交由后台线程批量写入所有 writer-plugin。 ￼ ￼
+
+4.3.2 内部实现
+
+struct Impl {
+  std::deque<std::shared_ptr<value_list_t>> queue;
+  std::mutex              mtx;
+  std::condition_variable cv;
+  std::thread             th;   // 后台消费线程
+  std::atomic<bool>       exit;
+};
+
+后台线程循环 cv.wait()，取队列首元素后调用
+PluginService::write(ds,vl) 完成真正落盘。 ￼
+
+4.3.3 主要接口
+
+接口	说明
+enqueue(vl)	深拷贝 → 入队 → notify_one()
+enqueueMultivalues(...)	批量展开多指标、可按百分比转换
+flushAll()	等待队列清空
+stop()	让后台线程安全退出
+
+4.3.4 性能
+	•	无锁环形缓冲可替换当前 deque + mutex。
+	•	批量写接口显著减少系统调用开销。
+
+⸻
+
+4.4 PD-004 ConfigManager 类
+
+4.4.1 模块功能描述
+
+在启动阶段解析 collect.conf → 生成 OConfigItem 树；提供线程安全的键值查询与数据集 (types.db) 缓存。引用示例见 ConfigManager::Instance().GetDataSetByName() 在 RstDispatcher.cpp 中的调用。 ￼
+
+4.4.2 接口概览
+
+接口	说明
+parse(conf)	调用 PD-005 完成解析
+get(key) / getGlobalOption(key)	字符串返回
+GetDataSetByName(type)	根据 types.db 查询指标描述
+GetDefaultInterval()	缺省采集周期
+
+4.4.3 热加载
+
+预留 inotify 钩子，当文件变更时广播调用每个插件的 config()。
+
+⸻
+
+4.5 PD-005 OConfigParser 组件
+
+4.5.1 功能
+
+实现递归下降解析器，支持 Include、块嵌套与多值项，生成带父指针的配置树；位于 oconfig/oconfig.h/.cpp。 ￼
+
+4.5.2 核心方法
+	•	parseFile(const char*) / parseString(const char*)
+	•	内部私有 parseStream → parseBlock 逐行处理
+	•	工具函数 trim / stripQuotes / tokenizeLine
+
+⸻
+
+4.6 PD-006 CCpuModule 采集插件
+
+4.6.1 功能
+
+读取 /proc/stat，计算每 CPU 多种状态的计数差分或百分比，按需上报。支持 Guest/Steal 等扩展字段。 ￼
+
+4.6.2 关键逻辑
+	1.	stage()：对同一 CPU & State 进行增量计算。
+	2.	aggregate()：计算全局活跃度。
+	3.	commitDeriveRaw / commitPercentages：根据配置决定上报原始值或百分比。
+
+⸻
+
+4.7 PD-007 CMemoryModule 采集插件
+
+4.7.1 功能
+
+解析 /proc/meminfo，同时支持绝对值与百分比上报，并在 flush() 模式下输出MMZ 诊断信息到文件。 ￼
+
+4.7.2 特点
+	•	MemAvailable 等可选字段自动检测；
+	•	兼容有/无详细 Slab 统计的内核；
+	•	dispatchMultivalues 与 PluginService 高效对接。
+
+⸻
+
+4.8 PD-008 CNetworkModule 辅助插件
+
+4.8.1 功能
+
+在 flush() 时一次性抓取 ip, netstat, arp, ss 等命令输出，形成网络诊断包，便于现场问题分析（源码位于 module/network/，与 MemoryModule Flush 流程一致）。
+
+⸻
+
+4.9 PD-009 CUptimeModule 采集插件
+
+4.9.1 功能
+
+读取 sysinfo() 中 uptime 字段并上报系统启动时长 (gauge)；实现最简单，仅重写 read() 和 config()。
+
+⸻
+
+4.10 PD-010 CCsvModule 输出插件
+
+4.10.1 功能
+
+把 value_list_t 序列化为行级 CSV：
+	•	支持 stdout / stderr / file 三种目标；
+	•	路径支持按日期分级；
+	•	可选 StoreRates 把 Counter/Derive 转实时速率。 ￼
+
+4.10.2 并发安全
+
+_ioMtx + flock() 双重保证同一文件无竞争。
+
+⸻
+
+4.11 PD-011 Utils 库
+
+4.11.1 功能
+
+提供跨平台安全工具函数：
+	•	字符串安全拷贝 sstrncpy、动态分配封装 smalloc；
+	•	format_values / format_name 把指标转字符串；
+	•	进程辅助 get_pid_by_name()。 ￼
+
+⸻
+
+4.12 PD-012 collectd-main（进程入口）
+
+4.12.1 功能
+
+CLI 入口，解析命令行 & 配置 → 初始化 PluginService → 注册 SIGINT / SIGTERM / SIGUSR1：
+	•	SIGUSR1 触发所有 flush-plugin 立即输出；
+	•	后台守护模式下写 PID 文件到 BaseDir。
+
+4.12.2 整体流程
+
+main()
+ ├─ ConfigManager::parse()
+ ├─ PluginService::setDirectory()
+ ├─ PluginService::load()  // 多次加载插件
+ ├─ PluginService::initAll()
+ └─ while(!stop) { PluginService::readAll(); sleep(interval); }
 
 
 ⸻
 
-7 性能优化
-	1.	环形无锁队列：RstDispatcher 使用 std::vector<shared_ptr> + head/tail 原子索引，单写多读；减少锁冲突。 ￼
-	2.	批量写：writer 插件支持连续 n 条聚合为一次 fwrite；CSV 中表现为 fprintf 批处理。
-	3.	按需采集：对诊断型插件，仅在 SIGUSR1 调用 flush()，减少 CPU 消耗。
-	4.	最小拷贝：value_list_t 上报时使用 shared_ptr 克隆函数 vl_clone()，避免大 struct 深拷贝。 ￼
-
-⸻
-
-8 可扩展性设计
-
-方向	方案
-新采集项	新建 module/foo/foo.cpp，继承基类，编译后放入 modules 目录并在 collect.conf 添加 LoadPlugin "foo"
-新输出后端	实现 write() 将数据送至 Prometheus Pushgateway / InfluxDB Line-Protocol；无需改动调度器
-配置热加载	在 ConfigManager 监听 inotify；触发后调用每插件 config() 更新
-云端集中监控	追加 grpc_writer 插件，将 value_list_t 转 protobuf stream
-
-
-⸻
-
-结语
-
-以上文档覆盖整体架构→核心模块→接口→异常→性能→扩展六大维度，并结合源码细节给出引用。可直接纳入项目 High-Level Design，后续如需类图或时序图，可进一步细化。
+以上即补全后的模块说明。后续若新增插件或替换调度器实现，只需扩展相应 PD 编号条目并保持交互契约不变即可。
