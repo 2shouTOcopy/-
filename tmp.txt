@@ -1,82 +1,387 @@
-**核心原则：** 始终围绕**“最有利于未成年子女”** 的原则展开论述，强调孩子身心健康、情感需求、教育发展、稳定生活环境等核心要素。
+下面给你一个可落地的方案 + 直接可用的C代码，把两个端口（TCP文件传输、UDP心跳）从固定端口改为登录协商后按需启动、并随机端口（1024–65535）。同时给出“节点”发布方式两种选项（本地文件/已有控制通道返回）。你可以直接把代码段嵌到现有工程里。
 
-**一、 论证男方（父亲）不适合抚养的核心要点（劣势）：**
+⸻
 
-1.  **时间精力严重匮乏，无法履行基本监护职责：**
-    *   **核心：** 父亲工作性质（无法接触手机）和极少的休息时间（每月仅2天），**客观上无法**保证与孩子进行日常有效沟通、情感交流，更无法参与孩子的学习辅导、家校联系、课外活动等需要投入时间和精力的监护事务。
-    *   **升级表述：** “父亲因工作性质限制和极少的休息时间，**严重缺乏履行监护职责所需的基本时间和精力保障**，无法满足孩子日常陪伴、学习辅导、情感交流、家校沟通等核心成长需求，将导致孩子实际处于监护缺位状态。”
-    *   **证据建议：** 父亲的工作证明、排班表等。
+整体方案
 
-2.  **家庭环境不利于孩子心理健康：**
-    *   **核心：** 祖父母频繁争吵（基本每天有口角），**制造了紧张、冲突、不稳定的家庭氛围**，对心思敏感的女孩子尤其容易造成心理压力和负面影响，不利于其安全感和健康心理的形成。
-    *   **升级表述：** “孩子目前与祖父母同住，家庭内部存在频繁的争吵冲突（几乎每日发生），**长期处于紧张、不安的家庭环境中，严重不利于孩子（特别是心思敏感的女童）的心理健康、情绪稳定和安全感的建立**。”
-    *   **证据建议：** 如有可能，邻居证言（证明争吵频率）、孩子表达不安的录音/录像（需合法取得且谨慎使用）、心理咨询师意见（如果孩子因此接受过咨询）。
+1）最小固定入口（Auth/Control）
+	•	保留一个固定且受控的认证入口（建议 TCP，亦可复用你现有的管理通道），仅用于：
+	•	登录认证（用户名/密码或签名/HMAC）。
+	•	成功后由设备随机选择两个端口：
+	•	file_tcp_port ∈ [1024, 65535]（TCP监听）
+	•	hb_udp_port ∈ [1024, 65535]（UDP心跳）
+	•	返回给对端：{session_id/token, file_tcp_port, hb_udp_port, ttl}。
+	•	端口未分配前，不启动服务（不bind、不listen、不发送心跳）。
 
-3.  **物质条件无法满足孩子基本成长需求：**
-    *   **核心：** 居住空间拥挤（孩子与大人挤睡），**缺乏独立的睡眠空间和学习环境**，这是保障孩子休息质量、专注学习、培养隐私意识的基本条件。
-    *   **升级表述：** “男方家庭居住条件有限，孩子**缺乏独立的睡眠空间和安静的学习环境**。长期与成年人挤住，不利于保障孩子充足的休息、隐私保护以及专注的学习氛围，无法满足其基本的生活和学习需求。”
-    *   **证据建议：** 实地照片（如可能合法取得）、租房合同或房产证明（显示面积、房间数）。
+2）随机端口绑定策略
+	•	采用“随机挑选 + bind”模式，自行控制范围 1024–65535，避免依赖系统ephemeral range。
+	•	冲突/占用则重试（最多N次）。
+	•	TCP服务启动前 setsockopt(SO_REUSEADDR)；UDP心跳视需求设置 SO_BROADCAST。
 
-4.  **情感陪伴与教育引导严重缺失：**
-    *   **核心：** 假期中孩子处于“自娱自乐、封闭独处”状态，**父亲及家庭未能提供必要的情感陪伴、互动交流和学习引导**，可能导致孩子情感孤独、社交能力发展受限、学业缺乏监督。
-    *   **升级表述：** “在假期等需要家长更多陪伴和引导的时段，孩子常常处于**独自玩耍、封闭独处的状态，缺乏必要的情感互动、社交引导和学习监督**。这种忽视和情感支持的缺失，对孩子的社会性发展和学习动力培养极其不利。”
-    *   **证据建议：** 孩子假期生活的描述（母亲或孩子日记等）、老师反馈（如提到孩子假期后状态变化）。
+3）心跳链路从广播改为定向（建议）
+	•	为满足“随机端口 + 登录后才启用”，建议心跳改为对端定向unicast（你已经知道对端地址）。如果必须广播，请在协商里同时把“发送端口”告诉对端，并让对端按该端口收；否则广播很难让对端“发现”端口变更。
 
-5.  **父女性别差异带来的天然局限与不便：**
-    *   **核心：** 对于心思细腻敏感、即将进入或正处于青春期的女孩，**父亲在生理知识教育、情感沟通、隐私照顾等方面存在天然不便和局限性**。
-    *   **升级表述：** “孩子作为心思细腻敏感的女童，随着年龄增长，在生理发育、心理变化、情感倾诉、隐私保护等方面，**父亲存在天然的性别差异带来的沟通障碍和照顾不便**。母亲作为同性，更能细致入微地体察女儿的需求，提供及时、恰当的引导和照顾，避免尴尬和疏离。”
-    *   **证据建议：** 强调这是普遍认知，重点结合孩子性格（心思细腻敏感）来说明其重要性。
+4）“节点”获取最终端口（两种做法）
+	•	A. 控制通道返回（推荐）： 登录成功后即返回端口；之后也可提供“查询端口”命令。
+	•	B. 本地节点文件： 在设备上写 /run/ports.json（或你指定路径），对端通过既有管理能力（例如SSH/SFTP/REST）读取：
 
-6.  **实际照料人（祖母）身体状况无法胜任：**
-    *   **核心：** 祖母身体状况不佳，无法承受照料孩子（尤其是年幼或需要较多关注的孩子）所需的繁重体力和精力，**实际抚养责任将难以落实**。
-    *   **升级表述：** “目前男方家庭中承担主要照料责任的祖母身体状况不佳，**难以负担照料成长中儿童所需的持续精力和体力**。这必然导致孩子日常照料质量的下降，或在事实上加重父亲本已匮乏的时间和精力负担，形成恶性循环。”
-    *   **证据建议：** 祖母的医疗证明（如有）、日常观察描述。
+{"session":"abcd1234","file_tcp_port":45678,"hb_udp_port":52341,"expires_ms":600000}
 
-**二、 论证女方（母亲）抚养对孩子的显著优势（有利点）：**
 
-1.  **深厚稳定的情感依恋与抚养连续性：**
-    *   **核心：** 孩子从出生到幼儿园主要由母亲抚养，形成了**深厚、稳定的情感依恋和习惯依赖**。维持这种连续性对孩子安全感和心理健康至关重要。
-    *   **升级表述：** “孩子自出生起至学龄前主要由母亲抚养，**形成了深厚且不可替代的情感依恋关系**。由母亲继续抚养，能最大程度地**保持孩子生活环境和情感纽带的稳定性与连续性**，减少父母离异本身带来的冲击，符合孩子的最佳心理需求。”
-    *   **证据建议：** 孩子出生证明、幼儿期照片/视频（显示与母亲互动）、孩子表达对母亲依恋的言语。
 
-2.  **无微不至的照料与深入了解：**
-    *   **核心：** 母亲长期负责孩子的日常生活起居、健康管理（预防针）、学习用品准备等，**对孩子的生活习惯、身体状况、学习特点有着最细致、最全面的了解**。
-    *   **升级表述：** “母亲长期全方位负责孩子的日常生活照料（包括四季衣物、学习用品）、健康管理（如疫苗接种）等，**对孩子的生活习惯、身体特质、学习需求有着无可比拟的细致了解和丰富经验**，能提供最贴心、最符合孩子个体需求的照顾。”
-    *   **证据建议：** 购物记录（衣物、学习用品）、疫苗本（母亲签字）、日常记录本。
+若你已有“节点”的明确含义（比如特定共享内存、sysfs、mq、KV存储），把write_ports_node()换成你的实现即可。
 
-3.  **积极主动的家校沟通与教育参与：**
-    *   **核心：** 母亲是家校沟通的主要桥梁，**熟悉孩子在学校的表现、动态和需求**，能够更有效地配合学校教育，关注孩子学业发展。
-    *   **升级表述：** “母亲一直是与学校老师保持密切沟通的主要联系人，**深度了解孩子在学校的学业情况、行为表现、社交动态及老师的反馈建议**。这种积极主动的教育参与度，对及时发现问题、引导孩子学业和社交发展至关重要。”
-    *   **证据建议：** 与老师的微信/QQ聊天记录、家长会签到记录、老师联系方式（可申请老师出庭作证或提供书面证明）。
+⸻
 
-4.  **同性抚养的天然优势与情感支持：**
-    *   **核心：** 作为同性母亲，在女儿成长（尤其是青春期）过程中，**能提供更自然、无障碍的情感交流、生理知识指导、心理疏导和人生经验分享**。
-    *   **升级表述：** “母亲作为同性家长，**在女儿成长的关键阶段（如青春期）具有无可替代的优势**：能建立更开放、亲密的沟通渠道，及时进行生理卫生指导、情感疏导、自我保护教育，分享女性成长经验，有效应对叛逆期等挑战，更有利于女孩的身心健康发展。”
-    *   **证据建议：** 强调普遍认知，结合孩子喜欢并习惯向母亲倾诉的特点。
+代码实现（可直接用）
 
-5.  **和谐积极的家庭氛围与亲属支持网络：**
-    *   **核心：** 女方家庭氛围融洽，与外公外婆舅舅等亲属关系密切，**为孩子提供了更广阔、更稳定的情感支持系统和社会关系网络**。
-    *   **升级表述：** “女方家庭氛围和谐，与外公、外婆、舅舅等近亲属保持密切联系且关系融洽，**能为孩子提供一个充满关爱、支持与安全感的成长环境，并扩展其社会关系网络**，有利于培养孩子的亲社会性和健全人格。”
-    *   **证据建议：** 家庭聚会照片、亲属关系证明、亲属愿意提供支持的声明（如有）。
+0. 放置说明
+	•	是否需要新文件？
+	•	建议新建一个小工具文件：net_port_alloc.c/.h（端口随机与绑定），以及一个auth_control.c（登录与协商）。
+	•	如果不想加文件：把下面的工具函数放进你现有的gvcp_heart和file_transfer对应的.c里顶部，声明放到对应.h即可。
 
-6.  **良好的社交拓展能力：**
-    *   **核心：** 母亲有意识地通过自身社交圈（同龄宝妈）为孩子**创造与同龄人交往互动的机会**，有助于培养孩子的社交能力、拓展视野。
-    *   **升级表述：** “母亲积极利用自身社交资源，**主动为孩子创造与同龄伙伴在家庭环境外（如聚会、游玩）的社交互动机会**。这不仅丰富了孩子的课余生活，更**有效锻炼了其社交能力、合作精神和适应能力**，促进了孩子的全面发展。”
-    *   **证据建议：** 与宝妈们的聚会照片、活动记录、其他宝妈的联系方式（可作证）。
+⸻
 
-**关键建议给姐姐：**
+1. 端口随机与绑定工具
 
-1.  **证据为王：** 上述每一个论点，**尽可能**找到相应的证据来支持。书面证据（记录、照片、证明）优于口头陈述。及时收集整理。
-2.  **孩子意愿（如适用）：** 如果孩子已满8周岁（中国民法典规定），法庭一般会听取孩子本人意见。确保这个过程是孩子真实意愿的表达，避免给孩子压力。母亲长期抚养建立的亲密关系是让孩子愿意跟随的重要基础。
-3.  **经济能力和居住条件证明：** 虽然你列的点里没特别强调，但法庭也会考虑。准备好证明姐姐有稳定收入来源（工作证明、收入流水）和适合孩子居住的住房条件（房产证/租房合同、住房照片）的材料。
-4.  **未来抚养计划：** 在法庭上或书面材料中，清晰阐述姐姐如果获得抚养权后的具体抚养计划（如居住安排、教育规划、如何平衡工作与照顾孩子等），展现责任感和可行性。
-5.  **律师沟通：** 务必与代理律师详细沟通这些论点和证据。律师会从法律专业角度帮你筛选、强化、组织，并指导如何在法庭上有效呈现（陈述、质证）。
-6.  **陈述方式：** 在法庭陈述时，保持冷静、理性、客观，聚焦于孩子的利益和需求，避免攻击性语言，用事实和证据说话。强调由母亲抚养是**维持孩子现有生活稳定性和满足其特殊成长需求（特别是女孩）的最优解**。
-7.  **强调“现状”和“稳定性”：** 法律倾向于维持对孩子生活改变最小的方案。强调孩子长期由母亲照顾、习惯母亲在身边、母亲承担主要抚养责任是**既定且稳定的现状**，改变现状（交由父亲抚养）将给孩子带来更大风险和不适应。
+// net_port_alloc.h
+#pragma once
+#include <stdint.h>
+#include <sys/types.h>
 
-**总结：**
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-你整理的论点已经非常全面和有力。核心在于突出：
+int get_random_u16(uint16_t *out);
+int bind_random_udp(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int max_try);
+int bind_random_tcp_listen(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int backlog, int max_try);
 
-*   **男方劣势：** 时间精力匮乏（核心硬伤）、不良家庭氛围、物质条件不足、情感陪伴缺失、性别照顾不便、实际照料人能力不足。
-*   **女方优势：** 深厚情感依恋与抚养连续性、细致了解与精心照料、积极教育参与、同性养育独特优势、和谐家庭支持网络、主动拓展社交能力。
+#ifdef __cplusplus
+}
+#endif
+
+// net_port_alloc.c
+#define _GNU_SOURCE
+#include "net_port_alloc.h"
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/random.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+
+static int strong_rand_bytes(void *buf, size_t len) {
+    ssize_t n = getrandom(buf, len, 0);
+    if (n == (ssize_t)len) return 0;
+    // fallback: /dev/urandom
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = read(fd, (char*)buf + got, len - got);
+        if (r <= 0) { close(fd); return -1; }
+        got += (size_t)r;
+    }
+    close(fd);
+    return 0;
+}
+
+int get_random_u16(uint16_t *out) {
+    uint16_t v;
+    if (strong_rand_bytes(&v, sizeof(v)) != 0) return -1;
+    *out = v;
+    return 0;
+}
+
+static uint16_t rand_port_in_range(uint16_t min_p, uint16_t max_p) {
+    uint16_t r;
+    if (get_random_u16(&r) != 0) {
+        // very unlikely; fallback to libc rand
+        r = (uint16_t) (rand() & 0xFFFF);
+    }
+    uint32_t span = (uint32_t)max_p - (uint32_t)min_p + 1u;
+    return (uint16_t)(min_p + (r % span));
+}
+
+static void fill_sockaddr(struct sockaddr_in *sa, const char *ip, uint16_t port) {
+    memset(sa, 0, sizeof(*sa));
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons(port);
+    sa->sin_addr.s_addr = (ip && *ip) ? inet_addr(ip) : htonl(INADDR_ANY);
+}
+
+int bind_random_udp(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int max_try) {
+    struct sockaddr_in sa;
+    for (int i = 0; i < max_try; ++i) {
+        uint16_t p = rand_port_in_range(min_port, max_port);
+        fill_sockaddr(&sa, bind_ip, p);
+        if (bind(sockfd, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
+            if (out_port) *out_port = p;
+            return 0;
+        }
+        if (errno != EADDRINUSE && errno != EACCES) {
+            // other errors likely fatal for this ip; continue trying other ports though
+        }
+    }
+    return -1;
+}
+
+int bind_random_tcp_listen(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int backlog, int max_try) {
+    int yes = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in sa;
+    for (int i = 0; i < max_try; ++i) {
+        uint16_t p = rand_port_in_range(min_port, max_port);
+        fill_sockaddr(&sa, bind_ip, p);
+        if (bind(sockfd, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
+            if (listen(sockfd, backlog) != 0) {
+                // if listen fails try another port
+                continue;
+            }
+            if (out_port) *out_port = p;
+            return 0;
+        }
+        if (errno != EADDRINUSE && errno != EACCES) {
+            // ignore and retry another port
+        }
+    }
+    return -1;
+}
+
+
+⸻
+
+2. 登录协商（骨架）
+
+下面给出一个极简接口，你可以把认证细节替换成你已有的实现（用户名/密码、签名校验、TLS等）。
+
+// auth_control.h
+#pragma once
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    char session_id[64];
+    char token[64];
+    uint16_t file_tcp_port;
+    uint16_t hb_udp_port;
+    int expires_ms; // token有效期
+} auth_result_t;
+
+// 处理登录请求（阻塞/事件驱动皆可），成功后分配端口并返回
+int handle_login_and_allocate_ports(const char *bind_ip, auth_result_t *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+// auth_control.c
+#include "auth_control.h"
+#include "net_port_alloc.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+
+// 这里假设你已经在某个固定端口上收到了“登录请求”并完成认证。
+// 下面函数只做“分配端口 + 启动服务 + 返回结果”的演示。
+
+extern int start_file_server_on_port(uint16_t port);    // 由你实现，监听并接受连接
+extern int start_heartbeat_on_port(uint16_t port);      // 由你实现，启用心跳发送/接收
+
+static void gen_token(char out[64]) {
+    // 简易版，占位。请换成安全的随机 + HMAC/签名
+    uint16_t r=0; get_random_u16(&r);
+    snprintf(out, 64, "tk-%04x", r);
+}
+static void gen_session(char out[64]) {
+    uint16_t r=0; get_random_u16(&r);
+    snprintf(out, 64, "sess-%04x", r);
+}
+
+int handle_login_and_allocate_ports(const char *bind_ip, auth_result_t *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    // 1) 分配TCP文件传输端口并listen
+    int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_fd < 0) return -1;
+    uint16_t file_port = 0;
+    if (bind_random_tcp_listen(tcp_fd, bind_ip, 1024, 65535, &file_port, 16, 64) != 0) {
+        close(tcp_fd);
+        return -1;
+    }
+
+    // 2) 分配UDP心跳端口并bind
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) {
+        close(tcp_fd);
+        return -1;
+    }
+    uint16_t hb_port = 0;
+    if (bind_random_udp(udp_fd, bind_ip, 1024, 65535, &hb_port, 64) != 0) {
+        close(udp_fd);
+        close(tcp_fd);
+        return -1;
+    }
+
+    // 3) 启动服务（实际应为异步/线程）
+    if (start_file_server_on_port(file_port) != 0) {
+        close(udp_fd); close(tcp_fd); return -1;
+    }
+    if (start_heartbeat_on_port(hb_port) != 0) {
+        // 可回滚
+        close(udp_fd); /* TODO: stop file server */
+        close(tcp_fd);
+        return -1;
+    }
+
+    // 4) 生成会话与token
+    gen_session(out->session_id);
+    gen_token(out->token);
+    out->file_tcp_port = file_port;
+    out->hb_udp_port   = hb_port;
+    out->expires_ms    = 10 * 60 * 1000; // 10分钟示例
+
+    return 0;
+}
+
+
+⸻
+
+3. 将你的 UDP 心跳改为随机端口绑定
+
+下面是你给的 prepare_gvcp_heart_socket() 的改造版本（随机端口，登录成功后再调用）：
+
+#include "net_port_alloc.h"
+
+#define PORT_MIN 1024
+#define PORT_MAX 65535
+
+static int prepare_gvcp_heart_socket_random(const char *bind_ip, uint16_t *out_port)
+{
+    int sock_fd = -1;
+    struct sockaddr_in *local_addr = &heart_gvcp.local_addr;
+    int broadcst = 1;	
+    socklen_t addr_len = sizeof(struct sockaddr_in);
+
+    if (heart_gvcp.sock_fd > 0) {
+        close(heart_gvcp.sock_fd);
+        heart_gvcp.sock_fd = -1;
+    }
+
+    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_fd < 0) {
+        LOGE("gvcp_heart_thread: socket failed: %s\r\n", strerror(errno));
+        return -1;
+    }
+
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_BROADCAST, (void *)&broadcst, sizeof(broadcst)) < 0) {		
+        LOGE("socket option broadcast set error:%s\n", strerror(errno));
+        close(sock_fd);
+        return -1;
+    }
+
+    memset((char *)local_addr, 0, sizeof(struct sockaddr_in));
+
+    // 随机端口绑定
+    if (bind_random_udp(sock_fd, bind_ip, PORT_MIN, PORT_MAX, out_port, 64) != 0) {
+        LOGE("gvcp_thread: bind random port failed: %s\r\n", strerror(errno));
+        close(sock_fd);
+        return -1;
+    }
+
+    // 保存本地地址
+    local_addr->sin_family = AF_INET;
+    local_addr->sin_port   = htons(*out_port);
+    local_addr->sin_addr.s_addr = (bind_ip && *bind_ip) ? inet_addr(bind_ip) : htonl(INADDR_ANY);
+
+    memset((char *)&heart_gvcp.host_addr, 0, addr_len);
+    heart_gvcp.sock_fd = sock_fd;
+    heart_gvcp.port = *out_port; // 建议在结构中新增port字段
+
+    return 0;
+}
+
+若将心跳改为unicast：把 host_addr 设置为对端IP与对端接收端口（由对端自行选择/在协商里传回）。
+
+⸻
+
+4. TCP 文件传输服务随机端口监听
+
+#include "net_port_alloc.h"
+
+int start_file_server_on_port(uint16_t port) {
+    // 如果你已有现成的 server 代码，请把 bind 改为传入 port
+    // 这里给出示例的封装
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    uint16_t outp = 0;
+    if (bind_random_tcp_listen(fd, NULL, port, port, &outp, 128, 1) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    // TODO: 把 fd 交给你的 accept 线程/事件循环
+    // 例如：spawn_thread(file_server_loop, fd);
+
+    LOGI("file server listening at TCP %u\n", outp);
+    return 0;
+}
+
+如果你更希望“先选端口再启动”，可以用 bind_random_tcp_listen(sockfd, NULL, 1024, 65535, &outp, 128, 64) 来随机挑选端口并listen，然后把 outp 返回给对端。
+
+⸻
+
+5. 将端口通过“节点”发布
+
+方式A：控制通道直接返回（上面的 auth_result_t 已经包含端口）。
+
+方式B：写本地节点文件（示例）
+
+#include <stdio.h>
+
+int write_ports_node(const char *path, const auth_result_t *res) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    // 简单JSON；生产可用cJSON/yyjson等
+    fprintf(fp,
+        "{ \"session\":\"%s\", \"token\":\"%s\", \"file_tcp_port\":%u, \"hb_udp_port\":%u, \"expires_ms\":%d }\n",
+        res->session_id, res->token, res->file_tcp_port, res->hb_udp_port, res->expires_ms);
+    fclose(fp);
+    return 0;
+}
+
+
+⸻
+
+协议层建议（简要）
+	•	登录请求：LOGIN {user, nonce, sign}
+	•	登录响应（成功）：
+LOGIN_OK {session, token, file_tcp_port, hb_udp_port, expires_ms}
+	•	后续每次文件/心跳首包带 session+token（或在TLS里做双向认证），服务端验证通过才继续，否则立即关闭/丢弃，避免端口扫描滥用。
+
+⸻
+
+注意事项
+	1.	随机端口范围：按需求固定为 [1024, 65535]；如果现场存在端口策略/ACL，请同步更新白名单。
+	2.	广播心跳的可行性：使用随机端口广播时，对端必须事先知道该端口；因此更推荐unicast心跳。
+	3.	安全：随机端口不是安全机制，务必在登录和服务首包校验token；最好全链路TLS/DTLS。
+	4.	生命周期：登录失败不启动/不占用端口；token过期及时回收服务（停止监听/关闭socket）。
+	5.	并发会话：如允许多个对端并发，建议为每个会话分配独立端口对（或复用TCP文件服务，UDP心跳按会话token区分）。
+
+⸻
+
+如果你确认“节点”的具体实现（比如：某个sysfs节点、共享内存、消息队列、或已有的管理RPC），我可以把 write_ports_node() 和协商返回改成你指定的形式，并把文件/函数放在哪个源文件再细化到行级改动。需要的话也可以把服务端accept/心跳线程的模板直接补齐。
