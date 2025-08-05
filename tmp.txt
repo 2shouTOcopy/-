@@ -1,387 +1,128 @@
-下面给你一个可落地的方案 + 直接可用的C代码，把两个端口（TCP文件传输、UDP心跳）从固定端口改为登录协商后按需启动、并随机端口（1024–65535）。同时给出“节点”发布方式两种选项（本地文件/已有控制通道返回）。你可以直接把代码段嵌到现有工程里。
+下面这段文字可直接放进 SDK 集成说明 / 协议补充文档。
+我把当前阶段（基于 节点取值）与下一阶段（基于 LOGIN_CMD / LOGIN_ACK 信令）都写成 完整时序 + 字段定义，保持向后兼容、便于增量迭代。你可以按需裁剪或直接交给 SDK 团队。
 
 ⸻
 
-整体方案
+1 背景
 
-1）最小固定入口（Auth/Control）
-	•	保留一个固定且受控的认证入口（建议 TCP，亦可复用你现有的管理通道），仅用于：
-	•	登录认证（用户名/密码或签名/HMAC）。
-	•	成功后由设备随机选择两个端口：
-	•	file_tcp_port ∈ [1024, 65535]（TCP监听）
-	•	hb_udp_port ∈ [1024, 65535]（UDP心跳）
-	•	返回给对端：{session_id/token, file_tcp_port, hb_udp_port, ttl}。
-	•	端口未分配前，不启动服务（不bind、不listen、不发送心跳）。
-
-2）随机端口绑定策略
-	•	采用“随机挑选 + bind”模式，自行控制范围 1024–65535，避免依赖系统ephemeral range。
-	•	冲突/占用则重试（最多N次）。
-	•	TCP服务启动前 setsockopt(SO_REUSEADDR)；UDP心跳视需求设置 SO_BROADCAST。
-
-3）心跳链路从广播改为定向（建议）
-	•	为满足“随机端口 + 登录后才启用”，建议心跳改为对端定向unicast（你已经知道对端地址）。如果必须广播，请在协商里同时把“发送端口”告诉对端，并让对端按该端口收；否则广播很难让对端“发现”端口变更。
-
-4）“节点”获取最终端口（两种做法）
-	•	A. 控制通道返回（推荐）： 登录成功后即返回端口；之后也可提供“查询端口”命令。
-	•	B. 本地节点文件： 在设备上写 /run/ports.json（或你指定路径），对端通过既有管理能力（例如SSH/SFTP/REST）读取：
-
-{"session":"abcd1234","file_tcp_port":45678,"hb_udp_port":52341,"expires_ms":600000}
-
-
-
-若你已有“节点”的明确含义（比如特定共享内存、sysfs、mq、KV存储），把write_ports_node()换成你的实现即可。
-
-⸻
-
-代码实现（可直接用）
-
-0. 放置说明
-	•	是否需要新文件？
-	•	建议新建一个小工具文件：net_port_alloc.c/.h（端口随机与绑定），以及一个auth_control.c（登录与协商）。
-	•	如果不想加文件：把下面的工具函数放进你现有的gvcp_heart和file_transfer对应的.c里顶部，声明放到对应.h即可。
-
-⸻
-
-1. 端口随机与绑定工具
-
-// net_port_alloc.h
-#pragma once
-#include <stdint.h>
-#include <sys/types.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int get_random_u16(uint16_t *out);
-int bind_random_udp(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int max_try);
-int bind_random_tcp_listen(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int backlog, int max_try);
-
-#ifdef __cplusplus
-}
-#endif
-
-// net_port_alloc.c
-#define _GNU_SOURCE
-#include "net_port_alloc.h"
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/random.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <arpa/inet.h>
-
-static int strong_rand_bytes(void *buf, size_t len) {
-    ssize_t n = getrandom(buf, len, 0);
-    if (n == (ssize_t)len) return 0;
-    // fallback: /dev/urandom
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return -1;
-    size_t got = 0;
-    while (got < len) {
-        ssize_t r = read(fd, (char*)buf + got, len - got);
-        if (r <= 0) { close(fd); return -1; }
-        got += (size_t)r;
-    }
-    close(fd);
-    return 0;
-}
-
-int get_random_u16(uint16_t *out) {
-    uint16_t v;
-    if (strong_rand_bytes(&v, sizeof(v)) != 0) return -1;
-    *out = v;
-    return 0;
-}
-
-static uint16_t rand_port_in_range(uint16_t min_p, uint16_t max_p) {
-    uint16_t r;
-    if (get_random_u16(&r) != 0) {
-        // very unlikely; fallback to libc rand
-        r = (uint16_t) (rand() & 0xFFFF);
-    }
-    uint32_t span = (uint32_t)max_p - (uint32_t)min_p + 1u;
-    return (uint16_t)(min_p + (r % span));
-}
-
-static void fill_sockaddr(struct sockaddr_in *sa, const char *ip, uint16_t port) {
-    memset(sa, 0, sizeof(*sa));
-    sa->sin_family = AF_INET;
-    sa->sin_port = htons(port);
-    sa->sin_addr.s_addr = (ip && *ip) ? inet_addr(ip) : htonl(INADDR_ANY);
-}
-
-int bind_random_udp(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int max_try) {
-    struct sockaddr_in sa;
-    for (int i = 0; i < max_try; ++i) {
-        uint16_t p = rand_port_in_range(min_port, max_port);
-        fill_sockaddr(&sa, bind_ip, p);
-        if (bind(sockfd, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
-            if (out_port) *out_port = p;
-            return 0;
-        }
-        if (errno != EADDRINUSE && errno != EACCES) {
-            // other errors likely fatal for this ip; continue trying other ports though
-        }
-    }
-    return -1;
-}
-
-int bind_random_tcp_listen(int sockfd, const char *bind_ip, uint16_t min_port, uint16_t max_port, uint16_t *out_port, int backlog, int max_try) {
-    int yes = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    struct sockaddr_in sa;
-    for (int i = 0; i < max_try; ++i) {
-        uint16_t p = rand_port_in_range(min_port, max_port);
-        fill_sockaddr(&sa, bind_ip, p);
-        if (bind(sockfd, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
-            if (listen(sockfd, backlog) != 0) {
-                // if listen fails try another port
-                continue;
-            }
-            if (out_port) *out_port = p;
-            return 0;
-        }
-        if (errno != EADDRINUSE && errno != EACCES) {
-            // ignore and retry another port
-        }
-    }
-    return -1;
-}
+项目	目标
+SC2000X 安全红线	移除固定端口暴露，改为 登录协商 + 随机端口
+受影响通道	- 文件传输（sc_fileaccess, TCP）- 心跳（UDP）
+兼容性要求	- 现阶段：仅通过 GenApi 节点取值 获取端口- 下一阶段：新增 LOGIN_CMD / LOGIN_ACK 信令携带端口，同时保留节点（双轨）
 
 
 ⸻
 
-2. 登录协商（骨架）
+2 当前阶段（v1）——节点取值模式
 
-下面给出一个极简接口，你可以把认证细节替换成你已有的实现（用户名/密码、签名校验、TLS等）。
+2.1 总流程
 
-// auth_control.h
-#pragma once
-#include <stdint.h>
+@startuml
+autonumber
+skinparam ParticipantPadding 10
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+participant SDK
+participant "Camera\n(GVCP Server)" as DEV
 
-typedef struct {
-    char session_id[64];
-    char token[64];
-    uint16_t file_tcp_port;
-    uint16_t hb_udp_port;
-    int expires_ms; // token有效期
-} auth_result_t;
+SDK -> DEV : GVCP: ReadRegister\n(CCP=Open)
+DEV --> SDK : OK
 
-// 处理登录请求（阻塞/事件驱动皆可），成功后分配端口并返回
-int handle_login_and_allocate_ports(const char *bind_ip, auth_result_t *out);
+SDK -> DEV : GenApiRead(\"GevPrivMCPHostPort\")
+DEV --> SDK :  TCP_PORT  (随机 1024–65535)
 
-#ifdef __cplusplus
-}
-#endif
+SDK -> DEV : GenApiRead(\"GevGvcpHeartBeatPort\")
+DEV --> SDK :  HB_PORT   (随机 1024–65535)
 
-// auth_control.c
-#include "auth_control.h"
-#include "net_port_alloc.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <errno.h>
+SDK -> DEV : TCP Connect sc_fileaccess @TCP_PORT
+DEV --> SDK : 220 Ready (示例)
 
-// 这里假设你已经在某个固定端口上收到了“登录请求”并完成认证。
-// 下面函数只做“分配端口 + 启动服务 + 返回结果”的演示。
+... 心跳线程 ...
+SDK --> DEV : GVCP Heartbeat [UDP HB_PORT]
+DEV --> SDK : GVCP Heartbeat ACK
+@enduml
 
-extern int start_file_server_on_port(uint16_t port);    // 由你实现，监听并接受连接
-extern int start_heartbeat_on_port(uint16_t port);      // 由你实现，启用心跳发送/接收
+2.2 节点定义
 
-static void gen_token(char out[64]) {
-    // 简易版，占位。请换成安全的随机 + HMAC/签名
-    uint16_t r=0; get_random_u16(&r);
-    snprintf(out, 64, "tk-%04x", r);
-}
-static void gen_session(char out[64]) {
-    uint16_t r=0; get_random_u16(&r);
-    snprintf(out, 64, "sess-%04x", r);
-}
+节点名	类型	说明	示例值
+GevPrivMCPHostPort	Integer (R)	文件传输随机端口，仅在登录成功后可读	45678
+GevGvcpHeartBeatPort	Integer (R)	心跳随机端口，仅在登录成功后可读	52341
 
-int handle_login_and_allocate_ports(const char *bind_ip, auth_result_t *out) {
-    if (!out) return -1;
-    memset(out, 0, sizeof(*out));
+	•	节点值在 每次上电 / 重登录 后都会重新生成。
+	•	读取失败（GenApi::InvalidNode 或值为 0）表示登录尚未完成。
 
-    // 1) 分配TCP文件传输端口并listen
-    int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (tcp_fd < 0) return -1;
-    uint16_t file_port = 0;
-    if (bind_random_tcp_listen(tcp_fd, bind_ip, 1024, 65535, &file_port, 16, 64) != 0) {
-        close(tcp_fd);
-        return -1;
-    }
+⸻
 
-    // 2) 分配UDP心跳端口并bind
-    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_fd < 0) {
-        close(tcp_fd);
-        return -1;
-    }
-    uint16_t hb_port = 0;
-    if (bind_random_udp(udp_fd, bind_ip, 1024, 65535, &hb_port, 64) != 0) {
-        close(udp_fd);
-        close(tcp_fd);
-        return -1;
-    }
+3 下一阶段（v2）——LOGIN_CMD 信令模式（增量）
 
-    // 3) 启动服务（实际应为异步/线程）
-    if (start_file_server_on_port(file_port) != 0) {
-        close(udp_fd); close(tcp_fd); return -1;
-    }
-    if (start_heartbeat_on_port(hb_port) != 0) {
-        // 可回滚
-        close(udp_fd); /* TODO: stop file server */
-        close(tcp_fd);
-        return -1;
-    }
+3.1 新增寄存器／命令
 
-    // 4) 生成会话与token
-    gen_session(out->session_id);
-    gen_token(out->token);
-    out->file_tcp_port = file_port;
-    out->hb_udp_port   = hb_port;
-    out->expires_ms    = 10 * 60 * 1000; // 10分钟示例
+名称	寄存器地址	DIR	说明
+LOGIN_CMD	0x00F4_0100	W	SDK→设备，携带用户凭证
+LOGIN_ACK	0x00F4_0104	R	设备→SDK，应答 + 端口
 
-    return 0;
-}
+LOGIN_CMD 格式（Little-Endian）
+
+偏移	字段	长度	说明
+0	Magic	4	固定 0x4C4F474E (“LOGN”)
+4	UserID	4	用户编号 / Hash
+8	Nonce	8	随机数
+16	Signature	32	HMAC-SHA256(UserID‖Nonce‖Secret)
+
+LOGIN_ACK 格式
+
+偏移	字段	长度	说明
+0	Status	4	0=OK，其他=错误码
+4	FileTcpPort	2	若 Status==0
+6	HeartBeatPort	2	同上
+8	Token	32	可选：会话 Token
+
+3.2 升级后完整流程
+
+@startuml
+autonumber
+participant SDK
+participant DEV
+
+== 登录 ==
+SDK -> DEV : WRITE LOGIN_CMD\n(UserID, Nonce, Signature)
+DEV --> SDK : POLL LOGIN_ACK.Status==0
+SDK -> DEV : READ LOGIN_ACK (ports)
+
+== 建链 ==
+SDK -> DEV : TCP connect @FileTcpPort
+... HeartBeat @HeartBeatPort ...
+
+note over SDK
+若 SDK 使用老版本逻辑\n(只读取节点)，仍可成功：\n设备在回复 LOGIN_ACK 的同时\n更新 GevPrivMCPHostPort/GevGvcpHeartBeatPort
+end note
+@enduml
+
+3.3 SDK 兼容策略
+	1.	首选：尝试 LOGIN_CMD 流程；成功则直接使用 ACK 中端口。
+	2.	若寄存器不存在 / 报写入错误 → 回落到 节点取值模式。
+	3.	节点依旧保持只读，含义不变，用于旧版 SDK。
+
+⸻
+
+4 实现要点
+
+模块	要点
+设备端	- 登录成功后  • 随机生成端口  • 先启动监听 (bind(port=0) 或显式随机)  • 写入节点 & 组装 LOGIN_ACK- 登录失败：节点值置 0
+SDK	- 串行流程：登录 → 读取端口 → 建链- 若心跳或文件连接断开，须重新登录获取新端口
+安全	- 整体仍跑在 GVCP (UDP 3956) 登录阶段 内部信令；后期可移植到 DTLS- Token/Signature 校验失败即拒绝建链
+并发	如允许多 Host，同一时刻每个 Host 独占一对端口；可在节点下再挂 CurSessionUID 区分
 
 
 ⸻
 
-3. 将你的 UDP 心跳改为随机端口绑定
+5 落地计划（建议）
 
-下面是你给的 prepare_gvcp_heart_socket() 的改造版本（随机端口，登录成功后再调用）：
-
-#include "net_port_alloc.h"
-
-#define PORT_MIN 1024
-#define PORT_MAX 65535
-
-static int prepare_gvcp_heart_socket_random(const char *bind_ip, uint16_t *out_port)
-{
-    int sock_fd = -1;
-    struct sockaddr_in *local_addr = &heart_gvcp.local_addr;
-    int broadcst = 1;	
-    socklen_t addr_len = sizeof(struct sockaddr_in);
-
-    if (heart_gvcp.sock_fd > 0) {
-        close(heart_gvcp.sock_fd);
-        heart_gvcp.sock_fd = -1;
-    }
-
-    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
-        LOGE("gvcp_heart_thread: socket failed: %s\r\n", strerror(errno));
-        return -1;
-    }
-
-    if (setsockopt(sock_fd, SOL_SOCKET, SO_BROADCAST, (void *)&broadcst, sizeof(broadcst)) < 0) {		
-        LOGE("socket option broadcast set error:%s\n", strerror(errno));
-        close(sock_fd);
-        return -1;
-    }
-
-    memset((char *)local_addr, 0, sizeof(struct sockaddr_in));
-
-    // 随机端口绑定
-    if (bind_random_udp(sock_fd, bind_ip, PORT_MIN, PORT_MAX, out_port, 64) != 0) {
-        LOGE("gvcp_thread: bind random port failed: %s\r\n", strerror(errno));
-        close(sock_fd);
-        return -1;
-    }
-
-    // 保存本地地址
-    local_addr->sin_family = AF_INET;
-    local_addr->sin_port   = htons(*out_port);
-    local_addr->sin_addr.s_addr = (bind_ip && *bind_ip) ? inet_addr(bind_ip) : htonl(INADDR_ANY);
-
-    memset((char *)&heart_gvcp.host_addr, 0, addr_len);
-    heart_gvcp.sock_fd = sock_fd;
-    heart_gvcp.port = *out_port; // 建议在结构中新增port字段
-
-    return 0;
-}
-
-若将心跳改为unicast：把 host_addr 设置为对端IP与对端接收端口（由对端自行选择/在协商里传回）。
-
-⸻
-
-4. TCP 文件传输服务随机端口监听
-
-#include "net_port_alloc.h"
-
-int start_file_server_on_port(uint16_t port) {
-    // 如果你已有现成的 server 代码，请把 bind 改为传入 port
-    // 这里给出示例的封装
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    uint16_t outp = 0;
-    if (bind_random_tcp_listen(fd, NULL, port, port, &outp, 128, 1) != 0) {
-        close(fd);
-        return -1;
-    }
-
-    // TODO: 把 fd 交给你的 accept 线程/事件循环
-    // 例如：spawn_thread(file_server_loop, fd);
-
-    LOGI("file server listening at TCP %u\n", outp);
-    return 0;
-}
-
-如果你更希望“先选端口再启动”，可以用 bind_random_tcp_listen(sockfd, NULL, 1024, 65535, &outp, 128, 64) 来随机挑选端口并listen，然后把 outp 返回给对端。
-
-⸻
-
-5. 将端口通过“节点”发布
-
-方式A：控制通道直接返回（上面的 auth_result_t 已经包含端口）。
-
-方式B：写本地节点文件（示例）
-
-#include <stdio.h>
-
-int write_ports_node(const char *path, const auth_result_t *res) {
-    FILE *fp = fopen(path, "w");
-    if (!fp) return -1;
-    // 简单JSON；生产可用cJSON/yyjson等
-    fprintf(fp,
-        "{ \"session\":\"%s\", \"token\":\"%s\", \"file_tcp_port\":%u, \"hb_udp_port\":%u, \"expires_ms\":%d }\n",
-        res->session_id, res->token, res->file_tcp_port, res->hb_udp_port, res->expires_ms);
-    fclose(fp);
-    return 0;
-}
+Milestone	内容	交付物
+M1 (本月)	设备端实现 随机端口生成 + 节点写入；SDK 侧按照 §2 集成测试	• 固件 v1.3• SDK patch v1.3
+M2 (下月)	完成 LOGIN_CMD / ACK 信令 + 双轨兼容	• 固件 v1.4• 升级版 SDK v1.4
+M3	引入会话 Token + 心跳改为 unicast；走 DTLS 可选	• 设计评审文档
 
 
 ⸻
 
-协议层建议（简要）
-	•	登录请求：LOGIN {user, nonce, sign}
-	•	登录响应（成功）：
-LOGIN_OK {session, token, file_tcp_port, hb_udp_port, expires_ms}
-	•	后续每次文件/心跳首包带 session+token（或在TLS里做双向认证），服务端验证通过才继续，否则立即关闭/丢弃，避免端口扫描滥用。
-
-⸻
-
-注意事项
-	1.	随机端口范围：按需求固定为 [1024, 65535]；如果现场存在端口策略/ACL，请同步更新白名单。
-	2.	广播心跳的可行性：使用随机端口广播时，对端必须事先知道该端口；因此更推荐unicast心跳。
-	3.	安全：随机端口不是安全机制，务必在登录和服务首包校验token；最好全链路TLS/DTLS。
-	4.	生命周期：登录失败不启动/不占用端口；token过期及时回收服务（停止监听/关闭socket）。
-	5.	并发会话：如允许多个对端并发，建议为每个会话分配独立端口对（或复用TCP文件服务，UDP心跳按会话token区分）。
-
-⸻
-
-如果你确认“节点”的具体实现（比如：某个sysfs节点、共享内存、消息队列、或已有的管理RPC），我可以把 write_ports_node() 和协商返回改成你指定的形式，并把文件/函数放在哪个源文件再细化到行级改动。需要的话也可以把服务端accept/心跳线程的模板直接补齐。
+如需代码示例 / 节点注册 XML 扩展 / 详细错误码表，请告诉我，我可以直接补充到相应章节里。
