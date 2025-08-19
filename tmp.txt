@@ -1,10 +1,11 @@
+# --------------------- pqueue (libstdc++/deque) ---------------------
 define pqueue
     if $argc == 0
         help pqueue
     else
         set $q = $arg0
 
-        # 取 deque 迭代器与块信息
+        # deque iterators & block info
         set $start   = $q.c._M_impl._M_start
         set $finish  = $q.c._M_impl._M_finish
         set $snode   = $start._M_node
@@ -12,11 +13,9 @@ define pqueue
         set $sfirst  = $start._M_first
         set $slast   = $start._M_last
         set $scur    = $start._M_cur
-
-        # 单块大小（元素个数）
         set $block_sz = $slast - $sfirst
 
-        # 计算 size（不依赖内联的 size()）
+        # compute size w/o inline size()
         if $snode == $fnode
             set $size = $finish._M_cur - $scur
         else
@@ -24,7 +23,7 @@ define pqueue
             set $size = ($slast - $scur) + ($full_nodes * $block_sz) + ($finish._M_cur - $finish._M_first)
         end
 
-        # 打印上限：可选第二参数
+        # limit to print
         if $argc >= 2
             set $limit = $arg1
             if $limit < $size
@@ -41,7 +40,7 @@ define pqueue
             end
         end
 
-        # 遍历打印
+        # iterate
         set $i = 0
         set $node = $snode
         set $cur  = $scur
@@ -65,7 +64,6 @@ define pqueue
                     set $cur++
                     set $i++
                 end
-                # 跳到下一个块
                 set $node++
                 set $first = *$node
                 set $cur   = $first
@@ -78,12 +76,13 @@ define pqueue
 end
 
 document pqueue
-    Prints std::queue<T> (libstdc++/deque) contents and size without calling inlined size().
+    Prints std::queue<T> (libstdc++/deque) contents and size without calling inline size().
     Usage:
-      pqueue <queue>                # print all elements
-      pqueue <queue> <max_elems>    # print at most <max_elems> elements
+      pqueue <queue>             # print all
+      pqueue <queue> <max>       # print at most <max> elements
     Example:
       pqueue m_schedSendQueue
       pqueue m_schedSendQueue 32
-    Note: relies on libstdc++ deque internals; will not work with libc++.
+    Note: relies on libstdc++ deque internals; not for libc++.
 end
+# --------------------------------------------------------------------
