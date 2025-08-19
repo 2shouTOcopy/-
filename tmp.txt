@@ -1,128 +1,89 @@
-下面这段文字可直接放进 SDK 集成说明 / 协议补充文档。
-我把当前阶段（基于 节点取值）与下一阶段（基于 LOGIN_CMD / LOGIN_ACK 信令）都写成 完整时序 + 字段定义，保持向后兼容、便于增量迭代。你可以按需裁剪或直接交给 SDK 团队。
+define pqueue
+    if $argc == 0
+        help pqueue
+    else
+        set $q = $arg0
 
-⸻
+        # 取 deque 迭代器与块信息
+        set $start   = $q.c._M_impl._M_start
+        set $finish  = $q.c._M_impl._M_finish
+        set $snode   = $start._M_node
+        set $fnode   = $finish._M_node
+        set $sfirst  = $start._M_first
+        set $slast   = $start._M_last
+        set $scur    = $start._M_cur
 
-1 背景
+        # 单块大小（元素个数）
+        set $block_sz = $slast - $sfirst
 
-项目	目标
-SC2000X 安全红线	移除固定端口暴露，改为 登录协商 + 随机端口
-受影响通道	- 文件传输（sc_fileaccess, TCP）- 心跳（UDP）
-兼容性要求	- 现阶段：仅通过 GenApi 节点取值 获取端口- 下一阶段：新增 LOGIN_CMD / LOGIN_ACK 信令携带端口，同时保留节点（双轨）
+        # 计算 size（不依赖内联的 size()）
+        if $snode == $fnode
+            set $size = $finish._M_cur - $scur
+        else
+            set $full_nodes = $fnode - $snode - 1
+            set $size = ($slast - $scur) + ($full_nodes * $block_sz) + ($finish._M_cur - $finish._M_first)
+        end
 
+        # 打印上限：可选第二参数
+        if $argc >= 2
+            set $limit = $arg1
+            if $limit < $size
+                set $to_print = $limit
+            else
+                set $to_print = $size
+            end
+        else
+            set $to_print = $size
+        end
 
-⸻
+        if $size <= 0
+            printf "Queue size = 0\n"
+            end
+        end
 
-2 当前阶段（v1）——节点取值模式
+        # 遍历打印
+        set $i = 0
+        set $node = $snode
+        set $cur  = $scur
+        set $first = $sfirst
+        set $last  = $slast
 
-2.1 总流程
+        while $i < $to_print
+            if $node == $fnode
+                set $end = $finish._M_cur
+                while ($cur != $end) && ($i < $to_print)
+                    printf "[%ld] = ", $i
+                    p *$cur
+                    set $cur++
+                    set $i++
+                end
+                break
+            else
+                while ($cur != $last) && ($i < $to_print)
+                    printf "[%ld] = ", $i
+                    p *$cur
+                    set $cur++
+                    set $i++
+                end
+                # 跳到下一个块
+                set $node++
+                set $first = *$node
+                set $cur   = $first
+                set $last  = $first + $block_sz
+            end
+        end
 
-@startuml
-autonumber
-skinparam ParticipantPadding 10
+        printf "Queue size = %ld (printed %ld)\n", $size, $i
+    end
+end
 
-participant SDK
-participant "Camera\n(GVCP Server)" as DEV
-
-SDK -> DEV : GVCP: ReadRegister\n(CCP=Open)
-DEV --> SDK : OK
-
-SDK -> DEV : GenApiRead(\"GevPrivMCPHostPort\")
-DEV --> SDK :  TCP_PORT  (随机 1024–65535)
-
-SDK -> DEV : GenApiRead(\"GevGvcpHeartBeatPort\")
-DEV --> SDK :  HB_PORT   (随机 1024–65535)
-
-SDK -> DEV : TCP Connect sc_fileaccess @TCP_PORT
-DEV --> SDK : 220 Ready (示例)
-
-... 心跳线程 ...
-SDK --> DEV : GVCP Heartbeat [UDP HB_PORT]
-DEV --> SDK : GVCP Heartbeat ACK
-@enduml
-
-2.2 节点定义
-
-节点名	类型	说明	示例值
-GevPrivMCPHostPort	Integer (R)	文件传输随机端口，仅在登录成功后可读	45678
-GevGvcpHeartBeatPort	Integer (R)	心跳随机端口，仅在登录成功后可读	52341
-
-	•	节点值在 每次上电 / 重登录 后都会重新生成。
-	•	读取失败（GenApi::InvalidNode 或值为 0）表示登录尚未完成。
-
-⸻
-
-3 下一阶段（v2）——LOGIN_CMD 信令模式（增量）
-
-3.1 新增寄存器／命令
-
-名称	寄存器地址	DIR	说明
-LOGIN_CMD	0x00F4_0100	W	SDK→设备，携带用户凭证
-LOGIN_ACK	0x00F4_0104	R	设备→SDK，应答 + 端口
-
-LOGIN_CMD 格式（Little-Endian）
-
-偏移	字段	长度	说明
-0	Magic	4	固定 0x4C4F474E (“LOGN”)
-4	UserID	4	用户编号 / Hash
-8	Nonce	8	随机数
-16	Signature	32	HMAC-SHA256(UserID‖Nonce‖Secret)
-
-LOGIN_ACK 格式
-
-偏移	字段	长度	说明
-0	Status	4	0=OK，其他=错误码
-4	FileTcpPort	2	若 Status==0
-6	HeartBeatPort	2	同上
-8	Token	32	可选：会话 Token
-
-3.2 升级后完整流程
-
-@startuml
-autonumber
-participant SDK
-participant DEV
-
-== 登录 ==
-SDK -> DEV : WRITE LOGIN_CMD\n(UserID, Nonce, Signature)
-DEV --> SDK : POLL LOGIN_ACK.Status==0
-SDK -> DEV : READ LOGIN_ACK (ports)
-
-== 建链 ==
-SDK -> DEV : TCP connect @FileTcpPort
-... HeartBeat @HeartBeatPort ...
-
-note over SDK
-若 SDK 使用老版本逻辑\n(只读取节点)，仍可成功：\n设备在回复 LOGIN_ACK 的同时\n更新 GevPrivMCPHostPort/GevGvcpHeartBeatPort
-end note
-@enduml
-
-3.3 SDK 兼容策略
-	1.	首选：尝试 LOGIN_CMD 流程；成功则直接使用 ACK 中端口。
-	2.	若寄存器不存在 / 报写入错误 → 回落到 节点取值模式。
-	3.	节点依旧保持只读，含义不变，用于旧版 SDK。
-
-⸻
-
-4 实现要点
-
-模块	要点
-设备端	- 登录成功后  • 随机生成端口  • 先启动监听 (bind(port=0) 或显式随机)  • 写入节点 & 组装 LOGIN_ACK- 登录失败：节点值置 0
-SDK	- 串行流程：登录 → 读取端口 → 建链- 若心跳或文件连接断开，须重新登录获取新端口
-安全	- 整体仍跑在 GVCP (UDP 3956) 登录阶段 内部信令；后期可移植到 DTLS- Token/Signature 校验失败即拒绝建链
-并发	如允许多 Host，同一时刻每个 Host 独占一对端口；可在节点下再挂 CurSessionUID 区分
-
-
-⸻
-
-5 落地计划（建议）
-
-Milestone	内容	交付物
-M1 (本月)	设备端实现 随机端口生成 + 节点写入；SDK 侧按照 §2 集成测试	• 固件 v1.3• SDK patch v1.3
-M2 (下月)	完成 LOGIN_CMD / ACK 信令 + 双轨兼容	• 固件 v1.4• 升级版 SDK v1.4
-M3	引入会话 Token + 心跳改为 unicast；走 DTLS 可选	• 设计评审文档
-
-
-⸻
-
-如需代码示例 / 节点注册 XML 扩展 / 详细错误码表，请告诉我，我可以直接补充到相应章节里。
+document pqueue
+    Prints std::queue<T> (libstdc++/deque) contents and size without calling inlined size().
+    Usage:
+      pqueue <queue>                # print all elements
+      pqueue <queue> <max_elems>    # print at most <max_elems> elements
+    Example:
+      pqueue m_schedSendQueue
+      pqueue m_schedSendQueue 32
+    Note: relies on libstdc++ deque internals; will not work with libc++.
+end
