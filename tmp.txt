@@ -1,11 +1,10 @@
-# --------------------- pqueue (libstdc++/deque) ---------------------
 define pqueue
     if $argc == 0
         help pqueue
     else
         set $q = $arg0
 
-        # deque iterators & block info
+        # deque iterators & block info (libstdc++)
         set $start   = $q.c._M_impl._M_start
         set $finish  = $q.c._M_impl._M_finish
         set $snode   = $start._M_node
@@ -15,7 +14,7 @@ define pqueue
         set $scur    = $start._M_cur
         set $block_sz = $slast - $sfirst
 
-        # compute size w/o inline size()
+        # compute size w/o inlined size()
         if $snode == $fnode
             set $size = $finish._M_cur - $scur
         else
@@ -23,66 +22,61 @@ define pqueue
             set $size = ($slast - $scur) + ($full_nodes * $block_sz) + ($finish._M_cur - $finish._M_first)
         end
 
-        # limit to print
+        # decide how many to print
         if $argc >= 2
-            set $limit = $arg1
-            if $limit < $size
-                set $to_print = $limit
-            else
-                set $to_print = $size
-            end
+            set $to_print = ($arg1 < $size) ? $arg1 : $size
         else
             set $to_print = $size
         end
 
-        if $size <= 0
-            printf "Queue size = 0\n"
-            end
-        end
+        # always先打印总大小，便于校验
+        printf "Queue size = %ld\n", $size
 
-        # iterate
-        set $i = 0
-        set $node = $snode
-        set $cur  = $scur
-        set $first = $sfirst
-        set $last  = $slast
+        if $to_print > 0
+            set $i = 0
+            set $node = $snode
+            set $cur  = $scur
+            set $first = $sfirst
+            set $last  = $slast
 
-        while $i < $to_print
-            if $node == $fnode
-                set $end = $finish._M_cur
-                while ($cur != $end) && ($i < $to_print)
-                    printf "[%ld] = ", $i
-                    p *$cur
-                    set $cur++
-                    set $i++
+            while $i < $to_print
+                if $node == $fnode
+                    set $endcur = $finish._M_cur
+                    while ($cur != $endcur) && ($i < $to_print)
+                        printf "[%ld] = ", $i
+                        p *$cur
+                        set $cur++
+                        set $i++
+                    end
+                    # 退出外层 while 的方式：让条件失效
+                    set $i = $to_print
+                else
+                    while ($cur != $last) && ($i < $to_print)
+                        printf "[%ld] = ", $i
+                        p *$cur
+                        set $cur++
+                        set $i++
+                    end
+                    # 下一段
+                    set $node++
+                    set $first = *$node
+                    set $cur   = $first
+                    set $last  = $first + $block_sz
                 end
-                break
-            else
-                while ($cur != $last) && ($i < $to_print)
-                    printf "[%ld] = ", $i
-                    p *$cur
-                    set $cur++
-                    set $i++
-                end
-                set $node++
-                set $first = *$node
-                set $cur   = $first
-                set $last  = $first + $block_sz
             end
-        end
 
-        printf "Queue size = %ld (printed %ld)\n", $size, $i
+            printf "(printed %ld)\n", $to_print
+        end
     end
 end
 
 document pqueue
     Prints std::queue<T> (libstdc++/deque) contents and size without calling inline size().
     Usage:
-      pqueue <queue>             # print all
+      pqueue <queue>             # print all elements
       pqueue <queue> <max>       # print at most <max> elements
     Example:
       pqueue m_schedSendQueue
       pqueue m_schedSendQueue 32
     Note: relies on libstdc++ deque internals; not for libc++.
 end
-# --------------------------------------------------------------------
