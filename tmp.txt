@@ -1,82 +1,75 @@
-define pqueue
-    if $argc == 0
-        help pqueue
-    else
-        set $q = $arg0
+/**
+ * @brief 准备或重新创建 GVCP 心跳套接字
+ * * @param port 要绑定的本地端口。如果为 0，则由内核随机分配。
+ * @param recreate_fd 是否强制重新创建文件描述符。
+ * - 1: 强制关闭现有套接字并创建新的。
+ * - 0: 如果套接字已存在，则不执行任何操作直接返回成功。
+ * @return int 0 表示成功, -1 表示失败。
+ */
+static int prepare_gvcp_heart_socket(uint16_t port, int recreate_fd)
+{
+	int sock_fd = -1;
+	struct sockaddr_in *local_addr = &heart_gvcp.local_addr;
+	struct sockaddr_in *host_addr = &heart_gvcp.host_addr;
+	struct device_state_t *state = get_dev_device_state();
+	socklen_t addr_len = sizeof(struct sockaddr_in);
+	int broadcst = 1;
 
-        # deque iterators & block info (libstdc++)
-        set $start   = $q.c._M_impl._M_start
-        set $finish  = $q.c._M_impl._M_finish
-        set $snode   = $start._M_node
-        set $fnode   = $finish._M_node
-        set $sfirst  = $start._M_first
-        set $slast   = $start._M_last
-        set $scur    = $start._M_cur
-        set $block_sz = $slast - $sfirst
+	// 新增逻辑：根据 recreate_fd 判断是否需要执行操作
+	// 如果不强制重建，并且 socket 已经有效，直接返回成功
+	if (!recreate_fd && heart_gvcp.sock_fd > 0)
+	{
+		LOGD("GVCP heart socket already prepared, skipping recreation.\r\n");
+		return 0;
+	}
+	
+	// 如果 socket 已经存在，则关闭它，为创建新 socket 做准备
+	if (heart_gvcp.sock_fd > 0)
+	{
+		close(heart_gvcp.sock_fd);
+		heart_gvcp.sock_fd = -1;
+	}
 
-        # compute size w/o inlined size()
-        if $snode == $fnode
-            set $size = $finish._M_cur - $scur
-        else
-            set $full_nodes = $fnode - $snode - 1
-            set $size = ($slast - $scur) + ($full_nodes * $block_sz) + ($finish._M_cur - $finish._M_first)
-        end
+	sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock_fd < 0) 
+	{
+		LOGE("gvcp_heart_thread: socket failed\r\n");
+		return -1;
+	}
+	
+	if(setsockopt(sock_fd, SOL_SOCKET, SO_BROADCAST, (void *)&broadcst, sizeof(broadcst)) < 0)
+	{		
+		LOGE("socket option broadcast set error:%s\n ", strerror(errno));
+		close(sock_fd);
+		return -1;
+	}
 
-        # decide how many to print
-        if $argc >= 2
-            set $to_print = ($arg1 < $size) ? $arg1 : $size
-        else
-            set $to_print = $size
-        end
+	memset((char *)local_addr, 0, sizeof(struct sockaddr_in));
+	
+	// 修改点：使用传入的 port 参数，而不是硬编码的 0
+	makeAddrByString(AF_INET, NULL, port, local_addr);
 
-        # always先打印总大小，便于校验
-        printf "Queue size = %ld\n", $size
+	if (bind(sock_fd, (struct sockaddr *)local_addr, sizeof(struct sockaddr_in)) < 0) 
+	{
+		LOGE("gvcp_thread: bind failed 0x%x for port %u\r\n", errno, port);
+		close(sock_fd);
+		sock_fd = -1;
+		return -1;
+	}
 
-        if $to_print > 0
-            set $i = 0
-            set $node = $snode
-            set $cur  = $scur
-            set $first = $sfirst
-            set $last  = $slast
+	// 这个调用非常重要，特别是当 port 为 0 时，可以获取内核实际分配的端口号
+	if (getsockname(sock_fd, (struct sockaddr*)local_addr, &addr_len) != 0)
+	{
+		LOGE("gvcp_thread: getsockname failed 0x%x\r\n", errno);
+		close(sock_fd);
+		return -1;
+	}
+	state->GevHeartBeatPort = ntohs(local_addr->sin_port);
+    LOGI("GVCP heart socket is bound to port %d\n", state->GevHeartBeatPort);
 
-            while $i < $to_print
-                if $node == $fnode
-                    set $endcur = $finish._M_cur
-                    while ($cur != $endcur) && ($i < $to_print)
-                        printf "[%ld] = ", $i
-                        p *$cur
-                        set $cur++
-                        set $i++
-                    end
-                    # 退出外层 while 的方式：让条件失效
-                    set $i = $to_print
-                else
-                    while ($cur != $last) && ($i < $to_print)
-                        printf "[%ld] = ", $i
-                        p *$cur
-                        set $cur++
-                        set $i++
-                    end
-                    # 下一段
-                    set $node++
-                    set $first = *$node
-                    set $cur   = $first
-                    set $last  = $first + $block_sz
-                end
-            end
+	memset((char *)host_addr, 0, addr_len);
 
-            printf "(printed %ld)\n", $to_print
-        end
-    end
-end
+	heart_gvcp.sock_fd = sock_fd;
 
-document pqueue
-    Prints std::queue<T> (libstdc++/deque) contents and size without calling inline size().
-    Usage:
-      pqueue <queue>             # print all elements
-      pqueue <queue> <max>       # print at most <max> elements
-    Example:
-      pqueue m_schedSendQueue
-      pqueue m_schedSendQueue 32
-    Note: relies on libstdc++ deque internals; not for libc++.
-end
+	return 0;
+}
