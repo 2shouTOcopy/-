@@ -1,70 +1,99 @@
-static void *gvcp_heart_thread(void *arg)
+static int GevCCP_handler(struct gev_register *reg, char *buf, int size)
 {
-	struct gvcp *gvcp = NULL; 
-	int rx_len;
-	socklen_t len = sizeof(struct sockaddr_in);
-	thread_set_name("sc_gvcp_heart_thread");
-#ifndef ASAN_SUPPORT
-	thread_bind_cpu(1);
-#endif
-	gvcp = (struct gvcp *)arg;
-	int result;
-	struct gvcp_packet *aaaa;
-
-	fd_set rset;
-	if (NULL == gvcp) 
-	{
-		LOGE("gvcp is NULL\r\n");
-		return NULL;
-	}
+	int i = 0;
+	int ret = 0;
+	unsigned int ccp;
+	char *p = NULL;
+	char key_buf[SC_MODULE_PARAM_MAX_LEN] = {0};
+	char value_buf[SC_MODULE_PARAM_MAX_LEN] = {0};
     
-    // 修改点：调用新的函数接口
-    // 第一次创建时，传入 0 表示使用随机端口，传入 1 表示强制创建
-	if (prepare_gvcp_heart_socket(0, 1) != 0) 
+    // 新增：定义功能标志变量，默认为0 (无任何特殊功能)
+    uint32_t feature_flags = 0;
+    bool use_random_port = false;
+
+	// --- 修改点 1: 检查报文长度 ---
+	// 兼容新旧两种长度，如果不是其中任何一种，则视为参数错误
+	if (size != LEGACY_LOGIN_PAYLOAD_SIZE && size != EXTENDED_LOGIN_PAYLOAD_SIZE)
 	{
-		LOGE("Fail to prepare gevcp socket\r\n");
-		return NULL;
+		LOGE("Invalid login payload size: %d\r\n", size);
+		return SC_EC_PARAM;
 	}
-	
-	LOGD("GVCP enter heart thread loop\r\n");
-	while (1) 
+
+	return_if_nullptr(); // 假设这是检查 reg 等指针的宏
+	ccp = ntohl(*(unsigned int *)buf);
+
+    // --- 新增点 2: 解析功能标志 ---
+    // 如果是新版客户端发来的扩展长度报文，则解析最后4个字节的功能标志
+    if (size == EXTENDED_LOGIN_PAYLOAD_SIZE)
+    {
+        p = buf + LEGACY_LOGIN_PAYLOAD_SIZE; // 指向功能标志字段
+        feature_flags = ntohl(*(uint32_t *)p);
+        LOGI("Extended login detected with feature flags: 0x%x\r\n", feature_flags);
+    }
+    
+    // --- 新增点 3: 根据功能标志执行操作 ---
+    // 使用位与操作检查是否设置了随机端口标志
+    if ((feature_flags & FEATURE_FLAG_RANDOM_PORT) != 0)
+    {
+        use_random_port = true;
+    }
+    
+    // 根据标志位统一设置相关模块
+    ext_tcp_param_init(use_random_port);
+    sc_gvcp_set_heart_port(use_random_port);
+    LOGI("Random port feature is %s\r\n", use_random_port ? "ENABLED" : "DISABLED");
+
+
+	// --- 原有逻辑部分 (基本不变) ---
+	if (0 == ccp)
 	{
-        // ... (循环体内部代码保持不变) ...
-		if(heart_gvcp.sock_fd < 0)
+		// ... (原有断开连接的逻辑不变)
+		for (i = 0 ; i < MAX_STREAM_CHANNEL; i++)
 		{
-			usleep(100000);
-			// 可以在这里增加重试逻辑，比如重新调用 prepare_gvcp_heart_socket
-			continue;		
+			reg->device_configs->GevSCP[i] = 0;
+			reg->device_configs->GevSCSP[i] = 0;
 		}
 
-		FD_ZERO(&rset);
-		FD_SET(heart_gvcp.sock_fd, &rset);
-		result = select(heart_gvcp.sock_fd + 1, &rset, NULL, NULL, NULL);
-		if (result > 0)
+		gvsp_stop_stream(0);
+		gvsp_close_stream(0);
+		gvcp_controller_release();
+		sc_gvcp_controller_release();
+		reg->device_state_register->AcquisitionState = 0;
+
+		if (1 == reg->device_configs->AutoWork)
 		{
-			if (FD_ISSET(heart_gvcp.sock_fd, &rset))
-			{	
-				rx_len = recvfrom(heart_gvcp.sock_fd, (void *)gvcp_heart_net.recv_buf, sizeof(gvcp_heart_net.recv_buf), 0, (struct sockaddr *)&heart_gvcp.host_addr, &len);
-				if (rx_len > 0)
-				{
-					if (GVCP_DUMP_OPEN == gvcp_dump_type)
-					{
-						dump_buffer((char *)gvcp_heart_net.recv_buf, rx_len);
-					}
-					
-					gvcp_heart_handler((struct gvcp_packet *)gvcp_heart_net.recv_buf, SC_GVCP_HEART_PORT, (ip_addr_t)heart_gvcp.host_addr.sin_addr.s_addr,
-									heart_gvcp.host_addr.sin_port, rx_len);
-				}
-				else
-				{
-					LOGE("gvcp upd recvfrom ERROR\r\n");
-				}
-			}
+			LOGE("[W]%s acq_stop\r\n", __func__);
+			set_acq_start(1);
 		}
-		else
-		{
-			LOGE("read socket error\n");
-		}
+		reg->device_state_register->GevCCPIsConnect = 0;
 	}
-	return NULL;
+	else
+	{
+		// ... (原有建立连接的逻辑不变)
+		if (1 == reg->device_configs->AutoWork)
+		{
+			LOGE("[W]%s acq_start\r\n", __func__);
+			set_acq_start(0);
+		}
+		reg->device_state_register->GevCCPIsConnect = GBR_CONTROL_CHANNEL_PRIVILEGE_SC_CONNECT;
+	}
+
+	reg->device_state_register->GevCCP = ccp;
+	
+    // --- 修改点 4: 移除原先对 size 的判断 ---
+	// 无论是新旧客户端，都会包含用户和密码信息，所以直接解析
+	p = buf + sizeof(int);
+	memcpy(key_buf, p, LOGIN_USER_NAME_LEN);
+	p = buf + sizeof(int) + LOGIN_USER_NAME_LEN;
+	memcpy(value_buf, p, LOGIN_USER_PASSWD_LEN);
+	
+	LOGI("user name:%s, passwd:%s, ccp:0x%x\r\n", key_buf, value_buf, ccp);
+	if ((ret = comif_login(key_buf, value_buf)) != 0)
+	{
+		// 登录失败，可能需要根据 ccp 的值决定是否回滚上面的状态设置
+		LOGE("Login failed for user: %s, error code: %d\r\n", key_buf, ret);
+		return ret;
+	}
+
+	return 0;
 }
