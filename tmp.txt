@@ -1,75 +1,70 @@
-/**
- * @brief 准备或重新创建 GVCP 心跳套接字
- * * @param port 要绑定的本地端口。如果为 0，则由内核随机分配。
- * @param recreate_fd 是否强制重新创建文件描述符。
- * - 1: 强制关闭现有套接字并创建新的。
- * - 0: 如果套接字已存在，则不执行任何操作直接返回成功。
- * @return int 0 表示成功, -1 表示失败。
- */
-static int prepare_gvcp_heart_socket(uint16_t port, int recreate_fd)
+static void *gvcp_heart_thread(void *arg)
 {
-	int sock_fd = -1;
-	struct sockaddr_in *local_addr = &heart_gvcp.local_addr;
-	struct sockaddr_in *host_addr = &heart_gvcp.host_addr;
-	struct device_state_t *state = get_dev_device_state();
-	socklen_t addr_len = sizeof(struct sockaddr_in);
-	int broadcst = 1;
+	struct gvcp *gvcp = NULL; 
+	int rx_len;
+	socklen_t len = sizeof(struct sockaddr_in);
+	thread_set_name("sc_gvcp_heart_thread");
+#ifndef ASAN_SUPPORT
+	thread_bind_cpu(1);
+#endif
+	gvcp = (struct gvcp *)arg;
+	int result;
+	struct gvcp_packet *aaaa;
 
-	// 新增逻辑：根据 recreate_fd 判断是否需要执行操作
-	// 如果不强制重建，并且 socket 已经有效，直接返回成功
-	if (!recreate_fd && heart_gvcp.sock_fd > 0)
+	fd_set rset;
+	if (NULL == gvcp) 
 	{
-		LOGD("GVCP heart socket already prepared, skipping recreation.\r\n");
-		return 0;
+		LOGE("gvcp is NULL\r\n");
+		return NULL;
+	}
+    
+    // 修改点：调用新的函数接口
+    // 第一次创建时，传入 0 表示使用随机端口，传入 1 表示强制创建
+	if (prepare_gvcp_heart_socket(0, 1) != 0) 
+	{
+		LOGE("Fail to prepare gevcp socket\r\n");
+		return NULL;
 	}
 	
-	// 如果 socket 已经存在，则关闭它，为创建新 socket 做准备
-	if (heart_gvcp.sock_fd > 0)
+	LOGD("GVCP enter heart thread loop\r\n");
+	while (1) 
 	{
-		close(heart_gvcp.sock_fd);
-		heart_gvcp.sock_fd = -1;
+        // ... (循环体内部代码保持不变) ...
+		if(heart_gvcp.sock_fd < 0)
+		{
+			usleep(100000);
+			// 可以在这里增加重试逻辑，比如重新调用 prepare_gvcp_heart_socket
+			continue;		
+		}
+
+		FD_ZERO(&rset);
+		FD_SET(heart_gvcp.sock_fd, &rset);
+		result = select(heart_gvcp.sock_fd + 1, &rset, NULL, NULL, NULL);
+		if (result > 0)
+		{
+			if (FD_ISSET(heart_gvcp.sock_fd, &rset))
+			{	
+				rx_len = recvfrom(heart_gvcp.sock_fd, (void *)gvcp_heart_net.recv_buf, sizeof(gvcp_heart_net.recv_buf), 0, (struct sockaddr *)&heart_gvcp.host_addr, &len);
+				if (rx_len > 0)
+				{
+					if (GVCP_DUMP_OPEN == gvcp_dump_type)
+					{
+						dump_buffer((char *)gvcp_heart_net.recv_buf, rx_len);
+					}
+					
+					gvcp_heart_handler((struct gvcp_packet *)gvcp_heart_net.recv_buf, SC_GVCP_HEART_PORT, (ip_addr_t)heart_gvcp.host_addr.sin_addr.s_addr,
+									heart_gvcp.host_addr.sin_port, rx_len);
+				}
+				else
+				{
+					LOGE("gvcp upd recvfrom ERROR\r\n");
+				}
+			}
+		}
+		else
+		{
+			LOGE("read socket error\n");
+		}
 	}
-
-	sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sock_fd < 0) 
-	{
-		LOGE("gvcp_heart_thread: socket failed\r\n");
-		return -1;
-	}
-	
-	if(setsockopt(sock_fd, SOL_SOCKET, SO_BROADCAST, (void *)&broadcst, sizeof(broadcst)) < 0)
-	{		
-		LOGE("socket option broadcast set error:%s\n ", strerror(errno));
-		close(sock_fd);
-		return -1;
-	}
-
-	memset((char *)local_addr, 0, sizeof(struct sockaddr_in));
-	
-	// 修改点：使用传入的 port 参数，而不是硬编码的 0
-	makeAddrByString(AF_INET, NULL, port, local_addr);
-
-	if (bind(sock_fd, (struct sockaddr *)local_addr, sizeof(struct sockaddr_in)) < 0) 
-	{
-		LOGE("gvcp_thread: bind failed 0x%x for port %u\r\n", errno, port);
-		close(sock_fd);
-		sock_fd = -1;
-		return -1;
-	}
-
-	// 这个调用非常重要，特别是当 port 为 0 时，可以获取内核实际分配的端口号
-	if (getsockname(sock_fd, (struct sockaddr*)local_addr, &addr_len) != 0)
-	{
-		LOGE("gvcp_thread: getsockname failed 0x%x\r\n", errno);
-		close(sock_fd);
-		return -1;
-	}
-	state->GevHeartBeatPort = ntohs(local_addr->sin_port);
-    LOGI("GVCP heart socket is bound to port %d\n", state->GevHeartBeatPort);
-
-	memset((char *)host_addr, 0, addr_len);
-
-	heart_gvcp.sock_fd = sock_fd;
-
-	return 0;
+	return NULL;
 }
