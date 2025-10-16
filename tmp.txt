@@ -1,80 +1,95 @@
-好的，我们来深入探讨您提到的 LD_DEBUG 环境变量。您敏锐地指出了 glibc 和 uClibc 在这一点上的差异，这正是嵌入式开发中经常遇到的“工具链鸿沟”问题。
-下面我将详细解释 LD_DEBUG，并针对您所在的 uClibc 环境，给出实用的替代排查策略。
-LD_DEBUG 环境变量详解 (glibc 环境)
-1. 作用 (Purpose)
-LD_DEBUG 是 glibc 动态链接器（ld.so 或 ld-linux.so）内置的一个强大的调试工具。当设置了这个环境变量后，ld.so 会在程序运行时，向标准错误输出（stderr）打印出极其详细的内部工作日志。
-简单来说，它的作用就是让动态链接过程完全透明化。你可以用它来精确地观察：
- * 链接器是如何搜索共享库（.so）的。
- * 它是如何解析和绑定（resolve & bind）符号的。
- * 库之间的依赖关系是如何被处理的。
- * 符号版本控制是如何工作的。
-2. 适用场景 (Applicable Scenarios)
-LD_DEBUG 是解决复杂链接问题的终极武器，尤其适用于以下场景：
- * 符号解析失败：完美应对我们之前讨论的 undefined symbol 问题。它会准确地告诉你，为了查找某个符号，它搜索了哪些库，以及在每个库中的查找结果。
- * 库版本冲突：当系统中存在多个版本的同名库时，LD_DEBUG 可以显示程序实际加载的是哪个路径下的哪个库文件，帮你快速定位是否加载了错误的或不兼容的版本。
- * 依赖地狱 (Dependency Hell)：清晰地展示一个库所依赖的其他库（DT_NEEDED）是如何被依次加载的，帮你理清复杂的依赖链。
- * 理解链接器路径解析：当你想搞清楚 rpath、runpath 和 LD_LIBRARY_PATH 之间的复杂交互和优先级时，LD_DEBUG 会把每一步的搜索路径都打印出来，一目了然。
- * 性能分析：通过分析符号绑定的时机（立即绑定 vs 延迟绑定），可以对程序的启动性能有更深入的了解。
-3. 如何使用 (How to Use)
-LD_DEBUG 通过不同的参数来控制输出内容的详细程度。
-基本语法:
-LD_DEBUG=<option1,option2,...> ./your_program
+// src/redline_manager.hpp
+#pragma once
+extern "C" {
+#include "gvcp_redline.h"
+#include "redline_err.h"
+}
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <thread>
+#include <chrono>
 
-常用选项 (<option>):
- * libs：显示库的搜索过程和加载结果。这是最常用的选项之一。
-   # 示例输出片段
-find library=libpthread.so.0; searching
-/lib/libpthread.so.0
+class RedlineManager {
+public:
+    static RedlineManager& Instance();
 
- * symbols：显示符号的查找和解析过程，包括符号在哪个库中被找到。
-   # 示例输出片段
-symbol=foo; looking up in file=/lib/libc.so.6
-symbol=foo; looking up in file=/lib/libbar.so
-symbol=foo; binding to /lib/libbar.so
+    // 固化存取
+    int LoadSolidParams();
+    int SaveSolidParams();
 
- * bindings：显示符号绑定的详细信息，告诉你哪个模块的哪个符号最终绑定到了哪个库的实现上。
- * versions：显示库的版本依赖关系和解析过程。
- * all：开启所有调试选项，输出信息量巨大，通常用于全面分析。
- * help：一个非常有用的选项，执行后会打印出所有可用的调试选项及其说明，而不会真正运行程序。
-   LD_DEBUG=help ./your_program
+    // 设备/登录/锁定状态读取
+    uint8_t  GetActiveSts() const;
+    uint8_t  GetLockSts() const;
+    uint16_t GetLockTime() const;
 
-实战案例:
-针对之前的 can't resolve symbol 'HKANN_Scheduler_Done' 问题，如果在 glibc 环境下，我们会这样调试：
-LD_DEBUG=symbols,libs ./m315_app
+    int  GetLoginSts() const;
+    int  SetLoginSts(int sts);
+    int  GetAuthSts() const;
+    int  GetUpgAuthSts() const;
 
-然后，在海量的输出中 grep HKANN_Scheduler_Done，你就能看到动态链接器为了寻找这个符号，依次检查了哪些库，最终因为在所有搜索路径中都找不到而放弃的完整“心路历程”。
-在 uClibc 环境下的现实与应对策略
-核心差异：uClibc 不支持 LD_DEBUG
-正如您所指出的，您所在的 315 平台使用 uClibc。
-uClibc (及其现代分支 uClibc-ng) 是一个为嵌入式系统设计的轻量级C库。为了追求小体积和高效率，它裁剪了 glibc 中的许多功能，其中就包括复杂而庞大的 LD_DEBUG 调试日志系统。
-因此，在 uClibc 环境下，直接设置 LD_DEBUG 环境变量是无效的，动态链接器会忽略它。
-替代排查策略
-虽然没有 LD_DEBUG 这个“一键式”的解决方案，但我们可以组合使用其他标准Linux工具，同样能够达到诊断问题的目的。这种组合拳的思路，对于嵌入式工程师来说更为重要。
- * strace (老朋友，新用法)
-   我们可以用 strace 来模拟 LD_DEBUG=libs 的效果，观察链接器尝试打开了哪些库文件。
-   strace -e trace=open,openat -o strace_load.log ./your_program
+    const uint8_t* GetInitDropbearCmd() const;
+    bool IsSupRegOperation() const;
 
-   查看 strace_load.log 文件，grep 你的库名或者标准的库路径（如 /lib, /usr/lib），你就能看到链接器为了加载依赖库，都尝试了哪些路径。如果它尝试打开的文件返回 ENOENT (No such file or directory)，就说明你的库放错了位置，或者 LD_LIBRARY_PATH / rpath 设置有误。
- * ldd (查看直接依赖)
-   ldd 工具可以静态地分析可执行文件或共享库，并列出它的直接依赖库 (DT_NEEDED) 以及链接器找到的这些库的实际路径。
-   ldd ./your_program
-ldd ./path/to/your.so
+    // Cookie 维护
+    void StartCookieMonitor();
+    void UpdateCookie(const char* cookie);
 
-   > 注意：ldd 在 uClibc 系统上可能是一个脚本，其背后是通过设置 LD_TRACE_LOADED_OBJECTS=1 来调用动态链接器自身实现的。
-   > 
- * readelf (深入动态节)
-   这是最强大、最底层的分析工具。用它可以直接读取二进制文件中的 .dynamic 节，这里包含了链接器工作所需的所有元信息。
-   readelf -d ./your_program | grep 'NEEDED\|RPATH\|RUNPATH'
+    // GVCP 命令处理（对外C API转调）
+    int HandleInterchange(const gvcp_packet* req, gvcp_packet* ack,
+                          unsigned short pkt_id, int* size, bool broadcast);
+    int HandleActive(const gvcp_packet* req, gvcp_packet* ack,
+                     unsigned short pkt_id, int* size);
+    int HandleRestore(const gvcp_packet* req, gvcp_packet* ack,
+                      unsigned short pkt_id, int* size);
+    int HandleLogin(const gvcp_packet* req, gvcp_packet* ack,
+                    unsigned short pkt_id, int* size, bool broadcast);
+    int HandleChangePwd(const gvcp_packet* req, gvcp_packet* ack,
+                        unsigned short pkt_id, int* size);
+    int HandleChangeIP(const gvcp_packet* req, gvcp_packet* ack,
+                       unsigned short pkt_id, int* size);
+    int HandleResetPwd(const gvcp_packet* req, gvcp_packet* ack,
+                       unsigned short pkt_id, int* size, ip_addr_t peer_ip);
+    int HandleUpgrade(const gvcp_packet* req, gvcp_packet* ack,
+                      unsigned short pkt_id, int* size);
+    int HandleGetDevInfo(const gvcp_packet* req, gvcp_packet* ack,
+                         unsigned short pkt_id, int* size);
+    int HandleGetLockInfo(const gvcp_packet* req, gvcp_packet* ack,
+                          unsigned short pkt_id, int* size, bool broadcast);
+    int DefaultActive();
 
-   * NEEDED：列出了所有的直接依赖库。这是最权威的依赖列表。如果一个库没出现在这里，链接器默认是不会主动加载它的。
-   * RPATH/RUNPATH：显示了编码在二进制文件内部的库搜索路径。
-总结
-| 特性 | glibc 环境 | uClibc 环境 |
-|---|---|---|
-| 调试大杀器 | LD_DEBUG 环境变量 | (不支持) |
-| 替代方案 | (同样适用) | 组合使用以下工具: |
-| 模拟 LD_DEBUG=libs | - | strace -e trace=open,openat |
-| 查看依赖关系 | ldd | ldd |
-| 查看权威元信息 | readelf -d | readelf -d |
-结论：
-在您的 uClibc 平台上，虽然无法使用便捷的 LD_DEBUG，但解决链接问题的核心思想不变：理清依赖链，并追踪链接器的搜索路径。通过组合运用 readelf 来分析“期望的依赖”，再用 strace 来观察“实际的搜索行为”，您完全可以手动还原出 LD_DEBUG 所能提供的信息，从而精准定位问题。
+    // A/B互斥
+    bool TryAcquireSession();
+    void ReleaseSession();
+    bool HasActiveSession() const;
+
+private:
+    RedlineManager();
+    ~RedlineManager();
+
+    RedlineManager(const RedlineManager&) = delete;
+    RedlineManager& operator=(const RedlineManager&) = delete;
+
+    void cookieThreadLoop_();
+    bool isLocked_() const;
+    void punishOnLoginFail_();
+    void clearLoginFail_();
+
+private:
+    mutable std::mutex mtx_;
+    REDLINE_SOLIDIFY_PARAM_T solid_{};
+    REDLINE_DEVICE_STS_T     dev_{};
+    REDLINE_COOKIE_UPDATE_T  cookie_meta_{};
+
+    struct Session {
+        bool online = false;
+        uint32_t src_ip = 0;
+        uint16_t src_port = 0;
+        std::array<uint8_t, 16> cookie{};
+        std::chrono::steady_clock::time_point cookie_update_tp{};
+    } session_;
+
+    std::thread  cookie_thr_;
+    std::atomic<bool> cookie_thr_run_{false};
+};
