@@ -1,95 +1,280 @@
-// src/redline_manager.hpp
-#pragma once
-extern "C" {
-#include "gvcp_redline.h"
-#include "redline_err.h"
+// src/redline_manager.cpp
+#include "redline_manager.hpp"
+#include "redline_store.hpp"
+#include "redline_wire.h"
+#include "redline_crypto.hpp"
+#include "redline_tls.hpp"
+
+#include <cstring>
+
+RedlineManager& RedlineManager::Instance() {
+    static RedlineManager inst;
+    return inst;
 }
-#include <array>
-#include <atomic>
-#include <cstdint>
-#include <mutex>
-#include <thread>
-#include <chrono>
 
-class RedlineManager {
-public:
-    static RedlineManager& Instance();
+RedlineManager::RedlineManager() {
+    std::memset(&solid_, 0, sizeof(solid_));
+    std::memset(&dev_,   0, sizeof(dev_));
+    std::memset(&cookie_meta_, 0, sizeof(cookie_meta_));
+}
 
-    // 固化存取
-    int LoadSolidParams();
-    int SaveSolidParams();
+RedlineManager::~RedlineManager() {
+    cookie_thr_run_ = false;
+    if (cookie_thr_.joinable()) cookie_thr_.join();
+}
 
-    // 设备/登录/锁定状态读取
-    uint8_t  GetActiveSts() const;
-    uint8_t  GetLockSts() const;
-    uint16_t GetLockTime() const;
+int RedlineManager::LoadSolidParams() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return RedlineStore::Load(solid_);
+}
 
-    int  GetLoginSts() const;
-    int  SetLoginSts(int sts);
-    int  GetAuthSts() const;
-    int  GetUpgAuthSts() const;
+int RedlineManager::SaveSolidParams() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return RedlineStore::Save(solid_);
+}
 
-    const uint8_t* GetInitDropbearCmd() const;
-    bool IsSupRegOperation() const;
+uint8_t RedlineManager::GetActiveSts() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return solid_.bActiveSts;
+}
+uint8_t RedlineManager::GetLockSts() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return dev_.lock_sts;
+}
+uint16_t RedlineManager::GetLockTime() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return dev_.lock_times;
+}
 
-    // Cookie 维护
-    void StartCookieMonitor();
-    void UpdateCookie(const char* cookie);
+int RedlineManager::GetLoginSts() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return dev_.login_sts1;
+}
+int RedlineManager::SetLoginSts(int sts) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    dev_.login_sts1 = sts;
+    return REDL_OK;
+}
+int RedlineManager::GetAuthSts() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return dev_.auth_sts;
+}
+int RedlineManager::GetUpgAuthSts() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return dev_.upg_auth;
+}
 
-    // GVCP 命令处理（对外C API转调）
-    int HandleInterchange(const gvcp_packet* req, gvcp_packet* ack,
-                          unsigned short pkt_id, int* size, bool broadcast);
-    int HandleActive(const gvcp_packet* req, gvcp_packet* ack,
-                     unsigned short pkt_id, int* size);
-    int HandleRestore(const gvcp_packet* req, gvcp_packet* ack,
-                      unsigned short pkt_id, int* size);
-    int HandleLogin(const gvcp_packet* req, gvcp_packet* ack,
-                    unsigned short pkt_id, int* size, bool broadcast);
-    int HandleChangePwd(const gvcp_packet* req, gvcp_packet* ack,
-                        unsigned short pkt_id, int* size);
-    int HandleChangeIP(const gvcp_packet* req, gvcp_packet* ack,
-                       unsigned short pkt_id, int* size);
-    int HandleResetPwd(const gvcp_packet* req, gvcp_packet* ack,
-                       unsigned short pkt_id, int* size, ip_addr_t peer_ip);
-    int HandleUpgrade(const gvcp_packet* req, gvcp_packet* ack,
-                      unsigned short pkt_id, int* size);
-    int HandleGetDevInfo(const gvcp_packet* req, gvcp_packet* ack,
-                         unsigned short pkt_id, int* size);
-    int HandleGetLockInfo(const gvcp_packet* req, gvcp_packet* ack,
-                          unsigned short pkt_id, int* size, bool broadcast);
-    int DefaultActive();
+const uint8_t* RedlineManager::GetInitDropbearCmd() const {
+    static const uint8_t kStub[] = {0}; // TODO: 如有初始脚本/命令，可替换
+    return kStub;
+}
+bool RedlineManager::IsSupRegOperation() const {
+    return true; // TODO: 按产品策略返回
+}
 
-    // A/B互斥
-    bool TryAcquireSession();
-    void ReleaseSession();
-    bool HasActiveSession() const;
+void RedlineManager::StartCookieMonitor() {
+    bool expected = false;
+    if (!cookie_thr_run_.compare_exchange_strong(expected, true)) return;
+    cookie_thr_ = std::thread(&RedlineManager::cookieThreadLoop_, this);
+}
 
-private:
-    RedlineManager();
-    ~RedlineManager();
+void RedlineManager::UpdateCookie(const char* cookie) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    std::snprintf(this->cookie_meta_.last_cookie, sizeof(cookie_meta_.last_cookie),
+                  "%s", cookie ? cookie : "");
+    gettimeofday(&cookie_meta_.update_time, nullptr);
+    if (session_.online) {
+        std::memset(session_.cookie.data(), 0, session_.cookie.size());
+        std::memcpy(session_.cookie.data(), this->cookie_meta_.last_cookie,
+                    std::min(sizeof(cookie_meta_.last_cookie), session_.cookie.size()));
+        session_.cookie_update_tp = std::chrono::steady_clock::now();
+    }
+}
 
-    RedlineManager(const RedlineManager&) = delete;
-    RedlineManager& operator=(const RedlineManager&) = delete;
+void RedlineManager::cookieThreadLoop_() {
+    using namespace std::chrono;
+    const auto kTTL = minutes(3); // 鉴权窗口3分钟
+    while (cookie_thr_run_) {
+        std::this_thread::sleep_for(seconds(1));
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!session_.online) continue;
+        if (session_.cookie_update_tp.time_since_epoch().count() == 0) continue;
+        if (steady_clock::now() - session_.cookie_update_tp > kTTL) {
+            dev_.cookie_timeout_sts = 1;
+            session_.online = false; // 超时下线
+        }
+    }
+}
 
-    void cookieThreadLoop_();
-    bool isLocked_() const;
-    void punishOnLoginFail_();
-    void clearLoginFail_();
+bool RedlineManager::isLocked_() const {
+    // TODO: 结合 lock_start_time + lock_times 计算剩余锁定时间
+    return dev_.lock_sts != 0;
+}
 
-private:
-    mutable std::mutex mtx_;
-    REDLINE_SOLIDIFY_PARAM_T solid_{};
-    REDLINE_DEVICE_STS_T     dev_{};
-    REDLINE_COOKIE_UPDATE_T  cookie_meta_{};
+void RedlineManager::punishOnLoginFail_() {
+    // 登录失败计数/锁定
+    dev_.login_times += 1;
+    if (dev_.login_times >= REDLINE_LOGIN_RETRY_TIME) {
+        dev_.lock_sts = 1;
+        gettimeofday(&dev_.lock_start_time, nullptr);
+        dev_.lock_times = 60; // 例如锁定60s（按你现有逻辑替换）
+    }
+}
 
-    struct Session {
-        bool online = false;
-        uint32_t src_ip = 0;
-        uint16_t src_port = 0;
-        std::array<uint8_t, 16> cookie{};
-        std::chrono::steady_clock::time_point cookie_update_tp{};
-    } session_;
+void RedlineManager::clearLoginFail_() {
+    dev_.login_times = 0;
+    dev_.lock_sts = 0;
+    dev_.lock_times = 0;
+}
 
-    std::thread  cookie_thr_;
-    std::atomic<bool> cookie_thr_run_{false};
-};
+bool RedlineManager::TryAcquireSession() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (session_.online) return false;
+    session_.online = true;
+    return true;
+}
+
+void RedlineManager::ReleaseSession() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    session_.online = false;
+}
+
+bool RedlineManager::HasActiveSession() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return session_.online;
+}
+
+// ========= 命令处理（示范实现：Login；其它保持参数校验+TODO桩） =========
+
+int RedlineManager::HandleInterchange(const gvcp_packet* req, gvcp_packet* ack,
+                                      unsigned short /*pkt_id*/, int* size, bool /*broadcast*/) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: 解析 REDLINE_INTERCHANGE_CMD_T，生成 salt/enRandomString/devE1
+    *size = 0;
+    return REDL_OK;
+}
+
+int RedlineManager::HandleActive(const gvcp_packet* req, gvcp_packet* ack,
+                                 unsigned short /*pkt_id*/, int* size) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    if (GetActiveSts() == DEV_ACTIVATED) return REDL_OK; // 幂等
+
+    // TODO: 校验 enPassword/en1 计算，写 solid_.bActiveSts = DEV_ACTIVATED
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        solid_.bActiveSts = DEV_ACTIVATED;
+    }
+    *size = 0;
+    return SaveSolidParams();
+}
+
+int RedlineManager::HandleRestore(const gvcp_packet* req, gvcp_packet* ack,
+                                  unsigned short /*pkt_id*/, int* size) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: 恢复激活（口令/签名校验通过后生效）
+    *size = 0;
+    return REDL_OK;
+}
+
+int RedlineManager::HandleLogin(const gvcp_packet* req, gvcp_packet* ack,
+                                unsigned short /*pkt_id*/, int* size, bool /*broadcast*/) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    if (GetActiveSts() != DEV_ACTIVATED) return REDL_ENOTACTIVE;
+    if (isLocked_()) return REDL_ESTATE;
+
+    RL_LoginCmdView cmd{};
+    if (!RL_ParseLoginCmd(req, cmd)) {
+        punishOnLoginFail_();
+        return REDL_EPARAM;
+    }
+
+    // A/B 互斥：仅允许唯一在线
+    if (!TryAcquireSession()) {
+        punishOnLoginFail_();
+        return REDL_EBUSY;
+    }
+
+    // TODO: 使用 cmd.enString 结合随机串/盐进行校验，计算 devEn/cookie
+    RL_LoginAckView ackv{};
+    ackv.keepAlivePort  = 0;  // 由产品分配
+    ackv.fileAccessPort = 0;  // 由产品分配
+    ackv.loginFailedTimes = dev_.login_times;
+    ackv.remainLogTimes   = (dev_.login_times < REDLINE_LOGIN_RETRY_TIME)
+                          ? (REDLINE_LOGIN_RETRY_TIME - dev_.login_times) : 0;
+
+    // 生成/更新 Cookie（示例：占位）
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        std::memset(session_.cookie.data(), 0, session_.cookie.size());
+        std::memcpy(session_.cookie.data(), "COOKIE_PLACEHOLDER", 16);
+        session_.cookie_update_tp = std::chrono::steady_clock::now();
+        std::memcpy(ackv.cookie.data(), session_.cookie.data(), session_.cookie.size());
+        // devEn: 使用 cookie 作为随机串计算摘要后取后8字节（此处占位）
+        std::memset(ackv.devEn.data(), 0xCD, ackv.devEn.size());
+    }
+
+    if (!RL_WriteLoginAck(ack, ackv, size)) {
+        ReleaseSession();
+        punishOnLoginFail_();
+        return REDL_EPARAM;
+    }
+
+    clearLoginFail_();
+    SetLoginSts(LOGGED_IN);
+    return REDL_OK;
+}
+
+int RedlineManager::HandleChangePwd(const gvcp_packet* req, gvcp_packet* ack,
+                                    unsigned short /*pkt_id*/, int* size) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    if (GetLoginSts() != LOGGED_IN) return REDL_EPERM;
+    // TODO: 校验 en1String；解密 newPassword；更新固化
+    *size = 0;
+    return SaveSolidParams();
+}
+
+int RedlineManager::HandleChangeIP(const gvcp_packet* req, gvcp_packet* ack,
+                                   unsigned short /*pkt_id*/, int* size) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: 仅允许在鉴权窗口（auth_sts==1 && 未超3min）操作
+    *size = 0;
+    return REDL_OK;
+}
+
+int RedlineManager::HandleResetPwd(const gvcp_packet* req, gvcp_packet* ack,
+                                   unsigned short /*pkt_id*/, int* size, ip_addr_t /*peer_ip*/) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: 校验 encryptString + ivString；重置后 Save
+    *size = 0;
+    return SaveSolidParams();
+}
+
+int RedlineManager::HandleUpgrade(const gvcp_packet* req, gvcp_packet* ack,
+                                  unsigned short /*pkt_id*/, int* size) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: upg_auth 检查、分配upgPort，填充 REDLINE_UPGRADE_ACK_T
+    *size = 0;
+    return REDL_OK;
+}
+
+int RedlineManager::HandleGetDevInfo(const gvcp_packet* req, gvcp_packet* ack,
+                                     unsigned short /*pkt_id*/, int* size) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: 填充 rsaVer / encryptedString[1024]
+    *size = 0;
+    return REDL_OK;
+}
+
+int RedlineManager::HandleGetLockInfo(const gvcp_packet* req, gvcp_packet* ack,
+                                      unsigned short /*pkt_id*/, int* size, bool /*broadcast*/) {
+    if (!req || !ack || !size) return REDL_EPARAM;
+    // TODO: 根据 dev_ 状态回填 REDLINE_LOCK_ACK_T
+    *size = 0;
+    return REDL_OK;
+}
+
+int RedlineManager::DefaultActive() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    // TODO: 默认激活策略（如出厂恢复）
+    return REDL_OK;
+}
