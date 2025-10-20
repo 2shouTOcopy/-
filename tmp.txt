@@ -1,80 +1,176 @@
-extern "C" {
-#include "gvcp_redline.h"
-#include "redline_err.h"
+下面是可直接合入《PD-001 鉴权》里的新增章节与插图（按你给的事实约束：SC/ID 双通路、固定端口、默认关闭 ID 通路、SCMVS 新增节点、共享鉴权状态且登录互斥）。我把位置建议放在 1.1.2 模块框架设计及处理流程 后面，作为 1.1.2A 双通路鉴权机制（SC & ID）；同时在相关子模块（DISCOVERY、LOGIN、FORCEIP）小节里各补充“通路差异化行为”段落。
+
+⸻
+
+1.1.2A 双通路鉴权机制（SC & ID）
+
+1. 设计目标
+
+为满足量产产线测试（ID SDK）与正式业务（SC SDK/SCMVS）的并行诉求，设备侧在同一套鉴权/存储体系上提供两条逻辑通路：
+	•	SC 通路：面向 SC SDK/SCMVS 的业务通路，固定端口 3966/UDP。
+	•	ID 通路：面向产线测试的通路，固定端口 3956/UDP。
+
+两通路共享激活与口令存储（用户名/密码/salt/E1），但登录会话互斥：任一通路成功登录后，另一通路在会话有效期内不可再登录。
+
+2. 默认策略与启用控制
+	•	未激活状态：SC、ID 两通路均可发现与访问（支持激活流程）。
+	•	激活后默认：ID 通路关闭（包括 DISCOVERY 不响应、所有命令不响应），仅 SC 通路开启。
+	•	开启 ID 通路：由 SCMVS 提供节点开关控制：
+	•	节点：/DeviceControl/IDChannelEnable（bool；0 关闭 / 1 打开）
+	•	即时生效（无需重启）。
+	•	开启后，ID 通路恢复 DISCOVERY 与鉴权能力，且与 SC 通路互斥登录。
+	•	互斥规则：
+	•	SC 与 ID 不可同时登录。当一侧已登录：
+	•	另一侧 LOGIN 返回 设备忙（ExclusiveLogin / DeviceBusy）；
+	•	依然允许 INTERCHANGE（交换码） 与 DISCOVERY（仅用于发现与状态显示），但不发放可用 cookie。
+
+注：cookie 共享。同一设备仅维护1 个会话 cookie（即最后一次成功登录/续约的 cookie）。续约/过期逻辑与 PD-001 原则一致。
+
+3. 端口与通路识别
+
+通路	客户端	传输端口（UDP）	作用
+SC	SC SDK / SCMVS	3966	业务通路，激活后长期可用
+ID	ID SDK（产线）	3956	产线专用，激活后默认关闭，可由 /DeviceControl/IDChannelEnable 打开
+
+识别优先级：以端口识别通路（3966=SC，3956=ID）。不再额外引入 Client 标识位。
+
+4. DISCOVERY/LOGIN/其它命令的通路差异化
+	•	DISCOVERY：
+	•	未激活：3966/3956 均响应；
+	•	激活且 IDChannelEnable=0：仅 3966 响应，3956 不响应；
+	•	激活且 IDChannelEnable=1：3966 与 3956 均响应。
+	•	LOGIN/INTERCHANGE/参数写读/FORCEIP/升级：
+	•	通路一致：按 PD-001 流程执行；
+	•	会话互斥：若另一通路已登录，本通路 LOGIN 拒绝，返回“ExclusiveLogin/DeviceBusy”。
+	•	广播行为：
+	•	当 ID 通路关闭时，设备对 3956 端口的广播同样不响应；
+	•	广播鉴权（LOGIN/INTERCHANGE）的可用性遵循各通路开闭状态。
+
+5. 用户名策略
+	•	鉴权存储（激活信息、用户名/密码/salt/E1）共用。
+	•	ID 通路默认仅支持 admin 用户名（与 SC 共用同一口令与盐 E1）。
+
+6. 配置与持久化
+	•	/DeviceControl/IDChannelEnable 为持久化节点（重启保持），默认值：0（关闭）。
+	•	该节点可通过 SC 通路写入（需已登录）；ID 通路关闭时，无法通过 ID 通路修改其值。
+
+⸻
+
+图 3-X SC/ID 双通路鉴权框架图（架构）
+
+@startuml
+title 图 3-X  SC/ID 双通路鉴权框架（端口与互斥）
+
+rectangle "SCMVS (SC SDK)" as SC {
+  [SC 客户端] -down-> (UDP 3966)
+}
+rectangle "ID SDK (产线)" as ID {
+  [ID 客户端] -down-> (UDP 3956)
 }
 
-#include "redline_manager.hpp"
-
-extern "C" {
-
-REDLINE_SOLIDIFY_PARAM_T* redline_get_solid_param() {
-    // 安全起见：不直接暴露内部镜像指针（避免外界写坏）
-    // 如你确实需要，可在 RedlineStore 再提供一个只读快照函数。
-    return nullptr;
+node "设备（SC 相机）" as DEV {
+  frame "GVCP/Safe Stack" {
+    [DISCOVERY]
+    [INTERCHANGE]
+    [LOGIN]
+    [WRITE/READ REG]
+    [FORCEIP]
+    [UPGRADE]
+  }
+  frame "会话/安全底座" {
+    [Cookie 管理(单实例)]
+    [E1/Salt/激活状态 存储]
+    [锁定/失败计数]
+  }
+  database "持久化" as ST
+  [会话/安全底座] - ST
 }
 
-int redline_set_flash_solid_param() { return RedlineManager::Instance().SaveSolidParams(); }
-int redline_get_flash_solid_param() { return RedlineManager::Instance().LoadSolidParams(); }
+(SC 客户端) --> DEV : 3966\n(始终可用)
+(ID 客户端) -[#red,dashed]-> DEV : 3956\n(激活后默认关闭)\n由 /DeviceControl/IDChannelEnable 控制
 
-uint8_t redline_get_active_sts() { return RedlineManager::Instance().GetActiveSts(); }
-uint8_t redline_get_lock_sts()   { return RedlineManager::Instance().GetLockSts(); }
-uint16_t redline_get_lock_time() { return RedlineManager::Instance().GetLockTime(); }
+DEV -[hidden]-> ST
 
-int redline_get_login_sts()      { return RedlineManager::Instance().GetLoginSts(); }
-int redline_set_login_sts(int s) { return RedlineManager::Instance().SetLoginSts(s); }
-int redline_get_auth_sts()       { return RedlineManager::Instance().GetAuthSts(); }
-int redline_get_upg_auth_sts()   { return RedlineManager::Instance().GetUpgAuthSts(); }
+note right of DEV
+- 激活后默认：ID 通路关闭（含 DISCOVERY/LOGIN 均不响应）
+- 开启 ID 通路后：与 SC 通路“登录互斥”
+- Cookie 全局单实例（共享），续约/过期统一
+end note
+@enduml
 
-const uint8_t* redline_get_init_dropbear_cmd() { return RedlineManager::Instance().GetInitDropbearCmd(); }
 
-void redline_cookie_monitor_thread() { RedlineManager::Instance().StartCookieMonitor(); }
-void redline_update_cookie(char* ck) { RedlineManager::Instance().UpdateCookie(ck); }
+⸻
 
-bool redline_is_sup_reg_operation() { return RedlineManager::Instance().IsSupRegOperation(); }
+图 3-Y 双通路典型时序（激活后，开启/关闭 ID 通路）
 
-// —— GVCP 命令处理 —— //
-int gvcp_proc_redline_interchange_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                      unsigned short id, int* sz, int broadcast) {
-    return RedlineManager::Instance().HandleInterchange(r, a, id, sz, broadcast != 0);
-}
-int gvcp_proc_redline_active_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                 unsigned short id, int* sz) {
-    return RedlineManager::Instance().HandleActive(r, a, id, sz);
-}
-int gvcp_proc_redline_retore_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                 unsigned short id, int* sz) {
-    return RedlineManager::Instance().HandleRestore(r, a, id, sz);
-}
-int gvcp_proc_redline_login_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                unsigned short id, int* sz, int broadcast) {
-    return RedlineManager::Instance().HandleLogin(r, a, id, sz, broadcast != 0);
-}
-int gvcp_proc_redline_changepwd_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                    unsigned short id, int* sz) {
-    return RedlineManager::Instance().HandleChangePwd(r, a, id, sz);
-}
-int gvcp_proc_redline_changepIP_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                    unsigned short id, int* sz) {
-    return RedlineManager::Instance().HandleChangeIP(r, a, id, sz);
-}
-int gvcp_proc_redline_resetpwd_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                   unsigned short id, int* sz, ip_addr_t peer_ip) {
-    return RedlineManager::Instance().HandleResetPwd(r, a, id, sz, peer_ip);
-}
-int gvcp_proc_redline_upg_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                              unsigned short id, int* sz) {
-    return RedlineManager::Instance().HandleUpgrade(r, a, id, sz);
-}
-int gvcp_proc_redline_getdevinfo_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                     unsigned short id, int* sz) {
-    return RedlineManager::Instance().HandleGetDevInfo(r, a, id, sz);
-}
-int gvcp_proc_redline_getlockinfo_cmd(const struct gvcp_packet* r, struct gvcp_packet* a,
-                                      unsigned short id, int* sz, int broadcast) {
-    return RedlineManager::Instance().HandleGetLockInfo(r, a, id, sz, broadcast != 0);
-}
-int gvcp_proc_redline_default_active(void) {
-    return RedlineManager::Instance().DefaultActive();
-}
+@startuml
+title 图 3-Y 双通路时序（激活后默认关闭ID；开启后互斥登录）
 
-} // extern "C"
+actor User
+participant "SCMVS\n(3966)" as SC
+participant "ID SDK\n(3956)" as ID
+participant "设备" as DEV
+
+== 激活后默认（ID关闭） ==
+SC -> DEV : DISCOVERY@3966
+DEV --> SC : DISCOVERY_ACK(Active=1, ID=Off)
+ID -> DEV : DISCOVERY@3956
+DEV --> ID : （不响应）
+
+== 通过SC开启ID通路 ==
+User -> SC : 设置 /DeviceControl/IDChannelEnable=1
+SC -> DEV : WRITE_REG(IDChannelEnable=1)\n(已登录)
+DEV --> SC : OK (即时生效)
+
+== 双通路并存，但登录互斥 ==
+ID -> DEV : INTERCHANGE@3956（登录前交换码）
+DEV --> ID : Salt + RandomA
+ID -> DEV : LOGIN(En)@3956
+DEV --> ID : LOGIN_ACK(cookie) 或 BUSY? 
+
+... 若此时 SC 已登录中 ...
+SC -> DEV : 保活 / 参数操作（cookie有效）
+ID -> DEV : LOGIN@3956（尝试并发登录）
+DEV --> ID : ERROR(ExclusiveLogin/DeviceBusy)
+
+== SC 主动退出或 Cookie 过期 ==
+SC -> DEV : LOGOUT/心跳超时
+DEV -> DEV : 释放会话
+
+== ID 获得登录资格 ==
+ID -> DEV : LOGIN@3956（再次尝试）
+DEV --> ID : LOGIN_ACK(cookie)
+
+@enduml
+
+说明：
+	1.	ID 关闭时，设备对 3956 端口的 DISCOVERY 与所有命令不响应。
+	2.	互斥体现在 LOGIN 阶段：若存在有效会话（SC 或 ID 任一），另一侧 LOGIN 返回 ExclusiveLogin/DeviceBusy。
+	3.	cookie 单实例共享：任一通路登录成功后获得的 cookie 即为全局会话 cookie；续约/过期策略不区分通路。
+	4.	ID 通路开启/关闭即时生效；关闭后，现存 ID 会话将被强制失效（建议返回会话过期/被禁用错误码）。
+
+⸻
+
+对原文各小节的补充点位
+	•	1.1.2 模块框架设计及处理流程：加入本小节链接，并在架构图中明确 3966/3956 两路径。
+	•	1.1.4.2 枚举发现（DISCOVERY）：
+	•	新增“通路控制”描述：激活后且 IDChannelEnable=0 时，3956 不响应 DISCOVERY。
+	•	1.1.4.5 登录（LOGIN）：
+	•	新增“互斥登录”与“共享 cookie”说明；定义拒绝登录的错误码（建议：0xE0XX ExclusiveLogin）。
+	•	1.1.4.7 FORCEIP：
+	•	当 ID 通路关闭时，通过 3956 路径的广播/单播鉴权不响应；仅 3966 有效。
+	•	1.1.4.9 参数操作：
+	•	/DeviceControl/IDChannelEnable 的写入需 已登录（SC 通路） 且具管理员权限。
+	•	1.1.4.10 升级：
+	•	升级鉴权与会话沿用通路互斥原则（避免跨通路发起并行升级）。
+
+⸻
+
+错误码与边界建议（可选落地）
+	•	ExclusiveLogin / DeviceBusy：另一通路已持有会话；拒绝本次 LOGIN。
+	•	ChannelDisabled：ID 通路关闭时在 3956 上收到的任何命令均不响应（当前策略），如未来需要可改为显式错误码。
+	•	SessionRevoked：当 ID 通路被关闭时，已存在的 ID 会话被动失效（返回该错误码）。
+
+⸻
+
+如果需要，我可以把以上 PlantUML 导出的 PNG/SVG 也一并给你，或把这些内容按你文档现有编号风格再细化到“图 3-X / 图 3-Y”的序号体系里。
