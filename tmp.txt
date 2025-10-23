@@ -1,334 +1,107 @@
-// src/redline_wire.h
-#pragma once
-extern "C" {
-#include "gvcp_redline.h"
-}
-#include <cstring>
-#include <cstdint>
-#include <array>
+好，我按你“CCP 只保留控制标识 + SdkFeatureFlags”的要求，给出精确改动说明。你可以把下面内容直接放入设计/变更文档里。
 
-// ========== 通用小工具 ==========
-static inline bool RL_CheckSize(const gvcp_packet* pkt, int need) {
-    return pkt && pkt->data && pkt->size >= need;
-}
+⸻
 
-// ========== 1) 交换码 Interchange ==========
+CCP 寄存器变更说明（仅保留控制标识与特征标志）
 
-enum class RL_InterDataMode : uint8_t {
-    Salt_EncryptedRandom = 0,  // inter_data 里用 salt[16]，inter_data2 用 enRandomString[512]
-    Reserved_PlainRandom = 1   // inter_data 里用 reserved2[16]，inter_data2 用 RandomString[16]
-};
+1）变更摘要
+	•	删除字段：用户名（16B）、密码（32B）、会话/任何与登录相关的内容。
+	•	保留字段：
+	•	ctrl_magic（4B）——控制/版本识别用
+	•	sdk_feature_flags（4B）——SDK 特性声明
+	•	寄存器总长度：8 字节（对齐/填充一律不需要；设备按 8B 精确解析）。
+	•	职责调整：
+	•	CCP 不参与鉴权、cookie 安装/替换。
+	•	登录/鉴权严格走 INTERCHANGE + LOGIN；cookie 安装/续期/替换严格走独立请求（如 Write_reg(SessionCookieReg) 或 COOKIE_UPDATE_CMD）。
 
-// —— Host 视图（CMD）——
-struct RL_InterchangeCmdView {
-    uint16_t mode = 0;
-    uint16_t macHigh = 0;
-    uint32_t macLow = 0;
-    std::array<uint8_t,16>  userName{};
-    std::array<uint8_t,896> publicKey{}; // 512 传输字节（base64？）/384 实际公钥字节——按你上层逻辑使用
-};
+⸻
 
-static inline bool RL_ParseInterchangeCmd(const gvcp_packet* pkt, RL_InterchangeCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_INTERCHANGE_CMD_T))) return false;
-    REDLINE_INTERCHANGE_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    out.mode    = ntohs(raw.mode);
-    out.macHigh = ntohs(raw.macHigh);
-    out.macLow  = ntohl(raw.maclow);
-    std::memcpy(out.userName.data(),  raw.auth_data.userName,  out.userName.size());
-    std::memcpy(out.publicKey.data(), raw.auth_data.publicKey, out.publicKey.size());
-    return true;
-}
+2）新寄存器定义
 
-// —— Host 视图（ACK）——
-struct RL_InterchangeAckView {
-    uint32_t reserved1 = 0;
-    RL_InterDataMode mode = RL_InterDataMode::Salt_EncryptedRandom;
-    std::array<uint8_t,16>  salt{};            // 当 mode=Salt_EncryptedRandom 使用
-    std::array<uint8_t,512> enRandomString{};  // 当 mode=Salt_EncryptedRandom 使用
-    std::array<uint8_t,16>  randomString{};    // 当 mode=Reserved_PlainRandom 使用
-    std::array<uint8_t,8>   devE1{};           // 必填：用随机串+盐计算的后8字节
-};
+2.1 二进制布局
 
-static inline bool RL_WriteInterchangeAck(gvcp_packet* pkt, const RL_InterchangeAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_INTERCHANGE_ACK_T raw{};
-    raw.reserved1 = htonl(v.reserved1);
-    if (v.mode == RL_InterDataMode::Salt_EncryptedRandom) {
-        std::memcpy(raw.inter_data.salt, v.salt.data(), v.salt.size());
-        std::memcpy(raw.inter_data2.enRandomString, v.enRandomString.data(), v.enRandomString.size());
-    } else {
-        // reserved2[16] 随意占位（全0），交由上层自定；只在用明文随机串时走这条
-        std::memset(raw.inter_data.reserved2, 0, sizeof(raw.inter_data.reserved2));
-        std::memcpy(raw.inter_data2.RandomString, v.randomString.data(), v.randomString.size());
-    }
-    std::memcpy(raw.devE1, v.devE1.data(), v.devE1.size());
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
+Offset  Size  Name              描述
+0x00    4     ctrl_magic        控制标识（固定魔数/版本识别）
+0x04    4     sdk_feature_flags SDK特征标志（见下）
 
-// ========== 2) 激活 Active ==========
+	•	端序：小端（LE）。
+	•	读写属性：R/W。
+	•	上电默认值：
+	•	ctrl_magic = 固定魔数（建议：0x43435001 // “CCP\1”）
+	•	sdk_feature_flags = 0
 
-// —— Host 视图（CMD）——
-struct RL_ActiveCmdView {
-    std::array<uint8_t,16> username{};
-    std::array<uint8_t,24> enPassword{}; // AES+Base64（你的上层解析）
-};
+2.2 结构体（示例）
 
-static inline bool RL_ParseActiveCmd(const gvcp_packet* pkt, RL_ActiveCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_ACTIVE_CMD_T))) return false;
-    REDLINE_ACTIVE_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    std::memcpy(out.username.data(),   raw.username,   out.username.size());
-    std::memcpy(out.enPassword.data(), raw.enPassword, out.enPassword.size());
-    return true;
-}
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t ctrl_magic;        // 固定魔数，例如 0x43435001
+    uint32_t sdk_feature_flags; // SdkFeatureFlags
+} ccp_reg_t;
+#pragma pack(pop)
 
-// —— Host 视图（ACK）——
-struct RL_ActiveAckView {
-    uint32_t reserved1 = 0;
-    std::array<uint8_t,16> salt{};
-};
+typedef enum {
+    FEATURE_FLAG_RANDOM_PORT = (1u << 0),
+    FEATURE_FLAG_RESERVED_A  = (1u << 1),
+    FEATURE_FLAG_RESERVED_B  = (1u << 2),
+    // 仅表达SDK偏好，不触发协议内隐式动作
+    FEATURE_FLAG_AUTO_RENEW  = (1u << 3),
+} SdkFeatureFlags;
 
-static inline bool RL_WriteActiveAck(gvcp_packet* pkt, const RL_ActiveAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_ACTIVE_ACK_T raw{};
-    raw.reserved1 = htonl(v.reserved1);
-    std::memcpy(raw.salt, v.salt.data(), v.salt.size());
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
+说明：FEATURE_FLAG_AUTO_RENEW 仅作偏好位，cookie 的安装/续期仍需 SDK 主动调用独立请求。
 
-// ========== 3) 恢复激活 Restore (SESTORE) ==========
+⸻
 
-// —— Host 视图（CMD）——
-struct RL_RestoreCmdView {
-    std::array<uint8_t,64> enString{};
-};
+3）兼容与错误处理
+	•	收到旧格式写入（>8B，例如 56B，且用户名/密码字段非零）
+	•	设备直接返回：ERR_USE_NEW_LOGIN_FLOW（建议错误码 0xE101）。
+	•	日志打印："CCP legacy payload detected, login moved to INTERCHANGE+LOGIN; cookie via COOKIE_UPDATE/Write_reg."
+	•	收到长度 ≠ 8B 的写入
+	•	设备返回：ERR_CCP_LENGTH_INVALID（建议 0xE102）。
+	•	任何试图通过 CCP 进行登录/会话相关操作
+	•	返回：ERR_CCP_UNSUPPORTED_OP（建议 0xE103）。
+	•	读取 CCP
+	•	返回当前 ctrl_magic 与 sdk_feature_flags（便于端到端确认）。
 
-static inline bool RL_ParseRestoreCmd(const gvcp_packet* pkt, RL_RestoreCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_SESTORE_CMD_T))) return false;
-    REDLINE_SESTORE_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    std::memcpy(out.enString.data(), raw.enString, out.enString.size());
-    return true;
-}
+注：不要对旧字段“容错解析”或“静默忽略”，务必以显式错误码推动 SDK 升级，避免“看似成功但不生效”的隐患。
 
-// —— Host 视图（ACK）——
-struct RL_RestoreAckView {
-    uint32_t reserved1 = 0;
-};
+⸻
 
-static inline bool RL_WriteRestoreAck(gvcp_packet* pkt, const RL_RestoreAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_SESTORE_ACK_T raw{};
-    raw.reserved1 = htonl(v.reserved1);
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
+4）设备侧实现要点
+	1.	解析器：严格按 8B 读取；超长/短直接报错（见上）。
+	2.	幂等：重复写入相同 sdk_feature_flags 返回成功，设备内部不产生副作用。
+	3.	安全边界：CCP 不触发任何鉴权、cookie 或通路互斥判定。
+	4.	通路无关：3966（SC）/3956（ID）均可写 CCP（仅特性声明）。
+	•	当 ID 通路关闭时，对 3956 的 CCP 写入建议同样不响应（保持“激活后ID关闭”一致策略）。若需允许读取/写入，可在文档中注明“CCP 例外开放”。默认推荐：随通路策略走（ID 关闭→不响应）。
+	5.	日志：记录来源通路（端口）、flags 变更（旧→新）、时间戳。
 
-// ========== 4) 登录 Login ==========
+⸻
 
-// —— Host 视图（CMD）——
-struct RL_LoginCmdView {
-    uint16_t function = 0;
-    uint16_t macHigh  = 0;
-    uint32_t macLow   = 0;
-    std::array<uint8_t,64> enString{};
-};
+5）SDK 侧改动清单（必须）
+	•	移除：向 CCP 写用户名/密码/会话信息的逻辑。
+	•	保留/更新：仅写 8B（ctrl_magic + sdk_feature_flags）。
+	•	登录路径：走 INTERCHANGE + LOGIN；取 cookie 后，调用独立 cookie 请求安装/续期。
+	•	错误处理：识别 ERR_USE_NEW_LOGIN_FLOW / ERR_CCP_LENGTH_INVALID / ERR_CCP_UNSUPPORTED_OP，弹出明确升级提示。
+	•	自检：写入后读取 CCP 校验 flags 生效（可选）。
 
-static inline bool RL_ParseLoginCmd(const gvcp_packet* pkt, RL_LoginCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_LOGIN_CMD_T))) return false;
-    REDLINE_LOGIN_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    out.function = ntohs(raw.Function);
-    out.macHigh  = ntohs(raw.macHigh);
-    out.macLow   = ntohl(raw.maclow);
-    std::memcpy(out.enString.data(), raw.enString, out.enString.size());
-    return true;
-}
+⸻
 
-// —— Host 视图（ACK）——
-struct RL_LoginAckView {
-    uint16_t keepAlivePort    = 0;
-    uint16_t fileAccessPort   = 0;
-    uint16_t loginFailedTimes = 0;
-    uint16_t remainLogTimes   = 0;
-    std::array<uint8_t,8>  reserved1{};
-    std::array<uint8_t,16> cookie{};
-    std::array<uint8_t,8>  devEn{};
-};
+6）对流程/时序的影响（概要）
 
-static inline bool RL_WriteLoginAck(gvcp_packet* pkt, const RL_LoginAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_LOGIN_ACK_T raw{};
-    raw.keepAlivePort   = htons(v.keepAlivePort);
-    raw.fileAccessPort  = htons(v.fileAccessPort);
-    raw.loginFaiedTimes = htons(v.loginFailedTimes);
-    raw.remainLogTimes  = htons(v.remainLogTimes);
-    std::memcpy(raw.reserved1, v.reserved1.data(), v.reserved1.size());
-    std::memcpy(raw.cookie,    v.cookie.data(),    v.cookie.size());
-    std::memcpy(raw.devEn,     v.devEn.data(),     v.devEn.size());
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
-
-// ========== 5) 修改密码 ChangePwd ==========
-
-// —— Host 视图（CMD）——
-struct RL_ChangePwdCmdView {
-    std::array<uint8_t,64> en1String{};   // 旧密码摘要密文
-    std::array<uint8_t,24> newPassword{}; // 新密码 AES+Base64
-};
-
-static inline bool RL_ParseChangePwdCmd(const gvcp_packet* pkt, RL_ChangePwdCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_CHANGEPWD_CMD_T))) return false;
-    REDLINE_CHANGEPWD_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    std::memcpy(out.en1String.data(),  raw.en1String,  out.en1String.size());
-    std::memcpy(out.newPassword.data(),raw.newPassword,out.newPassword.size());
-    return true;
-}
-
-// —— Host 视图（ACK）——（结构体为空）
-static inline bool RL_WriteChangePwdAck(gvcp_packet* pkt, int* size) {
-    if (!pkt || !size) return false;
-    // 空体：置 size = 0（或 = sizeof(REDLINE_CHANGEPWD_ACK_T)=0）
-    *size = 0;
-    return true;
-}
-
-// ========== 6) 获取设备状态 GetDevInfo ==========
-
-// —— Host 视图（CMD）——
-struct RL_GetDevInfoCmdView { /* 空体，无需字段 */ };
-
-static inline bool RL_ParseGetDevInfoCmd(const gvcp_packet* pkt) {
-    return RL_CheckSize(pkt, (int)sizeof(REDLINE_GETDEVINFO_CMD_T));
-}
-
-// —— Host 视图（ACK）——
-struct RL_GetDevInfoAckView {
-    uint32_t reserved1 = 0;
-    int32_t  rsaVer    = 0;
-    std::array<uint8_t,1024> encryptedString{};
-};
-
-static inline bool RL_WriteGetDevInfoAck(gvcp_packet* pkt, const RL_GetDevInfoAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_GETDEVINFO_ACK_T raw{};
-    raw.reserved1 = htonl(v.reserved1);
-    raw.rsaVer    = htonl(v.rsaVer);
-    std::memcpy(raw.encryptedString, v.encryptedString.data(), v.encryptedString.size());
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
-
-// ========== 7) 重置密码 ResetPwd ==========
-
-// —— Host 视图（CMD）——
-struct RL_ResetPwdCmdView {
-    std::array<uint8_t,64> encryptString{};
-    std::array<uint8_t,32> ivString{};
-};
-
-static inline bool RL_ParseResetPwdCmd(const gvcp_packet* pkt, RL_ResetPwdCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_RESETPWD_CMD_T))) return false;
-    REDLINE_RESETPWD_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    std::memcpy(out.encryptString.data(), raw.encryptString, out.encryptString.size());
-    std::memcpy(out.ivString .data(),     raw.ivString,     out.ivString.size());
-    return true;
-}
-
-// —— Host 视图（ACK）——（结构体为空）
-static inline bool RL_WriteResetPwdAck(gvcp_packet* pkt, int* size) {
-    if (!pkt || !size) return false;
-    *size = 0;
-    return true;
-}
-
-// ========== 8) 升级 Upgrade ==========
-
-// —— Host 视图（CMD）——
-struct RL_UpgradeCmdView {
-    uint16_t port = 0;
-    std::array<uint8_t,64> encryptString{};
-};
-
-static inline bool RL_ParseUpgradeCmd(const gvcp_packet* pkt, RL_UpgradeCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_UPGRADE_CMD_T))) return false;
-    REDLINE_UPGRADE_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    out.port = ntohs(raw.port);
-    std::memcpy(out.encryptString.data(), raw.encryptString, out.encryptString.size());
-    return true;
-}
-
-// —— Host 视图（ACK）——
-struct RL_UpgradeAckView {
-    uint16_t upgPort = 0;
-    uint16_t reserved = 0;
-};
-
-static inline bool RL_WriteUpgradeAck(gvcp_packet* pkt, const RL_UpgradeAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_UPGRADE_ACK_T raw{};
-    raw.upgPort = htons(v.upgPort);
-    raw.reserved = htons(v.reserved);
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
-
-// ========== 9) 锁定信息 LockInfo ==========
-
-// —— Host 视图（CMD）——
-struct RL_LockInfoCmdView {
-    uint16_t macHigh = 0;
-    uint32_t macLow  = 0;
-};
-
-static inline bool RL_ParseLockInfoCmd(const gvcp_packet* pkt, RL_LockInfoCmdView& out) {
-    if (!RL_CheckSize(pkt, (int)sizeof(REDLINE_LOCK_CMD_T))) return false;
-    REDLINE_LOCK_CMD_T raw{};
-    std::memcpy(&raw, pkt->data, sizeof(raw));
-    out.macHigh = ntohs(raw.macHigh);
-    out.macLow  = ntohl(raw.macLow);
-    return true;
-}
-
-// —— Host 视图（ACK）——
-struct RL_LockInfoAckView {
-    uint8_t  lockSts       = 0;  // 0=未锁定 1=锁定
-    uint8_t  reserved1     = 0;
-    uint16_t lockTime      = 0;  // 剩余锁定时间，单位秒
-    uint16_t loginFailTimes= 0;  // 登录失败次数
-    uint16_t remainLogTimes= 0;  // 剩余可尝试次数
-    uint16_t reserved2     = 0;
-    uint16_t macHigh       = 0;
-    uint32_t macLow        = 0;
-};
-
-static inline bool RL_WriteLockInfoAck(gvcp_packet* pkt, const RL_LockInfoAckView& v, int* size) {
-    if (!pkt || !pkt->data || !size) return false;
-    REDLINE_LOCK_ACK_T raw{};
-    raw.lockSts         = v.lockSts;
-    raw.reserved1       = v.reserved1;
-    raw.lockTime        = htons(v.lockTime);
-    raw.loginFaiedTimes = htons(v.loginFailTimes);
-    raw.remainLogTimes  = htons(v.remainLogTimes);
-    raw.reserved2       = htons(v.reserved2);
-    raw.macHigh         = htons(v.macHigh);
-    raw.macLow          = htonl(v.macLow);
-    std::memcpy(pkt->data, &raw, sizeof(raw));
-    *size = sizeof(raw);
-    return true;
-}
+[旧] CCP(用户名+密码) -> 登录
+   |
+[新] INTERCHANGE -> LOGIN(返回cookie) -> COOKIE_UPDATE(独立请求)   // 完成会话安装
+   |
+   +--> CCP(可选)：仅写 sdk_feature_flags（8B，无会话含义）
 
 
+⸻
+
+7）文档补丁（可直接贴）
+	•	1.1.4.5 登录（鉴权）：新增一句
+“CCP 不用于登录；登录通过 INTERCHANGE+LOGIN 完成。cookie 的安装/更新仅通过独立请求完成（如 Write_reg(SessionCookieReg) 或 COOKIE_UPDATE_CMD）。”
+	•	CCP 寄存器章节：替换为本页“新寄存器定义”，并添加“兼容与错误处理”小节。
+	•	ID 通路策略：若保持“ID 关闭即不响应任何命令”，则 CCP 在 3956 同样不响应；如业务需要例外开放，需在《双通路鉴权机制》中注明“CCP 例外”。
+
+⸻
+
+这样修改后，登录链路与会话管理完全解耦，CCP 仅承担“特性声明/配置提示”角色，设备和 SDK 的改动都最小且清晰，兼容策略也可控。
