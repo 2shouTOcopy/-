@@ -1,187 +1,603 @@
-好的 ✅
-下面是精简版的《SC_GVMP 连接流程与细节（现行实现版）》，
-去掉所有 TLS/双向认证内容，仅保留当前真实行为与关键实现细节，可直接纳入设计文档或接口规范。
+好的，我直接给出一个**可复用的输出模式引擎（OutputModeEngine）**的重构方案与落地代码，避免每个通信算子（TCP/UDP/Modbus…）各写一套逻辑，同时把“编码器输出模式”无缝加进去。你可以把这套代码抽成公共模块，各算子只做“接线”（依赖注入），后续再新增别的模式也不需要改算子本体。
 
 ⸻
 
-SC_GVMP 连接流程与细节（现行实现）
-
-1. 概述
-
-SC_GVMP（Smart Camera GigE Video Message Protocol） 是相机与客户端（SC SDK / SCMVS）之间的图像传输通道协议。
-该协议采用 TCP 传输，在用户点击“开启取流”后由 SDK 控制相机通过寄存器配置主机地址与端口，再由相机主动建立 TCP 链路并推送图像数据。
-
-⸻
-
-2. 整体时序
-
-@startuml
-title SC_GVMP 取流连接时序（当前实现）
-
-actor User
-participant "SC SDK\n(SCMVS)" as SDK
-participant "设备" as DEV
-participant "主机(PC)" as HOST
-
-== 开启取流 ==
-User -> SDK : 点击“开启取流”
-SDK -> DEV : WriteReg(MCDA) = 主机IP
-SDK -> DEV : WriteReg(MCP) = 主机端口
-DEV -> HOST : TCP SYN
-HOST -> DEV : SYN-ACK
-DEV -> HOST : ACK  (三次握手完成)
-
-SDK -> DEV : WriteReg(STREAM_START) = 1
-DEV -> HOST : 发送图像数据（TCP）
-@enduml
-
+设计要点（可扩展 + 复用）
+	•	抽象出输出策略接口：IOutputStrategy（默认/定时/编码器 3 种策略分别实现）。
+	•	把各算子共有的：
+	•	取触发计数 & 出图时间（TRIGGER_COUNT/TRIGGER_IMG_TIME）
+	•	维护“最近一次出图”的触发计数
+	•	统一从“待发队列”取消息 / 为空则发 NG 的逻辑
+统一放进一个输出模式引擎 OutputModeEngine。
+	•	各算子只需要：
+	•	提供 发送函数（比如 m_msgServer.InsertSendMsg(msg)）给引擎；
+	•	提供 待发队列与互斥量（仍可沿用你现有的 m_shchedSendQueue / m_shchedSendQueueMtx）；
+	•	提供 触发源接口 mvsc_idr_app::ITriggerSource&；
+	•	（编码器模式）提供 编码器状态接口 IEncoderStatusProvider（内部转调 getEncoderStatus()）。
+	•	线程模型不变：仍在你原来的工作线程里调用 engine.tick()（替换原 CheckTriggerMode/CheckTriggerCount/ProcessScheduledTrans 分支），其余时候批量转移队列直发。
+	•	一致的 NG 兜底：定时模式 & 编码器模式在“到达发送条件但队列为空”时统一发送 SCHEDULED_TRANS_NG_STRING（与现实现保持一致；如果你希望编码器模式不发 NG，只需切换一个开关）。
 
 ⸻
 
-3. 流程步骤说明
+新增/修改文件建议
+	1.	新增（公共）
 
-（1）MCDA 设置目标地址
-	•	寄存器名：MCDA（Message Channel Destination Address）
-	•	长度：4 字节
-	•	内容：主机 IPv4 地址（网络序），SDK 在下发时需确保与实际 PC 网卡一致。
-	•	生效时机：写入即缓存，不立即触发连接。
+	•	output_mode.h / output_mode.cpp：输出模式引擎 + 三种策略实现
+	•	encoder_status.h / encoder_status.cpp：编码器状态适配层（包一层 getEncoderStatus()）
 
-（2）MCP 设置主机端口
-	•	寄存器名：MCP（Message Channel Port）
-	•	长度：2 字节
-	•	内容：主机接收端口号（0–65535）。
-	•	生效时机：写入即缓存，不立即触发连接。
+	2.	各算子无需新增文件，只在原类里注入并调用 OutputModeEngine：
 
-（3）设备主动建立 TCP 连接
-	•	设备在收到完整的 MCDA 与 MCP 配置后，等待 STREAM_START=1 信号。
-	•	当 STREAM_START=1：
-	•	设备作为 TCP 客户端，向 MCDA:MCP 发起连接；
-	•	建立连接使用标准三次握手；
-	•	连接成功后进入“Streaming”状态。
+	•	TCP：CTcpsMessage（你现在的类）
+	•	UDP：CUdpsMessage
+	•	Modbus：CModbusMessage
+……都走相同套路
 
-（4）启动取流
-	•	寄存器名：STREAM_START
-	•	写入值：
-	•	1 → 启动取流流程（设备建立 TCP 并发送图像）
-	•	0 → 停止取流（关闭 TCP 连接，释放资源）
-	•	当 STREAM_START=1 时设备开始从采集通道取图并封包发送。
-	•	当 STREAM_START=0 时立即停止取流并断开连接。
-
-（5）图像传输
-	•	传输通道：建立好的 TCP 长连接。
-	•	数据封装：
-	•	每帧以固定头部结构发送，典型格式如下（实际按型号定义）：
-
-+-----------+--------+-----------+-----------+
-| Magic(2B) | Ver(1) | Flags(1)  | Seq(4B)   |
-+-----------+--------+-----------+-----------+
-| PayloadLen(4B) | 图像数据内容 |
-+------------------------------------------+
-
-
-	•	Magic：帧同步标识
-	•	Seq：帧序号递增
-	•	PayloadLen：图像数据长度
-
-	•	图像内容可为编码帧（JPEG/H264/H265）或原始帧（RAW/YUV），依产品配置。
+如果你倾向于最少文件：也可以把 encoder_status.* 合并进 output_mode.*，减少两个文件。
 
 ⸻
 
-4. 设备端状态机（当前）
+头文件：output_mode.h
 
-@startuml
-title SC_GVMP 设备状态机（现行）
+#ifndef OUTPUT_MODE_H_
+#define OUTPUT_MODE_H_
 
-[*] --> Idle
-Idle --> Connecting : STREAM_START=1 且 MCDA/MCP 有效
-Connecting --> Streaming : TCP 建链成功
-Connecting --> Error : 超时/失败
-Streaming --> Idle : STREAM_START=0
-Streaming --> Error : TCP异常断开
-Error --> Idle : STREAM_START=0
-@enduml
+#include <cstdint>
+#include <queue>
+#include <mutex>
+#include <functional>
+#include <optional>
+#include <string>
+
+// 你项目里的类型/常量
+// --------------------------------------------------------
+#ifndef SCHEDULED_TRANS_NG_STRING
+#define SCHEDULED_TRANS_NG_STRING "NG"
+#endif
+
+struct TcpsMessage {
+    uint8_t buf[1024];
+    int     len;
+};
+
+// 触发源（你项目已有）
+namespace mvsc_idr_app {
+struct ITriggerSource {
+    static ITriggerSource* getComponent();
+
+    virtual int GetParam(int key, int& value) = 0;       // TRIGGER_COUNT 等
+    virtual int GetParam(int key, std::string& value) = 0; // TRIGGER_IMG_TIME 等
+    virtual ~ITriggerSource() = default;
+};
+}
+
+// 触发参数 key（沿用你现有枚举/宏）
+#ifndef TRIGGER_COUNT
+#define TRIGGER_COUNT 1001
+#endif
+#ifndef TRIGGER_IMG_TIME
+#define TRIGGER_IMG_TIME 1002
+#endif
+
+// 时间与系统函数（由外部注入，方便单测/替换）
+using NowSecondsFn = uint64_t(*)();   // 返回单调递增秒，如 get_up_time()
+using SleepUsFn   = void(*)(uint32_t);// usleep 封装
+
+// 编码器状态提供者（编码器模式用）
+struct IEncoderStatusProvider {
+    virtual int getStatus() = 0; // 返回1表示需要发送
+    virtual ~IEncoderStatusProvider() = default;
+};
+
+// 输出模式
+enum class OutputMode : uint8_t {
+    kImmediate,  // 默认：有结果立刻发
+    kTimed,      // 定时：出图后等待间隔
+    kEncoder     // 编码器：出图后按编码器状态发
+};
+
+// 统一上下文：引擎持有的依赖
+struct OutputContext {
+    // 待发队列与锁（沿用你现有成员）
+    std::queue<TcpsMessage>* schedQueue = nullptr;
+    std::mutex*              schedMtx   = nullptr;
+
+    // 发送函数（算子注入）：如 [&](const TcpsMessage& m){ m_msgServer.InsertSendMsg(m); }
+    std::function<void(const TcpsMessage&)> send;
+
+    // 触发源
+    mvsc_idr_app::ITriggerSource* trigger = nullptr;
+
+    // 编码器状态（编码器模式可为空；为空则编码器模式无效）
+    IEncoderStatusProvider* encoder = nullptr;
+
+    // “定时输出间隔”（单位：秒）
+    uint32_t scheduledIntervalSec = 0;
+
+    // 时间/睡眠函数
+    NowSecondsFn nowSecFn = nullptr;
+    SleepUsFn    sleepUs  = nullptr;
+
+    // NG 文本
+    const char* ngText = SCHEDULED_TRANS_NG_STRING;
+};
+
+// 策略决策输出
+struct Decision {
+    enum Type { kNoop, kSendOne, kSendNG } type = kNoop;
+    // 当 type==kSendOne 时，如果没有显式携带消息，则由引擎从队列取一条
+    std::optional<TcpsMessage> msg;
+    // 建议睡眠（微秒）；引擎不强制，但可减少空转
+    uint32_t suggestedSleepUs = 5000;
+};
+
+// 策略接口
+class IOutputStrategy {
+public:
+    virtual ~IOutputStrategy() = default;
+    virtual Decision step(OutputContext& ctx) = 0;
+    virtual void onModeChanged(OutputContext&) {}
+};
+
+// 三种策略前置声明
+class ImmediateStrategy;
+class TimedStrategy;
+class EncoderStrategy;
+
+// 引擎
+class OutputModeEngine {
+public:
+    OutputModeEngine(OutputMode mode,
+                     OutputContext ctx);
+
+    // 工作线程里周期调用
+    void tick();
+
+    // 切换模式（线程安全外部保证即可，一般配置改变时调用）
+    void setMode(OutputMode mode);
+
+    // 供外部查询（可选）
+    OutputMode mode() const { return mode_; }
+
+    // 记录最近一次“出图”的触发计数（内部维护）
+private:
+    OutputMode mode_;
+    OutputContext ctx_;
+
+    // 出图判断相关缓存
+    int      lastTriggerCount_ = -1;
+    uint64_t lastImgTimeSec_   = 0;  // 最近一次 TRIGGER_IMG_TIME
+
+    // 策略实例
+    IOutputStrategy* strat_ = nullptr;
+    ImmediateStrategy* immediate_ = nullptr;
+    TimedStrategy*     timed_     = nullptr;
+    EncoderStrategy*   encoder_   = nullptr;
+
+private:
+    // 工具
+    bool fetchTrigger_(int& trigCount, uint64_t& imgTimeSec);
+    void ensureStrategy_();
+    void sendNG_();
+    void sendOneOrNG_(std::optional<TcpsMessage>&& preferred = std::nullopt);
+};
+
+#endif // OUTPUT_MODE_H_
 
 
 ⸻
 
-5. 寄存器交互规则
+实现：output_mode.cpp
 
-寄存器名	功能描述	长度	写入方向	备注
-MCDA	目标主机 IP 地址	4B	SDK→设备	写入缓存
-MCP	目标主机端口号	2B	SDK→设备	写入缓存
-STREAM_START	启停控制位	1B	SDK→设备	1=开始取流；0=停止
-STREAM_STATE	当前状态	1B	设备→SDK	0=Idle,1=Connecting,2=Streaming,3=Error
-ERR_CODE	最近错误码	2B	设备→SDK	用于诊断
+#include "output_mode.h"
+#include <cstdio>
+#include <cstring>
 
-写入顺序建议：
-	1.	MCDA
-	2.	MCP
-	3.	STREAM_START=1
+// =============== 工具函数 ===============
+static uint64_t parse_u64_from_string(const std::string& s, uint64_t defaultVal = 0) {
+    uint64_t v = 0;
+    if (sscanf(s.c_str(), "%" SCNu64, &v) == 1) return v;
+    return defaultVal;
+}
 
-若 STREAM_START=1 在前两者未写入时执行，应返回错误 ERR_PARAM_INCOMPLETE。
+// =============== 策略实现 ===============
+class ImmediateStrategy : public IOutputStrategy {
+public:
+    Decision step(OutputContext& ctx) override {
+        // 直接把队列里的都发掉（引擎里循环取）
+        Decision d;
+        d.type = Decision::kSendOne;
+        d.suggestedSleepUs = 0; // 有东西就发，没有的话引擎会很快返回
+        return d;
+    }
+};
+
+class TimedStrategy : public IOutputStrategy {
+public:
+    TimedStrategy(int* lastTrig, uint64_t* lastImg)
+        : lastTriggerCount_(lastTrig), lastImgTimeSec_(lastImg) {}
+
+    Decision step(OutputContext& ctx) override {
+        // 只有在“检测到新出图”时才检查是否到定时间隔
+        int trig = 0;
+        uint64_t imgSec = 0;
+        Decision d;
+
+        if (!ctx.trigger || !ctx.nowSecFn) {
+            d.type = Decision::kNoop;
+            return d;
+        }
+        // 读取出图信息
+        // 说明：这里的“新出图”沿用“TRIGGER_COUNT变化”这一约定
+        if (ctx.trigger->GetParam(TRIGGER_COUNT, trig) != 0) {
+            d.type = Decision::kNoop;
+            return d;
+        }
+        if (*lastTriggerCount_ == -1) {
+            *lastTriggerCount_ = trig; // 首次初始化
+            d.type = Decision::kNoop;
+            return d;
+        }
+        if (trig == *lastTriggerCount_) {
+            // 未出图，啥也不做
+            d.type = Decision::kNoop;
+            d.suggestedSleepUs = 5000;
+            return d;
+        }
+        // 已出图：拿到最近出图时间
+        {
+            std::string imgTimeStr;
+            if (ctx.trigger->GetParam(TRIGGER_IMG_TIME, imgTimeStr) != 0) {
+                d.type = Decision::kNoop;
+                return d;
+            }
+            *lastImgTimeSec_ = parse_u64_from_string(imgTimeStr, *lastImgTimeSec_);
+        }
+        // 等待到达定时间隔
+        uint64_t now = ctx.nowSecFn();
+        if (now - *lastImgTimeSec_ < ctx.scheduledIntervalSec) {
+            // 未到点，稍等
+            d.type = Decision::kNoop;
+            d.suggestedSleepUs = 5000;
+            return d;
+        }
+        // 到点：发一条（队列为空则发NG）；并更新 lastTriggerCount_
+        d.type = Decision::kSendOne;
+        *lastTriggerCount_ = trig;
+        d.suggestedSleepUs = 0;
+        return d;
+    }
+
+private:
+    int*      lastTriggerCount_;
+    uint64_t* lastImgTimeSec_;
+};
+
+class EncoderStrategy : public IOutputStrategy {
+public:
+    EncoderStrategy(int* lastTrig)
+        : lastTriggerCount_(lastTrig) {}
+
+    Decision step(OutputContext& ctx) override {
+        Decision d;
+        d.type = Decision::kNoop;
+        d.suggestedSleepUs = 5000;
+
+        if (!ctx.trigger || !ctx.encoder) return d;
+
+        int trig = 0;
+        if (ctx.trigger->GetParam(TRIGGER_COUNT, trig) != 0) {
+            return d;
+        }
+        if (*lastTriggerCount_ == -1) {
+            *lastTriggerCount_ = trig; // 首次初始化
+            return d;
+        }
+        if (trig == *lastTriggerCount_) {
+            // 未出图
+            return d;
+        }
+
+        // 已出图：看编码器状态
+        int st = ctx.encoder->getStatus();
+        if (st == 1) {
+            // 需要发送
+            d.type = Decision::kSendOne;
+            d.suggestedSleepUs = 0;
+            *lastTriggerCount_ = trig;
+        } else {
+            // 不需要发送，等待下一次出图
+            // 注：如果你希望“出图且编码器==0时也立即发NG”，可改为 kSendNG
+            d.type = Decision::kNoop;
+            d.suggestedSleepUs = 5000;
+            // 不更新 lastTriggerCount_，保证“同一帧图”，等编码器切成1时仍然能触发发送
+            // 如果你希望“错过就算了”，则这里把 *lastTriggerCount_ = trig;
+        }
+        return d;
+    }
+
+private:
+    int* lastTriggerCount_;
+};
+
+// =============== 引擎实现 ===============
+OutputModeEngine::OutputModeEngine(OutputMode mode, OutputContext ctx)
+    : mode_(mode), ctx_(ctx) {
+    ensureStrategy_();
+}
+
+void OutputModeEngine::setMode(OutputMode mode) {
+    if (mode_ == mode) return;
+    mode_ = mode;
+    ensureStrategy_();
+    if (strat_) strat_->onModeChanged(ctx_);
+}
+
+void OutputModeEngine::ensureStrategy_() {
+    // 析构留给进程退出；也可用unique_ptr管理
+    if (!immediate_) immediate_ = new ImmediateStrategy();
+    if (!timed_)     timed_     = new TimedStrategy(&lastTriggerCount_, &lastImgTimeSec_);
+    if (!encoder_)   encoder_   = new EncoderStrategy(&lastTriggerCount_);
+
+    switch (mode_) {
+        case OutputMode::kImmediate: strat_ = immediate_; break;
+        case OutputMode::kTimed:     strat_ = timed_;     break;
+        case OutputMode::kEncoder:   strat_ = encoder_;   break;
+    }
+}
+
+bool OutputModeEngine::fetchTrigger_(int& trigCount, uint64_t& imgTimeSec) {
+    if (!ctx_.trigger) return false;
+    if (ctx_.trigger->GetParam(TRIGGER_COUNT, trigCount) != 0) return false;
+    std::string imgTimeStr;
+    if (ctx_.trigger->GetParam(TRIGGER_IMG_TIME, imgTimeStr) != 0) return false;
+    imgTimeSec = parse_u64_from_string(imgTimeStr, imgTimeSec);
+    return true;
+}
+
+void OutputModeEngine::sendNG_() {
+    TcpsMessage ng{};
+    std::snprintf((char*)ng.buf, sizeof(ng.buf), "%s", ctx_.ngText);
+    ng.len = (int)std::strlen((char*)ng.buf);
+    ctx_.send(ng);
+}
+
+void OutputModeEngine::sendOneOrNG_(std::optional<TcpsMessage>&& preferred) {
+    if (preferred.has_value()) {
+        ctx_.send(preferred.value());
+        return;
+    }
+    std::optional<TcpsMessage> msg;
+    {
+        std::lock_guard<std::mutex> lk(*ctx_.schedMtx);
+        if (!ctx_.schedQueue->empty()) {
+            msg = ctx_.schedQueue->front();
+            ctx_.schedQueue->pop();
+        }
+    }
+    if (msg.has_value()) {
+        ctx_.send(msg.value());
+    } else {
+        // 队列为空，发 NG（保持与你当前定时模式一致）
+        sendNG_();
+    }
+}
+
+void OutputModeEngine::tick() {
+    if (!strat_) return;
+
+    // Immediate: 引擎里会循环把队列清空；Timed/Encoder：由策略判断发不发一条
+    Decision d = strat_->step(ctx_);
+
+    switch (d.type) {
+        case Decision::kNoop:
+            if (ctx_.sleepUs) ctx_.sleepUs(d.suggestedSleepUs);
+            return;
+        case Decision::kSendOne: {
+            if (mode_ == OutputMode::kImmediate) {
+                // 把队列里的都发掉（批量）
+                std::queue<TcpsMessage> local;
+                {
+                    std::lock_guard<std::mutex> lk(*ctx_.schedMtx);
+                    if (!ctx_.schedQueue->empty()) std::swap(local, *ctx_.schedQueue);
+                }
+                while (!local.empty()) {
+                    ctx_.send(local.front());
+                    local.pop();
+                }
+            } else {
+                // Timed / Encoder：按需发一条（为空发 NG）
+                sendOneOrNG_(std::move(d.msg));
+            }
+            return;
+        }
+        case Decision::kSendNG:
+            sendNG_();
+            return;
+    }
+}
+
 
 ⸻
 
-6. 错误码定义（建议）
+编码器状态适配：encoder_status.h/.cpp
 
-错误码	含义
-ERR_PARAM_INCOMPLETE	MCDA/MCP 未配置
-ERR_CONNECT_FAIL	TCP 建链失败（主机不可达）
-ERR_CONNECT_TIMEOUT	TCP 超时
-ERR_STREAM_BUSY	当前已有取流会话
-ERR_TCP_RESET	连接被对端关闭
-ERR_NO_SESSION	未登录或会话过期（在安全红线鉴权机制启用时）
+// encoder_status.h
+#ifndef ENCODER_STATUS_H_
+#define ENCODER_STATUS_H_
+#include "output_mode.h"
 
+// 你的底层C接口（按你项目实际声明）
+extern "C" {
+    int getEncoderStatus(void);
+}
 
-⸻
+class EncoderStatusAdapter : public IEncoderStatusProvider {
+public:
+    int getStatus() override {
+        return getEncoderStatus();
+    }
+};
 
-7. 异常与重连逻辑
-	•	连接失败或断开：
-	•	设置 STREAM_STATE=Error；
-	•	记录 ERR_CODE；
-	•	若 STREAM_START=1 保持不变，可周期性重试（退避重连策略，典型为 1s→2s→4s）。
-	•	主动停止：
-	•	SDK 写 STREAM_START=0；
-	•	设备立即关闭 TCP 并回到 Idle 状态。
-	•	心跳/空闲保持：
-	•	当前实现不包含 TCP 保活包，可选开启 SO_KEEPALIVE（默认关闭）。
+#endif // ENCODER_STATUS_H_
 
-⸻
-
-8. SDK 侧建议逻辑
-	1.	开启取流
-
-WriteReg(MCDA)
-WriteReg(MCP)
-WriteReg(STREAM_START=1)
-
-等待状态回调或 STREAM_STATE=Streaming 后开始接收图像。
-
-	2.	停止取流
-
-WriteReg(STREAM_START=0)
-
-等待状态回到 Idle。
-
-	3.	断线重连
-当检测到 STREAM_STATE=Error 时，SDK 可自动写 STREAM_START=1 重启。
-
-⸻
-
-9. 当前版本特性小结
-
-特性项	说明
-传输协议	TCP
-建链方向	设备 → 主机
-控制方式	SDK 通过寄存器配置 MCDA/MCP/STREAM_START
-取流触发	STREAM_START=1
-停止取流	STREAM_START=0
-会话要求	需在已登录状态（激活后、cookie 有效期内）
-重连策略	设备端可自动或 SDK 侧主动重启
-安全特性	当前为明文 TCP；后续计划扩展双向认证
+// encoder_status.cpp
+#include "encoder_status.h"
+// 如果需要做防抖/缓存，也可以在这里扩展
 
 
 ⸻
 
-这样版本只描述当前实际的取流逻辑和控制流程，
-未来若增加双向认证（TLS/mTLS），只需在该节末尾追加一个“扩展说明”即可，无需重写主流程。
+在 TCP 算子中接线：CTcpsMessage 关键改造
+
+仅展示与你贴出来的两个函数相关的替换；其余成员变量保持不变。
+
+// CTcpsMessage.h (节选)
+#include "output_mode.h"
+#include "encoder_status.h"
+
+class CTcpsMessage {
+public:
+    void InitOutputEngine();  // 新增：在构造/Init里调用
+    void DispatchQueuedMessages(); // 维持原名，内部改为调用引擎
+
+    // 原有
+    // int ProcessScheduledTrans(); // 可删或留空（由引擎替代）
+
+private:
+    // 原有成员
+    std::queue<TcpsMessage> m_shchedSendQueue;
+    std::mutex              m_shchedSendQueueMtx;
+    // 原有：m_msgServer.InsertSendMsg(msg);
+
+    // 新增：引擎与依赖
+    OutputModeEngine*   m_outputEngine = nullptr;
+    EncoderStatusAdapter m_encoder; // 如果不用编码器模式，也可以不实例化
+    bool                 m_nScheduledTransEnable = false; // 你的开关
+    uint32_t             m_nScheduledTransTime = 0;       // 秒
+    // ...
+};
+
+// CTcpsMessage.cpp (节选)
+extern "C" {
+    uint64_t get_up_time();       // 你项目已有
+    void     _usleep_bridge(uint32_t us) { usleep(us); } // 简单桥接
+}
+
+void CTcpsMessage::InitOutputEngine() {
+    auto trigInstance = mvsc_idr_app::ITriggerSource::getComponent();
+    // 发送函数（复用你的消息服务）
+    auto sendFn = [this](const TcpsMessage& msg) {
+        this->m_msgServer.InsertSendMsg(msg);
+    };
+
+    OutputContext ctx;
+    ctx.schedQueue = &m_shchedSendQueue;
+    ctx.schedMtx   = &m_shchedSendQueueMtx;
+    ctx.send       = sendFn;
+    ctx.trigger    = trigInstance;
+    ctx.encoder    = &m_encoder;            // 如果该算子不需要编码器模式，可置为 nullptr
+    ctx.scheduledIntervalSec = m_nScheduledTransTime;
+    ctx.nowSecFn   = &get_up_time;
+    ctx.sleepUs    = &_usleep_bridge;
+    ctx.ngText     = SCHEDULED_TRANS_NG_STRING;
+
+    // 根据配置选择模式（举例）
+    OutputMode mode = OutputMode::kImmediate;
+    if (m_nScheduledTransEnable) {
+        // 你的 CheckTriggerMode() 可改为返回枚举，或从配置读取：
+        // 0=默认 1=定时 2=编码器
+        int conf = /* ReadYourConfig() */;
+        mode = (conf == 1) ? OutputMode::kTimed :
+               (conf == 2) ? OutputMode::kEncoder :
+                             OutputMode::kImmediate;
+    }
+
+    m_outputEngine = new OutputModeEngine(mode, ctx);
+}
+
+// 原 DispatchQueuedMessages 重写为：
+void CTcpsMessage::DispatchQueuedMessages()
+{
+    if (m_outputEngine) {
+        m_outputEngine->tick();   // 由引擎决定发不发 & 如何发
+        return;
+    }
+
+    // 兜底：没初始化引擎则走最简单的批量直发（与原逻辑一致）
+    std::queue<TcpsMessage> local;
+    {
+        std::lock_guard<std::mutex> lk(m_shchedSendQueueMtx);
+        if (!m_shchedSendQueue.empty()) {
+            std::swap(local, m_shchedSendQueue);
+        }
+    }
+    while (!local.empty()) {
+        m_msgServer.InsertSendMsg(std::move(local.front()));
+        local.pop();
+    }
+}
+
+你的 ProcessScheduledTrans() 原函数可删除（或留空实现），逻辑全部收敛到 OutputModeEngine 内。
+
+⸻
+
+在其他算子里复用
+	•	UDP / Modbus 的类基本复制 TCP 的“接线”：
+	•	仍旧维护自己的 m_shchedSendQueue/m_shchedSendQueueMtx
+	•	InitOutputEngine() 里把 sendFn 改为对应的发送方法（如 m_msgConn->InsertSendQueue() 等）
+	•	同样注入 ITriggerSource / IEncoderStatusProvider / 定时间隔 / 时间函数
+
+整个算子侧的变更量≈几十行，后续新增模式只需：
+	1.	新增一个 class XxxStrategy : public IOutputStrategy
+	2.	在 ensureStrategy_() 里接上
+	3.	配置切到新模式，所有算子自动获得新行为
+
+⸻
+
+行为与细节说明（与你现有实现对齐）
+	1.	默认模式（Immediate）
+	•	tick() 时把队列里的消息批量清空（与原“直发”一致）。
+	2.	定时模式（Timed）
+	•	以 TRIGGER_COUNT 变化判定“出图”。
+	•	出图后，等待 scheduledIntervalSec；到点时：
+	•	队列非空：取一条发送
+	•	队列为空：发 NG（保持你现有实现一致）
+	•	发送后把lastTriggerCount更新为最新。
+	3.	编码器模式（Encoder）
+	•	以 TRIGGER_COUNT 变化判定“出图”。
+	•	出图后读取 getEncoderStatus()：
+	•	返回 1：发送（队列空则发 NG，可配置，当前默认行为与定时模式一致，保持一致性）
+	•	非 1：暂不发送，等待同一帧在编码器变为 1 的时刻（当前示例里不更新 lastTriggerCount_，这样同一帧仍可再次触发尝试；如果你希望“错过即作废”，把注释里那行改为 *lastTriggerCount_ = trig;）
+	4.	空转与CPU
+	•	策略会返回 suggestedSleepUs（默认 5ms），引擎调用你注入的 usleep，避免忙等。
+	•	Immediate 模式下若有数据会立即发；无数据即立刻返回，线程外层如果还有统一 sleep 也没问题。
+
+⸻
+
+可选开关（编码器模式 NG 行为）
+
+如你希望编码器模式在“出图但队列空”时不发 NG，而是什么也不做，只需把：
+
+// EncoderStrategy::step() 里，st == 1 时
+d.type = Decision::kSendOne;
+
+替换为
+
+// 返回kNoop，由外部维持队列为空就不发
+if (/* 队列非空 */) d.type = Decision::kSendOne;
+else d.type = Decision::kNoop;
+
+或在 sendOneOrNG_ 里加一个模式判断跳过发 NG。
+
+⸻
+
+落地步骤建议
+	1.	新增 output_mode.* 与 encoder_status.*，通过一次编译。
+	2.	在 CTcpsMessage 中新增 InitOutputEngine() & 重写 DispatchQueuedMessages()。
+	3.	跑冒烟测试（默认模式/定时/编码器），确认行为一致。
+	4.	复制同样的“接线”到 UDP/Modbus 类。
+	5.	把原来各算子里分散的 ProcessScheduledTrans/CheckTriggerMode/CheckTriggerCount 逻辑删除或退役。
+
+⸻
+
+如果你希望我直接把这套代码“贴合你现有类名/命名规范/日志宏/返回码”，我可以再按你的工程风格微调一版（例如把 printf/sscanf 全部替换成你们统一的 LOGE/ParseU64 等，或把 NG 组包逻辑挂到一个回调里）。
