@@ -1,150 +1,238 @@
-// line_handlers.cpp
-#include "line_handlers.h"
-#include <cstdio>
-#include <cstring>
-#include <algorithm>
+好的，按你的新需求把编码器模式改成“基于剔除号”的判定，并把 scheduled_fifo_param 增加“剔除号”字段。同时，为了在“剔除号未满足”时不消费队列、不更新帧号继续等待，我把队列适配层增加了peek / consume 两个接口，编码器模式用“先窥视后消费”的流程。
 
-// 如果你有统一的日志宏，直接用你的；这里给个兜底
-#ifndef LOGE
-#define LOGE(fmt, ...) std::fprintf(stderr, "[E] " fmt "\n", ##__VA_ARGS__)
-#endif
+下面给你精确的改动点（只贴必要增改，方便你直接替换/合并）：
 
-#ifndef LOGD
-#define LOGD(fmt, ...) std::fprintf(stdout, "[D] " fmt "\n", ##__VA_ARGS__)
-#endif
+⸻
 
-static inline bool is_edge_trigger(TriggerActive a) {
-    return (a == RisingEdge) || (a == FallingEdge);
-}
-static inline bool is_level_trigger(TriggerActive a) {
-    return (a == LevelHigh) || (a == LevelLow);
-}
+1) 统一消息结构体：新增“剔除号”
 
-// 拉取当前所有 Line 配置
-static bool fetch_all_lines(std::vector<LineConfig>& lines) {
-    lines.resize(LINE_EVENT_MAX_NUM);
-    int cnt = 0;
-    if (LineGetParam("AllLineConfig", lines.data(), LINE_EVENT_MAX_NUM, &cnt) != 0) {
-        return false;
+⚠️ 所有生产者必须填充 exclude_no；否则编码器模式无法按阈值正确判定。
+⚠️ 这是 ABI 变化，simple_fifo 的写读两端都要一起升级并重新编译。
+
+// 原有：scheduled_fifo_param
+typedef struct  {
+    uint32_t len;
+    uint8_t  buf[MAX_SCHEDULED_PAYLOAD_LEN];
+    uint32_t exclude_no;   // 新增：剔除号（例：8 表示“<=8 都应发送”）
+} scheduled_fifo_param;
+
+建议约定：exclude_no 的默认值为 0（最容易被满足）；若需要“严格等待较大阈值”，生产者据实填写。
+
+⸻
+
+2) 编码器接口：从“状态=1/0”改为“获取剔除号”
+
+C 接口（底层）
+
+// 原来：int getEncoderStatus(void);   // 1=发送, 其他=不发
+// 现在改为：返回“剔除号阈值”，>=0 有效，<0 表示读取失败
+extern "C" int getEncoderExcludeNo(void);
+
+C++ 适配（替换原 IEncoderStatusProvider 定义与实现）
+
+// output_mode.h 里将接口改为：
+struct IEncoderStatusProvider {
+    virtual int getExcludeNo() = 0;  // 返回“当前剔除号阈值”，>=0 有效
+    virtual ~IEncoderStatusProvider() = default;
+};
+
+// encoder_status.h
+#pragma once
+#include "output_mode.h"
+extern "C" int getEncoderExcludeNo(void);
+
+class EncoderStatusAdapter : public IEncoderStatusProvider {
+public:
+    int getExcludeNo() override { return getEncoderExcludeNo(); }
+};
+
+
+⸻
+
+3) 队列适配层：支持 peek / consume
+
+编码器模式需要“看得见但先不取走”，直到阈值满足才真正出队。
+
+// output_mode.h 里的队列抽象，新增两个方法：
+class ISchedQueue {
+public:
+    virtual ~ISchedQueue() = default;
+
+    // 仅窥视一条（不消费），成功返回 true
+    virtual bool peek_one(scheduled_fifo_param& out) = 0;
+
+    // 消费一条（配合 peek_one 使用），空队列调用应安全（可空操作）
+    virtual void consume_one() = 0;
+
+    // 兼容旧调用：pop = peek + consume
+    virtual bool pop_one(scheduled_fifo_param& out) {
+        if (!peek_one(out)) return false;
+        consume_one();
+        return true;
     }
-    lines.resize(std::min(cnt, LINE_EVENT_MAX_NUM));
+
+    // 清空并逐条发送（立即模式用）
+    virtual void drain_all(const std::function<void(const scheduled_fifo_param&)>& send) = 0;
+};
+
+simple_fifo 适配（Modbus）
+
+// output_mode.cpp
+bool SimpleFifoAdapter::peek_one(scheduled_fifo_param& out) {
+    if (!q_) return false;
+    return (sfifo_out(q_, &out) == 0); // 0=成功，仅复制，不消费
+}
+void SimpleFifoAdapter::consume_one() {
+    if (!q_) return;
+    sfifo_drain(q_);                   // 真正出队
+}
+void SimpleFifoAdapter::drain_all(const std::function<void(const scheduled_fifo_param&)>& send) {
+    if (!q_) return;
+    scheduled_fifo_param p{};
+    while (sfifo_out(q_, &p) == 0) {
+        sfifo_drain(q_);
+        send(p);
+    }
+}
+
+std::deque 适配（TCP/UDP）
+
+bool DequeAdapter::peek_one(scheduled_fifo_param& out) {
+    std::lock_guard<std::mutex> lk(*mtx_);
+    if (dq_->empty()) return false;
+    out = dq_->front();    // 不弹出
     return true;
 }
-
-// 规则校验：若系统存在编码器线，则所有触发线必须是“沿触发”
-static int validate_encoder_vs_trigger_levels(const std::vector<LineConfig>& lines) {
-    bool has_encoder = false;
-    for (const auto& l : lines) {
-        if (l.type == LT_ENCODER) { has_encoder = true; break; }
+void DequeAdapter::consume_one() {
+    std::lock_guard<std::mutex> lk(*mtx_);
+    if (!dq_->empty()) dq_->pop_front();
+}
+bool DequeAdapter::pop_one(scheduled_fifo_param& out) {
+    // 重写以减少两次加锁开销（可选）
+    std::lock_guard<std::mutex> lk(*mtx_);
+    if (dq_->empty()) return false;
+    out = dq_->front();
+    dq_->pop_front();
+    return true;
+}
+void DequeAdapter::drain_all(const std::function<void(const scheduled_fifo_param&)>& send) {
+    std::deque<scheduled_fifo_param> local;
+    {
+        std::lock_guard<std::mutex> lk(*mtx_);
+        if (!dq_->empty()) dq_->swap(local);
     }
-    if (!has_encoder) return 0;
+    for (auto& e : local) send(e);
+}
 
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const auto& l = lines[i];
-        if (l.type == LT_TRIGGER && is_level_trigger(l.active)) {
-            LOGE("编码器只能用于沿触发模式：检测到 Line%zu 为电平触发（LevelHigh/LevelLow），与编码器冲突。", i);
-            return E_ENCODER_FAILED;
+
+⸻
+
+4) 编码器模式核心逻辑（重写 stepEncoder*）
+
+逻辑变化点：
+	•	读取剔除号阈值 enc_th = encoder->getExcludeNo()；enc_th < 0 视为不可用，继续等待。
+	•	仅当队头的 exclude_no <= enc_th 时才消费并发送；
+	•	队列空但阈值已满足 → 仅 LOGE 一次并标记这帧已处理（更新 m_nlastTrigCount）；
+	•	阈值未满足 → 不消费、不更新 m_nlastTrigCount，继续等待同一帧（满足你“保留该帧为待尝试状态，直到条件满足再发”的要求）。
+
+把你现有的 stepEncoder() 换成下面这段：
+
+// 编码器模式：新帧 -> 读取“剔除号阈值” -> 满足则发送（按 exclude_no <= enc_th）
+// - 队列空但阈值已满足：仅 LOGE，一次性标记本帧已处理
+// - 阈值未满足：不消费、不更新帧号，继续等
+void OutputModeEngine::stepEncoder_()
+{
+    if (!ctx_.queue) { sleepDefault_(); return; }
+
+    // 触发模式门控
+    (void)fetchTriggerMode_();
+    if (!inTriggerMode_) { sleepDefault_(); return; }
+
+    int trig = 0;
+    if (!fetchTrigCount_(trig)) { sleepDefault_(); return; }
+
+    // 初始化：记录第一帧，不做任何发送
+    if (lastTrigCount_ == -1) {
+        lastTrigCount_ = trig;
+        sleepDefault_();
+        return;
+    }
+
+    // 没有新帧
+    if (trig == lastTrigCount_) {
+        sleepDefault_();
+        return;
+    }
+
+    // 新帧：读取当前剔除号阈值
+    if (!ctx_.encoder) { ctx_.loge("[encoder] encoder provider null\n"); sleepDefault_(); return; }
+    int enc_th = ctx_.encoder->getExcludeNo();
+    if (enc_th < 0) { // 读取失败，继续等待
+        sleepDefault_();
+        return;
+    }
+
+    // 先窥视，不立刻消费
+    scheduled_fifo_param head{};
+    if (ctx_.queue->peek_one(head)) {
+        // 队头剔除号满足阈值：消费并发送
+        if (head.exclude_no <= (uint32_t)enc_th) {
+            ctx_.queue->consume_one();  // 真正出队
+            ctx_.send(head);            // 发送
+            lastTrigCount_ = trig;      // 本帧已处理
+        } else {
+            // 阈值未达到：不消费，不更新 lastTrigCount_，继续等待本帧
+            // 可视需要打印 debug 日志（避免刷屏，这里默认不打印）
         }
+    } else {
+        // 队列空，但阈值已满足：仅打印一次，标记本帧已处理
+        ctx_.loge("[encoder] queue empty on trigger=%d (enc_th=%d), skip sending\n", trig, enc_th);
+        lastTrigCount_ = trig;
     }
-    return 0;
+
+    sleepDefault_();
 }
 
-// 在“将第 line_idx 路设置为编码器”之前的快速校验：
-// 若当前存在任一触发线为电平触发 -> 禁止
-static int validate_when_setting_encoder(int line_idx, const std::vector<LineConfig>& lines) {
-    (void)line_idx; // 当前仅需全局检查
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const auto& l = lines[i];
-        if (l.type == LT_TRIGGER && is_level_trigger(l.active)) {
-            LOGE("编码器只能用于沿触发模式：检测到 Line%zu 为电平触发，不能再把其它线路设置为编码器。", i);
-            return E_ENCODER_FAILED;
-        }
-    }
-    return 0;
+说明：
+	•	lastTrigCount_ 只在实际发送或**“阈值满足但队列空”**时更新。
+	•	当阈值不满足时，lastTrigCount_ 保持不变，确保我们还在等待“同一帧”的发送机会。
+	•	我们不跨帧“偷看后面的结果”，严格按队头（FIFO）与“每帧只发一次”的原则执行。
+
+⸻
+
+5) 其余模式 & 线程/配置 不需要改动
+	•	定时模式与立即模式逻辑不变（定时模式仍是“到点但队列空→发 NG”）。
+	•	触发门控、时间单位（毫秒）、线程命名/绑核、队列满丢旧、错误日志+sleep 等之前约束均保持。
+	•	全局配置仍用 PM_OUTPUT_MODE（0=立即、1=定时、2=编码器）与 PM_SCHEDULED_TRANS_TIME（毫秒）。
+
+⸻
+
+6) 生产者入队补充（以 TCP 为例）
+
+void CTcpsMessage::EnqueueScheduled(const uint8_t* data, uint32_t len, uint32_t exclude_no) {
+    scheduled_fifo_param p{};
+    p.len = std::min<uint32_t>(len, MAX_SCHEDULED_PAYLOAD_LEN);
+    std::memcpy(p.buf, data, p.len);
+    p.exclude_no = exclude_no;  // 必须填
+
+    if (!m_qAdapter) m_qAdapter = new DequeAdapter(&m_shchedSendQueue, &m_shchedSendQueueMtx);
+    m_qAdapter->push_drop_old(p); // 满则丢旧
 }
 
-// —— 通用的“模式设置”处理 ——
-// buf: *(unsigned int*)buf 为目标模式（和你现有协议保持一致）
-//
-// 逻辑：
-// 1) 若目标模式 == LT_ENCODER：validate_when_setting_encoder（拦截“先电平触发后选编码器”的场景）
-// 2) 其余模式无需与编码器做互斥校验（规则只在“存在编码器”时约束触发线必须为沿）
-//
-int LineMode_handler_common(int line_idx, struct gev_register* reg, char* buf, int size) {
-    HIK_UNUSED(size);
-    return_if_nullptr();
+Modbus 侧生产者同理：把 scheduled_fifo_param.exclude_no 按你的算法结果赋值后再入 simple_fifo。
 
-    unsigned int mode = *(unsigned int*)buf;
-    std::vector<LineConfig> lines;
-    if (!fetch_all_lines(lines)) {
-        LOGE("获取 AllLineConfig 失败");
-        return -1;
-    }
-    if (line_idx < 0 || line_idx >= (int)lines.size()) {
-        LOGE("line_idx 越界: %d", line_idx);
-        return -1;
-    }
+⸻
 
-    if (mode == (unsigned)LT_ENCODER) {
-        // 目标改成编码器：不允许系统里存在“电平触发”的触发线
-        int rc = validate_when_setting_encoder(line_idx, lines);
-        if (rc != 0) return rc;
-    }
+7) 小结（行为对齐）
+	•	编码器模式现在是：
+“新帧到 → 获取剔除号阈值 enc_th → 当且仅当 队头.exclude_no <= enc_th 时发送；
+否则继续等待该帧；若阈值已足但 队列空 → 只打 LOGE 并标记这帧已处理。”
+	•	这满足你提出的：
+	1.	基于“剔除号”的触发
+	2.	队列空只打 LOGE，不发 NG
+	3.	保留该帧直到满足条件再发（不消费、不更新帧号）
+	4.	仍然保证“一帧只发一次”。
 
-    // 可选：如果目标模式不是触发，给个默认沿触发（与原有逻辑一致的保护）
-    // 如果你们有 device_configs->LineXActivation 的直接访问，这里可以进行设置。
-    // 否则由上层保存时写默认值即可。
-    // if (mode != (unsigned)LT_TRIGGER) { ... 默认 RisingEdge ... }
+⸻
 
-    return 0;
-}
-
-// —— 通用的“激活设置（沿/电平）”处理 ——
-// buf: *(unsigned int*)buf 为目标 active（RisingEdge/...）
-//
-// 逻辑：
-// 若该路当前是 LT_TRIGGER 且目标 active 为电平（LevelHigh/LevelLow），而系统存在任一路为编码器 -> 禁止
-//
-int LineActivation_handler_common(int line_idx, struct gev_register* reg, char* buf, int size) {
-    HIK_UNUSED(size);
-    return_if_nullptr();
-
-    unsigned int active = *(unsigned int*)buf;
-
-    std::vector<LineConfig> lines;
-    if (!fetch_all_lines(lines)) {
-        LOGE("获取 AllLineConfig 失败");
-        return -1;
-    }
-    if (line_idx < 0 || line_idx >= (int)lines.size()) {
-        LOGE("line_idx 越界: %d", line_idx);
-        return -1;
-    }
-
-    const LineConfig& cur = lines[line_idx];
-    if (cur.type == LT_TRIGGER && is_level_trigger(static_cast<TriggerActive>(active))) {
-        // 只要系统内存在编码器线，就不允许该触发线设置为电平
-        for (size_t i = 0; i < lines.size(); ++i) {
-            if (lines[i].type == LT_ENCODER) {
-                LOGE("编码器只能用于沿触发模式：已存在编码器(Line%zu)，因此 Line%d 不可设置为电平触发。", i, line_idx);
-                return E_ENCODER_FAILED;
-            }
-        }
-    }
-    return 0;
-}
-
-// —— 五路薄包装：保持你现有导出的符号名 ——
-// Mode
-int Line0Mode_handler(struct gev_register* reg, char* buf, int size) { return LineMode_handler_common(0, reg, buf, size); }
-int Line1Mode_handler(struct gev_register* reg, char* buf, int size) { return LineMode_handler_common(1, reg, buf, size); }
-int Line2Mode_handler(struct gev_register* reg, char* buf, int size) { return LineMode_handler_common(2, reg, buf, size); }
-int Line3Mode_handler(struct gev_register* reg, char* buf, int size) { return LineMode_handler_common(3, reg, buf, size); }
-int Line4Mode_handler(struct gev_register* reg, char* buf, int size) { return LineMode_handler_common(4, reg, buf, size); }
-
-// Activation
-int Line0Activation_handler(struct gev_register* reg, char* buf, int size) { return LineActivation_handler_common(0, reg, buf, size); }
-int Line1Activation_handler(struct gev_register* reg, char* buf, int size) { return LineActivation_handler_common(1, reg, buf, size); }
-int Line2Activation_handler(struct gev_register* reg, char* buf, int size) { return LineActivation_handler_common(2, reg, buf, size); }
-int Line3Activation_handler(struct gev_register* reg, char* buf, int size) { return LineActivation_handler_common(3, reg, buf, size); }
-int Line4Activation_handler(struct gev_register* reg, char* buf, int size) { return LineActivation_handler_common(4, reg, buf, size); }
+如果你希望我把完整的 output_mode.h/.cpp（含上述改动）打包成可直接替换的两个文件，或者把 Modbus/TCP 的改造点以 diff 补丁 形式给出，我可以马上贴出整包代码。
