@@ -1,825 +1,296 @@
-对，你现在这个收敛后的需求很清晰：
-	•	激活命令 HandleActive 只有一个入口；
-	•	但逻辑上要支持两类场景：
-	1.	设备未激活：首次激活，只允许设置管理员（用户0）密码；
-	2.	设备已激活：用同一个 HandleActive 给“技术员 / 操作员”做首次设置密码（不是改密码，改密码以后用单独命令）。
-
-下面我按你最初贴的代码，给一套完整可落地的改造，重点只放在 HandleActive + 相关封装函数上，Interchange/Login 的多用户盐值逻辑沿用我们前面说的那套。
+核心思路：
+不要在 socket 层做“关线程 / 不起线程”的大动作，而是在每个 GVCP 线程里，根据激活状态 + 通道激活状态 + IDChannelEnable，决定“收到包要不要处理 / 回包”。
+这样既安全又好控制逻辑。
 
 ⸻
 
-0. 约定好的用户索引与用户名
+1. 先把规则翻译成“允许访问”判断
 
-我们固定三种角色到三个索引：
-	•	管理员：index = 0（DEFAULT_USER_NAME，和你原来一致）
-	•	技术员：index = 1
-	•	操作员：index = 2
+你给出的规则再整理一下（加一点“实现语义”）：
+	1.	未激活状态
+	•	设备未激活：bActiveSts == 0
+	•	行为：SC、ID 两通路都可以 Discovery + 命令（激活流程）。
+	2.	通过 SC（3966）激活后
+	•	设备已激活：bActiveSts == 1
+	•	bAuthChannel 标记了 SC 通道已激活（bit2=1）。
+	•	默认：ID 通路关闭：
+	•	DISCOVERY 不响应
+	•	所有命令不响应
+	•	只允许 SC 通道工作。
+	3.	通过 ID（3956）激活后
+	•	设备已激活：bActiveSts == 1
+	•	bAuthChannel 标记了 ID 通道已激活（bit1=1）。
+	•	规则：SC 通道的激活状态不因为 ID 激活而被关闭。
+	•	即：如果 SC 之前已经激活，继续生效；
+	•	如果还没激活，ID 激活不改变 SC 的可访问性（通常我们认为 SC 一直可访问，会更合理一点）。
+	4.	IDChannelEnable == 1 时的例外
+	•	配置项：IDChannelEnable（假设你有对应寄存器/变量）
+	•	含义：当 IDChannelEnable=1 时，即使 SC 通路激活，ID 通道也允许访问。
 
-在 RedlineManager 类增加一些常量和成员
+⸻
 
-// RedlineManager.h
+2. 通用决策函数：redline_allow_gvcp_access()
 
-class RedlineManager
+建议在 gvcp_redline.c/h 里加一个统一的“是否允许当前通道处理 GVCP 包”的函数，GVCP 两个线程在收到包后先问一下它：
+
+// gvcp_redline.h
+#pragma once
+
+#include <stdint.h>
+
+typedef enum
 {
-public:
-    static constexpr int   kMaxUserCount   = 8;
-    static constexpr size_t kUserNameSize  = 16;
+    REDLINE_AUTH_CH_ID = 1,   // 3956
+    REDLINE_AUTH_CH_SC = 2    // 3966
+} REDLINE_AUTH_CHANNEL_E;
 
-    // 固定角色名（你实际可以用中文 UTF-8 或协议里定义的固定用户名）
-    static constexpr const char* ADMIN_NAME    = DEFAULT_USER_NAME;  // 管理员
-    static constexpr const char* TECH_NAME     = "technician";       // 技术员
-    static constexpr const char* OPERATOR_NAME = "operator";         // 操作员
+// 设备是否已经完成激活（全局）
+int redline_is_device_activated(void);
 
-    // ...
+// bAuthChannel 的封装：返回 bitmask（ID=1, SC=2）
+uint8_t redline_get_channel_active(void);
 
-private:
-    REDLINE_SOLIDIFY_PARAM_T m_stSolid{};
-    REDLINE_DEVICE_STS_T     m_stDevSts{};
+// ID 通道开关配置：0 关闭 / 1 打开
+int redline_get_id_channel_enable(void);
 
-    int m_curUserIndex = -1; // 给 Interchange/Login 用，这里先不展开
+// 核心决策函数：当前通道是否允许访问 GVCP（含 DISCOVERY 和命令）
+int redline_allow_gvcp_access(REDLINE_AUTH_CHANNEL_E ch);
 
-    bool isUserSlotValid(int index) const;
-    int  mapUserNameToIndex(const char* userName) const;
+实现（示例）：
 
-    // 激活/首次设置密码用的内部封装
-    bool initUserCredential(int userIdx,
-                            const char* userName,
-                            const char* plainPwd,
-                            unsigned char* outSalt /* 可为 nullptr */,
-                            size_t* outSaltLen     /* 可为 nullptr */);
+// gvcp_redline.c
+#include "gvcp_redline.h"
+#include "redline_solidify.h"  // 里面有 REDLINE_SOLIDIFY_PARAM_T，全局固化参数
 
-    bool syncSolidToBsp();   // 封装 bsp_set_passwd 调用
-};
+extern REDLINE_SOLIDIFY_PARAM_T g_redline_solidify_param;
 
-实现这些小工具
+// ===== 基础状态封装 =====
 
-// RedlineManager.cpp
-
-bool RedlineManager::isUserSlotValid(int index) const
+int redline_is_device_activated(void)
 {
-    if (index < 0 || index >= kMaxUserCount)
-        return false;
-
-    // 简单约定：userName[0] != '\0' 视为该槽位已配置
-    return m_stSolid.userName[index][0] != '\0';
+    return (g_redline_solidify_param.bActiveSts != 0);
 }
 
-// 把用户名映射到固定的 user index
-int RedlineManager::mapUserNameToIndex(const char* userName) const
+uint8_t redline_get_channel_active(void)
 {
-    if (!userName)
-        return -1;
-
-    if (std::strncmp(userName, ADMIN_NAME,   kUserNameSize) == 0)
-        return 0;    // 管理员
-
-    if (std::strncmp(userName, TECH_NAME,    kUserNameSize) == 0)
-        return 1;    // 技术员
-
-    if (std::strncmp(userName, OPERATOR_NAME,kUserNameSize) == 0)
-        return 2;    // 操作员
-
-    // 其它用户名暂不支持（也可以扩展为 3~7）
-    return -1;
+    // 约定：bAuthChannel 为 bitmask：
+    // bit0: ID 通道已激活 (REDLINE_AUTH_CH_ID)
+    // bit1: SC 通道已激活 (REDLINE_AUTH_CH_SC)
+    return g_redline_solidify_param.bAuthChannel;
 }
 
-// 把当前 m_stSolid 整体同步到 BSP，BSP 用 user0 作为绑定入口
-bool RedlineManager::syncSolidToBsp()
+// 这个根据你实际寄存器/配置实现，这里给个伪函数
+int redline_get_id_channel_enable(void)
 {
-    const char* adminName = reinterpret_cast<const char*>(m_stSolid.userName[0]);
-    const char* adminPwd  = reinterpret_cast<const char*>(m_stSolid.password[0]);
-
-    if (!adminName || adminName[0] == '\0' ||
-        !adminPwd  || adminPwd[0]  == '\0')
-    {
-        LOGE("syncSolidToBsp: admin user0 not initialized!\n");
-        return false;
-    }
-
-    int ret = bsp_set_passwd(adminName, adminPwd);
-    if (ret != 0)
-    {
-        LOGE("syncSolidToBsp: bsp_set_passwd failed! ret=%d\n", ret);
-        return false;
-    }
-
-    return true;
+    // TODO: 从设备配置里取出 IDChannelEnable
+    // 比如：return device_configs->IDChannelEnable;
+    return 0;
 }
 
-// 初始化某个用户（首次设置密码）
-//  - userIdx: 0=管理员, 1=技术员, 2=操作员...
-//  - userName: 要写入 m_stSolid.userName[userIdx] 的名字（固定字符串）
-//  - plainPwd: 解密后的明文密码
-//  - outSalt/outSaltLen: 如需回填给 ACK，就传入；否则可传 nullptr
-bool RedlineManager::initUserCredential(int userIdx,
-                                        const char* userName,
-                                        const char* plainPwd,
-                                        unsigned char* outSalt,
-                                        size_t* outSaltLen)
+// ===== 核心访问决策 =====
+
+int redline_allow_gvcp_access(REDLINE_AUTH_CHANNEL_E ch)
 {
-    if (userIdx < 0 || userIdx >= kMaxUserCount ||
-        !userName || !plainPwd)
+    uint8_t active_mask;
+    int id_en;
+
+    // 1. 设备未激活：两通道都允许访问（用于激活流程）
+    if (!redline_is_device_activated())
     {
-        return false;
+        return 1;
     }
 
-    // 1. 校验密码格式（可按不同角色做不同规则，这里用统一 checkPasswd）
-    if (!checkPasswd(const_cast<char*>(userName),
-                     const_cast<char*>(plainPwd)))
+    // 下面都是“已激活”后的行为
+    active_mask = redline_get_channel_active();
+    id_en       = redline_get_id_channel_enable();
+
+    int sc_active = (active_mask & REDLINE_AUTH_CH_SC) != 0;
+    int id_active = (active_mask & REDLINE_AUTH_CH_ID) != 0;
+
+    if (ch == REDLINE_AUTH_CH_SC)
     {
-        LOGE("initUserCredential: password format invalid for user '%s'\n", userName);
-        return false;
+        // SC 通道规则：
+        // - 被 SC 激活后，永远允许访问；
+        // - 被 ID 激活后，规则里没说要关掉 SC，通常保持 SC 可访问。
+        return 1;
+    }
+    else if (ch == REDLINE_AUTH_CH_ID)
+    {
+        // ID 通道规则：
+        // 1) 未激活阶段已经在上面返回 1 了，这里都是已激活的情况。
+        // 2) 如果 ID 通道自己激活过（id_active=1），那么它当然可以访问
+        if (id_active)
+        {
+            return 1;
+        }
+
+        // 3) 如果 SC 通道激活，但 IDChannelEnable=0，则 ID 通道关闭
+        if (sc_active && !id_en)
+        {
+            return 0;   // 不允许 ID 通道访问：DISCOVERY 和命令都不响应
+        }
+
+        // 4) 其他情况（比如 id_en=1，或只有 ID 激活），允许
+        return 1;
     }
 
-    // 2. 生成 salt 与 e1
-    unsigned char salt[RANDOM_SALT_STR_LEN + 1] = {0};
-    unsigned char e1[256] = {0};
-    size_t e1Len = 0;
-
-    generate_random_string(salt, RANDOM_SALT_STR_LEN + 1);
-
-    int ret = generate_e1_encrypt(
-        reinterpret_cast<const unsigned char*>(plainPwd),
-        salt,
-        e1, sizeof(e1), &e1Len);
-    if (ret != 0)
-    {
-        LOGE("initUserCredential: generate_e1_encrypt failed! ret=%d\n", ret);
-        return false;
-    }
-
-    // 3. 写入 m_stSolid 指定槽位
-    std::memset(m_stSolid.userName[userIdx], 0, sizeof(m_stSolid.userName[userIdx]));
-    std::memset(m_stSolid.password[userIdx], 0, sizeof(m_stSolid.password[userIdx]));
-    std::memset(m_stSolid.salt[userIdx],     0, sizeof(m_stSolid.salt[userIdx]));
-    std::memset(m_stSolid.e1[userIdx],       0, sizeof(m_stSolid.e1[userIdx]));
-
-    std::strncpy(reinterpret_cast<char*>(m_stSolid.userName[userIdx]),
-                 userName,
-                 sizeof(m_stSolid.userName[userIdx]) - 1);
-    std::strncpy(reinterpret_cast<char*>(m_stSolid.password[userIdx]),
-                 plainPwd,
-                 sizeof(m_stSolid.password[userIdx]) - 1);
-    std::strncpy(reinterpret_cast<char*>(m_stSolid.salt[userIdx]),
-                 reinterpret_cast<char*>(salt),
-                 sizeof(m_stSolid.salt[userIdx]) - 1);
-    std::strncpy(reinterpret_cast<char*>(m_stSolid.e1[userIdx]),
-                 reinterpret_cast<char*>(e1),
-                 sizeof(m_stSolid.e1[userIdx]) - 1);
-
-    // 4. 首次激活时设置激活标志
-    if (userIdx == 0)
-        m_stSolid.bActiveSts = 1;
-
-    // 5. 保存红线固化参数
-    SaveSolidParams();
-
-    // 6. 如需返回盐值给调用者（比如给 ACK）
-    if (outSalt && outSaltLen)
-    {
-        std::memcpy(outSalt, salt, RANDOM_SALT_STR_LEN);
-        *outSaltLen = RANDOM_SALT_STR_LEN;
-    }
-
-    // 7. 把整套 8 组账号同步到 BSP secure 区（BSP 实际只绑 user0 的系统密码）
-    if (!syncSolidToBsp())
-    {
-        LOGE("initUserCredential: syncSolidToBsp failed!\n");
-        return false;
-    }
-
-    return true;
+    // 未知通道，安全起见拒绝
+    return 0;
 }
 
+bAuthChannel 的写入建议在激活流程里做：
+	•	SC 激活成功：g_redline_solidify_param.bAuthChannel |= REDLINE_AUTH_CH_SC;
+	•	ID 激活成功：g_redline_solidify_param.bAuthChannel |= REDLINE_AUTH_CH_ID;
 
 ⸻
 
-1. 修改 HandleActive：一个 handle，同步支持两类场景
+3. 在 gvcp_thread 里接入这套逻辑（假设是 ID 通道）
 
-1.1 要求：Active 命令里带用户名
+你给的 gvcp_thread 看起来是绑定单个 GVCP_PORT 的通用线程，这里我们先假定它是 ID 通道线程（3956 端口），那么只需在收到包、准备处理之前加一行判断：
 
-为了在 HandleActive 里区分是管理员 / 技术员 / 操作员，Active 命令必须有用户名字段，比如：
-
-typedef struct
+static void *gvcp_thread(void *arg)
 {
-    // ...
-    uint8_t userName[16];    // 新增：激活/设置密码的目标用户名
-    uint8_t enPassword[...]; // 现有：AES 加密后的密码
-} RL_ActiveCmdView;
+    struct gvcp *gvcp = NULL;
+    int rx_len;
+    socklen_t len = sizeof(struct sockaddr_in);
+    int result;
 
-下面代码里我用 stCmd.userName.data() 拿用户名，你按你实际的结构改一下即可。
+    thread_set_name("gvcp thread");
+#ifndef ASAN_SUPPORT
+    thread_bind_cpu(1);
+#endif
+    gvcp = (struct gvcp *)arg;
 
-1.2 改造后的 HandleActive（完整函数）
-
-int RedlineManager::HandleActive(const gvcp_packet* req, gvcp_packet* ack,
-                                 unsigned short pkt_id, int* size)
-{
-    RL_ActiveCmdView stCmd{};
-    RL_ActiveAckView stAck{};
-    unsigned char deAesPassword[32] = {0};
-    size_t outlen = 0;
-    int status = GEV_STATUS_SUCCESS;
-    int ret = -1;
-
-    if (!req || !ack || !size)
+    if (NULL == gvcp) 
     {
-        return REDL_EPARAM;
+        LOGE("gvcp is NULL\r\n");
+        return NULL;
     }
 
-    // 解析命令（包含用户名 + 加密密码）
-    if (!RL_ParseActiveCmd(req, stCmd))
+    if (prepare_gvcp_socket()) 
     {
-        return REDL_EPARAM;
+        LOGE("Fail to prepare gevcp socket\r\n");
+        return NULL;
     }
 
-    // 从命令中取出用户名
-    char userName[kUserNameSize + 1] = {0};
-    std::memcpy(userName,
-                stCmd.userName.data(),   // 根据你的结构调整
-                kUserNameSize);
-
-    // 把用户名映射到指定的用户索引（0=管理员, 1=技术员, 2=操作员）
-    int targetIdx = mapUserNameToIndex(userName);
-
-    // 未知用户名直接拒绝
-    if (targetIdx < 0)
+    while (gvcp->gevcp.state < GVCP_STATE_IP_CONFIGURED)
     {
-        LOGE("HandleActive: unsupported userName '%s'\n", userName);
-        return REDL_EPARAM;
+        usleep(100000);
     }
-
-    do
-    {
-        // 1) AES 解密密码 —— 和你原先逻辑一致
-        ret = aes128_cbc_decrypt(m_activeRandom, m_activeRandom,
-                                 stCmd.enPassword.data(),
-                                 std::strlen(reinterpret_cast<const char*>(stCmd.enPassword.data())),
-                                 deAesPassword, &outlen);
-        if (ret != 0)
+    
+    LOGI("GVCP enter main loop\r\n");
+    while (1) 
+    {   
+        if (recreate_gvcp_socket)
         {
-            LOGE("aes128_cbc_decrypt failed! ret %d!\n", ret);
-            status = GEV_STATUS_REDLINE_API_FAILED;
-            *size = GVCP_HEADER_SIZE;
-            break;
+            LOGE("recreate gvcp socket\r\n");
+            recreate_gvcp_socket = 0;
+            
+            if (prepare_gvcp_socket()) 
+            {
+                LOGE("Fail to prepare gevcp socket\r\n");
+                usleep(100000);
+                continue;
+            }
         }
 
-        deAesPassword[outlen] = '\0';
-
-        // ---------- 分支 A：设备未激活，首次激活 ----------
-        if (GetActiveSts() != DEV_ACTIVATED)
+        if (gvcp->sock_fd < 0)
         {
-            // 首次激活只允许管理员（user0）
-            if (targetIdx != 0)
-            {
-                LOGE("HandleActive: device not activated, but user '%s' is not admin!\n",
-                     userName);
-                status = GEV_STATUS_ACCESS_DENIED;
-                *size = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            LOGE("HandleActive: first activation, admin user '%s'\n", userName);
-
-            // 初始化管理员凭据（user0），回填盐到 ACK
-            unsigned char saltBuf[RANDOM_SALT_STR_LEN] = {0};
-            size_t saltLen = 0;
-
-            if (!initUserCredential(0, ADMIN_NAME,
-                                    reinterpret_cast<const char*>(deAesPassword),
-                                    saltBuf, &saltLen))
-            {
-                status = GEV_STATUS_REDLINE_API_FAILED;
-                *size = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            // 把盐返回给上位机
-            if (saltLen >= RANDOM_SALT_STR_LEN)
-            {
-                std::memcpy(stAck.salt.data(), saltBuf, RANDOM_SALT_STR_LEN);
-            }
-        }
-        // ---------- 分支 B：设备已激活，首次设置“技术员/操作员”密码 ----------
-        else
-        {
-            // 规则：HandleActive 在已激活状态下，只允许做“首次设置密码”：
-            //  - 管理员重激活不在这里做（改密码另有命令）
-            //  - 技术员/操作员如果已经设置过，不能再用这个命令改（避免混淆）
-
-            if (targetIdx == 0)
-            {
-                LOGE("HandleActive: device already activated, admin should change password via change-pwd command, not HandleActive\n");
-                status = GEV_STATUS_ACCESS_DENIED;
-                *size = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            // 技术员/操作员必须是“未设置过”的状态（userName 槽位为空）
-            if (isUserSlotValid(targetIdx))
-            {
-                LOGE("HandleActive: user '%s' already initialized, use change-pwd command instead\n",
-                     userName);
-                status = GEV_STATUS_ACCESS_DENIED;  // 或定义一个 USER_ALREADY_INIT
-                *size = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            LOGE("HandleActive: initialize extra user '%s' at index %d\n",
-                 userName, targetIdx);
-
-            // 初始化指定用户的凭据（首次设置密码）
-            if (!initUserCredential(targetIdx,
-                                    userName,
-                                    reinterpret_cast<const char*>(deAesPassword),
-                                    nullptr, nullptr))  // 不需要回盐给 ACK 可传 nullptr
-            {
-                status = GEV_STATUS_REDLINE_API_FAILED;
-                *size = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            // 一般给技术员/操作员首次设置密码时，ACK 不需要返回盐；
-            // 如有协议要求，也可以把对应 salt 回填 stAck.salt。
+            usleep(100000);
+            continue;       
         }
 
-    } while (0);
-
-    // 写 ACK + 头
-    RL_WriteActiveAck(ack, stAck, size);
-    RL_GvcpFillAckHeader(&ack->header, status,
-                         GVCP_COMMAND_ACTIVE_ACK, *size, pkt_id);
-    return REDL_OK;
-}
-
-小结下 HandleActive 现在的行为
-	1.	设备未激活（GetActiveSts() != DEV_ACTIVATED）
-	•	只允许 userName == ADMIN_NAME（即用户0）；
-	•	视为“首次激活 + 设置管理员密码”；
-	•	调 initUserCredential(0, ADMIN_NAME, pwd)
-	•	回 ACK 时带管理员的 salt[0]。
-	2.	设备已激活（GetActiveSts() == DEV_ACTIVATED）
-	•	当 userName == TECH_NAME 且该槽位未配置：首次设置技术员密码 → 初始化 index=1；
-	•	当 userName == OPERATOR_NAME 且该槽位未配置：首次设置操作员密码 → 初始化 index=2；
-	•	已经初始化过，再用 HandleActive 来改密码，会直接返回 ACCESS_DENIED（未来你可以在改密码命令里处理修改逻辑）；
-	•	管理员想改密码，也不走这个 handle，而是用单独的“修改密码命令”。
-
-所有这些初始化操作，内部都走同一个：
-	•	initUserCredential()：
-	•	写 m_stSolid.userName/password/salt/e1；
-	•	SaveSolidParams()；
-	•	syncSolidToBsp() → 最终调用 bsp_set_passwd(user0, pwd0)，把当前 8 组账号刷到 BSP secure 区。
-
-⸻
-
-2. 对你的两个需求点逐条对照
-
-1、相机最多支持8个用户，在首次使用（即激活时），需要设置管理员密码，即固定用户0，其余为未设置过的用户名设置密码，不是修改密码，具体的用户名也是固定的：技术员，操作员
-
-	•	✅ 首次使用（GetActiveSts != DEV_ACTIVATED）：只允许管理员（user0）走 HandleActive；
-	•	✅ 设备已激活后：HandleActive 允许对固定用户名（技术员、操作员）做“首次设置密码”；
-	•	✅ 已经设置过的技术员/操作员，再用 HandleActive 会被拒绝，避免被当成“改密码”。
-
-2、其余命令， 比如HandleLogin应该需要先判断是第几个用户，以及获取激活后交换码，也需要根据用户名对应的盐值
-
-	•	✅ Interchange：解析用户名 → mapUserNameToIndex() 找 userIdx → 使用 m_stSolid.salt[userIdx] 把 salt 下发给上位机，同时设置 m_curUserIndex = userIdx；
-	•	✅ Login：必须依赖 m_curUserIndex，用对应用户的 e1[userIdx] + m_activeRandom 算 En 做对比，实现“按用户索引选 e1[i]，支持多账户登录”。
-
-⸻
-
-如果你愿意，下一步可以把你现在的 RL_ActiveCmdView / RL_InterchangeCmdView 的结构体定义 丢出来，我可以帮你把 stCmd.userName.data() 那些地方对齐到你真实字段名，顺便把 Interchange/Login 也按这套多用户逻辑改成“可直接替换进工程”的版本。
-
-
-好，那我把 HandleInterchange + HandleLogin 两个接口按你现在的多用户需求完整补上，假定你已经按前一条消息那样，把 HandleActive 和辅助函数（mapUserNameToIndex、initUserCredential 等）加好了。
-
-下面代码是可以直接丢进 RedlineManager.cpp 里的版本，你按自己工程的字段名微调一下就行。
-
-⸻
-
-0. 前置假设（跟你现有代码保持一致）
-	•	REDLINE_SOLIDIFY_PARAM_T 已经是你贴的结构：
-
-typedef struct
-{
-    uint8_t userName[8][16];  // 0: 管理员，1: 技术员，2: 操作员
-    uint8_t password[8][16];
-    uint8_t salt[8][20];
-    uint8_t e1[8][68];
-    uint8_t bActiveSts;
-    uint32_t reserved2[32];
-} REDLINE_SOLIDIFY_PARAM_T;
-
-
-	•	RL_InterchangeCmdView 里有用户名字段，比如：
-
-struct RL_InterchangeCmdView {
-    uint16_t macHigh;
-    uint32_t macLow;
-    uint16_t mode;
-    std::array<uint8_t, 16> userName;   // 这里假定是这样，你按实际来
-    std::array<uint8_t, 896> publicKey; // 未激活时用
-    // ...
-};
-
-
-	•	RL_LoginCmdView 有成员：
-
-struct RL_LoginCmdView {
-    uint16_t function;                  // LOGIN_CMD_LOGIN / LOGIN_CMD_AUTH
-    uint16_t macHigh;
-    uint32_t macLow;
-    std::array<uint8_t, 128> enString;  // 登录用的 En 串
-    // ...
-};
-
-
-	•	RedlineManager 已经有这些成员/工具函数：
-
-class RedlineManager {
-public:
-    static constexpr int   kMaxUserCount   = 8;
-    static constexpr size_t kUserNameSize  = 16;
-
-private:
-    REDLINE_SOLIDIFY_PARAM_T m_stSolid{};
-    REDLINE_DEVICE_STS_T     m_stDevSts{};
-    char m_activeRandom[RANDOM_SALT_STR_LEN + 1]{};
-    int  m_curUserIndex = -1;
-
-    bool isUserSlotValid(int index) const;
-    int  mapUserNameToIndex(const char* userName) const;
-    bool syncSolidToBsp();
-    // ...
-};
-
-
-
-⸻
-
-1. HandleInterchange：已激活时按用户名选盐 + 记住用户索引
-
-int RedlineManager::HandleInterchange(const gvcp_packet* req, gvcp_packet* ack,
-                                      unsigned short pkt_id, int* size, bool broadcast)
-{
-    int ret = 0;
-    size_t outlen = 0;
-    unsigned short status = GEV_STATUS_SUCCESS;
-    RL_InterchangeCmdView stCmd{};
-    RL_InterchangeAckView stAck{};
-
-    if (!req || !ack || !size)
-    {
-        return REDL_EPARAM;
-    }
-
-    if (!RL_ParseInterchangeCmd(req, stCmd))
-    {
-        return REDL_EPARAM;
-    }
-
-    do
-    {
-        // ==================== 设备已激活：登录/鉴权握手 ====================
-        if (DEV_ACTIVATED == GetActiveSts())
+        FD_ZERO(&rset);
+        FD_SET(gvcp->sock_fd, &rset);
+        result = select(gvcp->sock_fd + 1, &rset, NULL, NULL, NULL);
+        if (result > 0)
         {
-            // 广播包但 MAC 不匹配：直接忽略
-            if (broadcast && !RedlineUtils::isMacAddressMatch(stCmd.macHigh, stCmd.macLow))
+            if (FD_ISSET(gvcp->sock_fd, &rset))
             {
-                *size = 0;
-                return REDL_OK;
-            }
+                rx_len = recvfrom(gvcp->sock_fd,
+                                  (void *)gvcp_net.recv_buf,
+                                  sizeof(gvcp_net.recv_buf),
+                                  0,
+                                  (struct sockaddr *)&gvcp->host_addr,
+                                  &len);
 
-            if (stCmd.mode != REDLINE_ACTIVE)
-            {
-                LOGE("device actived, and inter mode not auth!\n");
-                status = GEV_STATUS_DEVICE_ALREADY_ACTIVE;
-                *size  = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            // 1. 从交换码命令里取用户名（16 字节）
-            char userName[kUserNameSize + 1] = {0};
-            std::memcpy(userName,
-                        stCmd.userName.data(),
-                        kUserNameSize);
-            userName[kUserNameSize] = '\0';
-
-            // 2. 根据用户名找到用户索引（0:管理员, 1:技术员, 2:操作员, 其它暂不支持）
-            int userIdx = mapUserNameToIndex(userName);
-            if (userIdx < 0 || userIdx >= kMaxUserCount || !isUserSlotValid(userIdx))
-            {
-                LOGE("HandleInterchange: unknown/uninitialized user '%s', idx=%d\n",
-                     userName, userIdx);
-                status = GEV_STATUS_ACCESS_DENIED;
-                *size  = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            // 3. 记录本次会话的用户索引，给后续 HandleLogin 用
-            m_curUserIndex = userIdx;
-
-            stAck.mode = RL_InterDataMode::Salt_Random;
-
-            // 4. 把该用户的 salt[i] 发给客户端
-            std::memcpy(stAck.salt.data(),
-                        m_stSolid.salt[userIdx],
-                        RANDOM_SALT_STR_LEN);
-
-            // 5. 生成随机串 A，保存到 m_activeRandom
-            generate_random_string(reinterpret_cast<unsigned char*>(m_activeRandom),
-                                   RANDOM_SALT_STR_LEN + 1);
-            LOGI("interchange random string :%s, user %d!\n", m_activeRandom, userIdx);
-
-            unsigned char e1[256] = {0};
-
-            // 6. 用随机串 A + salt[userIdx] 计算 e1
-            ret = generate_e1_encrypt(
-                reinterpret_cast<unsigned char*>(m_activeRandom),
-                m_stSolid.salt[userIdx],
-                e1, sizeof(e1), &outlen);
-            if (ret != 0)
-            {
-                LOGE("generate_e1_encrypt failed! ret=%d\n", ret);
-                status = GEV_STATUS_REDLINE_API_FAILED;
-            }
-
-            char devE1[8 + 1] = {0};
-            if (outlen >= 8)
-            {
-                std::memcpy(devE1, e1 + outlen - 8, 8);
-                std::memcpy(stAck.devE1.data(), devE1, 8);
-            }
-
-            LOGE("new e1 %s; outlen %zu! devE1 %s\n", e1, outlen, devE1);
-
-            // 7. 把随机串 A 发给客户端
-            std::memcpy(stAck.randomString.data(),
-                        m_activeRandom, RANDOM_SALT_STR_LEN);
-        }
-        // ==================== 设备未激活：激活流程（保持原逻辑） ====================
-        else if (DEV_DEACTIVATED == GetActiveSts() ||
-                 DEV_INIT_STS == GetActiveSts())
-        {
-            // 激活：走 RSA 公钥 + 随机串加密
-            if (stCmd.mode != REDLINE_INACTIVE)
-            {
-                LOGE("device not actived, and inter mode not active!\n");
-                status = GEV_STATUS_ACCESS_DENIED;
-                *size  = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            stAck.mode = RL_InterDataMode::Encrypt_Random;
-            unsigned char rsaPubKey[1024] = {0};
-
-            // 解码拿到公钥
-            base64_decode(stCmd.publicKey.data(), rsaPubKey);
-            LOGD("pub key decode len %zu; get rsa pub key %s!\n",
-                 std::strlen(reinterpret_cast<const char*>(rsaPubKey)),
-                 rsaPubKey);
-
-            // 生成随机串 A
-            unsigned char randomStr[RANDOM_SALT_STR_LEN + 1] = {0};
-            generate_random_string(randomStr, RANDOM_SALT_STR_LEN + 1);
-
-            std::memset(m_activeRandom, 0, sizeof(m_activeRandom));
-            std::memcpy(m_activeRandom, randomStr, RANDOM_SALT_STR_LEN);
-
-            LOGE("interchange(activate) random :%s! m_activeRandom %s, len %zu\n",
-                 randomStr, m_activeRandom,
-                 std::strlen(reinterpret_cast<const char*>(randomStr)));
-
-            // 使用 RSA 公钥对随机串进行加密, 会直接进行 base64 编码输出
-            ret = rsa_encrypt_by_key(
-                rsaPubKey,
-                randomStr,
-                std::strlen(reinterpret_cast<const char*>(randomStr)),
-                stAck.enRandomString.data(),
-                &outlen);
-            if (ret != 0)
-            {
-                LOGE("rsa encrypt failed! ret %d\n", ret);
-                status = GEV_STATUS_REDLINE_API_FAILED;
-                *size  = GVCP_HEADER_SIZE;
-                break;
-            }
-
-            LOGE("enlen %zu , rsa en string :%s \n",
-                 outlen, stAck.enRandomString.data());
-        }
-    } while (0);
-
-    if (GEV_STATUS_SUCCESS == status)
-    {
-        RL_WriteInterchangeAck(ack, stAck, size);
-    }
-
-    RL_GvcpFillAckHeader(&ack->header, status,
-                         GVCP_COMMAND_INTERCHANGE_ACK, *size, pkt_id);
-    return REDL_OK;
-}
-
-要点：
-	•	激活后 Interchange 必须带 用户名，通过 mapUserNameToIndex() 找到索引；
-	•	用该用户的 salt[userIdx] 生成 e1，并把 salt[userIdx] + random + devE1 发给客户端；
-	•	把 userIdx 存进 m_curUserIndex，为 Login 做准备；
-	•	未激活分支完全沿用你原来的 RSA 公钥流程。
-
-⸻
-
-2. HandleLogin：严格依赖 m_curUserIndex，按用户索引选 e1[i]
-
-int RedlineManager::HandleLogin(const gvcp_packet* req, gvcp_packet* ack,
-                                unsigned short pkt_id, int* size, bool broadcast)
-{
-    unsigned char myEn[128]     = {0};
-    unsigned char myAuthEn[128] = {0};
-    size_t outEnLen = 0;
-    int ret = 0;
-    int status = GEV_STATUS_SUCCESS;
-    RL_LoginCmdView stCmd{};
-    RL_LoginAckView stAck{};
-    struct product_data* rt = get_product_data();
-
-    if (!req || !ack || !size)
-    {
-        return REDL_EPARAM;
-    }
-
-    // A/B 互斥：仅允许唯一在线（你可以选择直接返回 EBUSY）
-    if (!TryAcquireSession())
-    {
-        // return REDL_EBUSY;
-    }
-
-    if (!RL_ParseLoginCmd(req, stCmd))
-    {
-        return REDL_EPARAM;
-    }
-
-    struct timeval now;
-    struct timeval start;
-    RedlineUtils::getCurrentTime(&start);
-
-    do
-    {
-        if (isLocked_())
-        {
-            status = GEV_STSTUS_LOCKED_DENIED;
-            break;
-        }
-
-        if (GetActiveSts() != DEV_ACTIVATED)
-        {
-            LOGE("device not active, can't login!\n");
-            status = GEV_STATUS_DEVICE_NOT_ACTIVE;
-            *size  = GVCP_HEADER_SIZE;
-            break;
-        }
-
-        // 这里严格要求：必须先走 Interchange 设置好 m_curUserIndex
-        if (m_curUserIndex < 0 ||
-            m_curUserIndex >= kMaxUserCount ||
-            !isUserSlotValid(m_curUserIndex))
-        {
-            LOGE("HandleLogin: invalid m_curUserIndex=%d, Interchange(with username) must be done before Login!\n",
-                 m_curUserIndex);
-            status = GEV_STATUS_ACCESS_DENIED;
-            *size  = GVCP_HEADER_SIZE;
-            break;
-        }
-
-        LOGE("generate en param e1(user %d): %s; random string %s! salt %s\n",
-             m_curUserIndex,
-             m_stSolid.e1[m_curUserIndex],
-             m_activeRandom,
-             m_stSolid.salt[m_curUserIndex]);
-
-        // 用当前用户的 e1[i] 和 m_activeRandom 生成 En
-        ret = generate_en_encrypt(
-            m_stSolid.e1[m_curUserIndex],
-            reinterpret_cast<unsigned char*>(m_activeRandom),
-            myEn, sizeof(myEn), &outEnLen);
-        if (ret != 0)
-        {
-            LOGE("generate en failed! ret %d!\n", ret);
-            status = GEV_STATUS_REDLINE_API_FAILED;
-            break;
-        }
-
-        RedlineUtils::getCurrentTime(&now);
-        LOGE("auth en cost %dms!\n", RedlineUtils::calcTimeDiff(now, start));
-
-        LOGE("myEn %s, outlen %zu; login En %s!\n",
-             myEn, outEnLen, stCmd.enString.data());
-
-        // 按协议，只比较前 64 字节
-        if (std::strncmp(reinterpret_cast<char*>(myEn),
-                         reinterpret_cast<const char*>(stCmd.enString.data()),
-                         64) == 0)
-        {
-            LOGE("en compare ok! user index %d\n", m_curUserIndex);
-
-            if (stCmd.function == LOGIN_CMD_LOGIN)
-            {
-                // 真正登录
-                RecoverLockInfo();
-
-                m_stDevSts.login_sts1          = LOGGED_IN;
-                m_stDevSts.cookie_timeout_sts = 0;
-
-                std::memcpy(rt->device_configs.SessionCookie,
-                            m_activeRandom, RANDOM_SALT_STR_LEN);
-
-                // 端口协商
-                stAck.keepAlivePort = htons(rt->device_state.GevHeartBeatPort);
-                stAck.fileAccessPort = htons(rt->device_configs.GevPrivCPort);
-
-                std::memcpy(stAck.cookie.data(),
-                            m_activeRandom, RANDOM_SALT_STR_LEN);
-
-                // 视需求决定是否清空 m_curUserIndex
-                // m_curUserIndex = -1;
-                break;
-            }
-            else if (stCmd.function == LOGIN_CMD_AUTH)
-            {
-                // AUTH 功能分支
-                if (broadcast &&
-                    !RedlineUtils::isMacAddressMatch(stCmd.macHigh, stCmd.macLow))
+                if (rx_len > 0)
                 {
-                    *size = 0;
-                    return REDL_OK;
+                    // ===== 关键：ID 通道访问控制 =====
+                    if (!redline_allow_gvcp_access(REDLINE_AUTH_CH_ID))
+                    {
+                        // 不响应任何包（包括 DISCOVERY），直接丢弃
+                        continue;
+                    }
+
+                    if (GVCP_DUMP_OPEN == gvcp_dump_type)
+                    {
+                        dump_buffer((char *)gvcp_net.recv_buf, rx_len);
+                    }
+
+                    gvcp_udp_handler((uchar *)gvcp_net.recv_buf,
+                                     GVCP_PORT,
+                                     (ip_addr_t)gvcp->host_addr.sin_addr.s_addr,
+                                     gvcp->host_addr.sin_port,
+                                     rx_len);
                 }
-
-                RecoverLockInfo();
-
-                m_stDevSts.auth_sts           = 1;
-                m_stDevSts.cookie_timeout_sts = 0;
-                RedlineUtils::getCurrentTime(&m_stDevSts.auth_start_time);
-
-                ret = thread_spawn_ex(&m_thAuthTimeout, 1,
-                                      SCHED_POLICY_OTHER, SCHED_PRI_NA,
-                                      10 * 1024, AuthStsTimeoutThread, this);
-                if (ret < 0)
+                else
                 {
-                    LOGE("login_lock_thread_t creation failed!\r\n");
+                    LOGE("gvcp upd recvfrom ERROR\r\n");
                 }
-
-                break;
             }
         }
         else
         {
-            LOGE("en compare failed! user index %d\n", m_curUserIndex);
-
-            DoLock();
-
-            status = GEV_STATUS_PWD_VERIFY_FAILED;
-            break;
-        }
-    } while (0);
-
-    // LOGIN_CMD_AUTH 模式还需要生成一个 devEn
-    if (stCmd.function == LOGIN_CMD_AUTH)
-    {
-        std::memcpy(myAuthEn, stCmd.enString.data(), 64);
-        myAuthEn[64] = '\0';
-
-        ret = generate_en_encrypt(
-            myAuthEn,
-            reinterpret_cast<unsigned char*>(m_activeRandom),
-            myEn, sizeof(myEn), &outEnLen);
-        if (ret != 0)
-        {
-            LOGE("generate en failed! ret %d!\n", ret);
-            status = GEV_STATUS_REDLINE_API_FAILED;
+            LOGE("read socket error\n");
         }
     }
 
-    char devEn[8 + 1] = {0};
-    if (outEnLen >= 8)
-    {
-        std::memcpy(devEn, myEn + outEnLen - 8, 8);
-        std::memcpy(stAck.devEn.data(), devEn, 8);
-    }
-
-    LOGE("dev en %s, login ack en %s!\n", devEn, myEn);
-
-    RL_WriteLoginAck(ack, stAck, size);
-
-    RedlineUtils::getCurrentTime(&now);
-    LOGE("after proc cost %dms!\n", RedlineUtils::calcTimeDiff(now, start));
-
-    RL_GvcpFillAckHeader(&ack->header, status,
-                         GVCP_COMMAND_LOGIN_ACK, *size, pkt_id);
-    return REDL_OK;
+    return NULL;
 }
 
-要点：
-	•	不再遍历 0~7，只依赖上一步 Interchange 设置好的 m_curUserIndex；
-	•	用 m_stSolid.e1[m_curUserIndex] + m_activeRandom 算 myEn 和客户端报文的 enString 比较；
-	•	不改变你原来的锁定逻辑、端口协商和 cookie 逻辑，只是按用户索引来用 e1。
 
 ⸻
 
-如果你愿意，下一步你可以把 RL_InterchangeCmdView / RL_LoginCmdView 的真实定义丢过来，我可以把里面 .userName.data()、.enString.data() 等位置帮你对齐到完全一致的字段名，避免自己替换时出小错。
+4. SC 通道线程（sc_gvcp_thread）类似写法
+
+SC 通道线程 sc_gvcp_thread 也一样，只是换成 REDLINE_AUTH_CH_SC 和 SC_GVCP_PORT：
+
+static void *sc_gvcp_thread(void *arg)
+{
+    // ... 准备 socket 绑定 3966 端口，准备循环
+
+    // 在 recvfrom() 成功后：
+    if (rx_len > 0)
+    {
+        if (!redline_allow_gvcp_access(REDLINE_AUTH_CH_SC))
+        {
+            // 理论上 SC 通道在你的规则下始终允许访问，
+            // 但保留这行，可以应对未来扩展策略。
+            continue;
+        }
+
+        gvcp_udp_handler((uchar *)gvcp_net.recv_buf,
+                         SC_GVCP_PORT,
+                         (ip_addr_t)gvcp->host_addr.sin_addr.s_addr,
+                         gvcp->host_addr.sin_port,
+                         rx_len);
+    }
+}
+
+
+⸻
+
+5. 小结（对应需求点）
+	•	未激活状态：
+redline_is_device_activated()==0 → redline_allow_gvcp_access() 直接返回 1，两通道都能激活。
+	•	SC 激活后默认关闭 ID 通路：
+	•	bActiveSts == 1 + bAuthChannel 有 REDLINE_AUTH_CH_SC；
+	•	IDChannelEnable == 0；
+	•	ID 通道线程 redline_allow_gvcp_access(REDLINE_AUTH_CH_ID) 返回 0，直接丢包。
+	•	ID 激活后不关闭 SC 通道：
+	•	SC 通道 redline_allow_gvcp_access(REDLINE_AUTH_CH_SC) 始终返回 1。
+	•	IDChannelEnable 为 1 的例外：
+	•	即使 SC 已激活，只要 id_en == 1，ID 通道逻辑会走到“允许访问”的分支。
+
+如果你愿意，我可以再帮你把激活流程里的 bAuthChannel 设置逻辑（HandleActive / HandleLogin 里的修改）也补一份出来，这样“谁是通过哪个通路激活的”在固化结构体里就完整串起来了。
