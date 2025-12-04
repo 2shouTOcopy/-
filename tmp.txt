@@ -1,124 +1,259 @@
-好的，针对 ARM Cortex-A9 + uClibc 环境，我们编写一个最小化的 Demo 来验证 _Unwind_Backtrace。
-这个 Demo 会模拟几层函数调用，并在最内层触发堆栈回溯，打印出程序计数器（PC）地址。
-1. 代码实现 (unwind_test.c)
-#include <stdio.h>
-#include <stdlib.h>
-#include <unwind.h> // GCC 内建头文件
-#include <stdint.h>
+那我直接按“PPT 页”的形式给你写，你可以几乎原样拷过去改下字号 / 排版就能用。
 
-#define MAX_DEPTH 20
+⸻
 
-// 传递给回调的上下文结构
-struct trace_arg {
-    void **buffer;
-    int current_idx;
-    int max_depth;
-};
+第 1 页：密码学组件总览（这套鉴权里用了啥，各自干嘛）
 
-// Unwind 回调函数
-// 每一层堆栈帧都会进入此函数
-static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context *context, void *arg) {
-    struct trace_arg *tracing = (struct trace_arg *)arg;
+标题： 鉴权方案用到的密码学组件概览
 
-    // 获取当前帧的 IP (Instruction Pointer / PC)
-    // 注意：这里的 IP 通常是函数的返回地址
-    uintptr_t ip = _Unwind_GetIP(context);
+要点：
+	•	RSA3072（非对称加密）
+	•	用途：激活时，用客户端公钥加密随机串 A
+	•	解决问题：在还没有共享密钥之前，安全协商出一串随机密钥 A
+	•	特点：客户端独占私钥，只有客户端能解开 A
+	•	AES128-CBC（对称加密）
+	•	用途：
+	•	激活时加密“用户设置的密码”（密文 C）
+	•	密码修改 / 重置时加密“新密码 + 随机串”
+	•	解决问题：在**已经有共享密钥（随机串 A 或派生密钥）**的前提下，安全传输明文密码
+	•	SHA256（摘要算法）
+	•	用途：
+	•	生成密码指纹：E1 = f(salt, password)
+	•	登录 / RESTORE / FORCEIP / 升级等流程里的 En = f(A, E1)
+	•	密码重置中生成重置口令、派生 AES 密钥
+	•	解决问题：不可逆存储 / 验证密码，以及“挑战-应答”式口令证明（防重放）
+	•	盐值 salt（随机 16 字节）
+	•	用途：和密码一起参与 E1 计算
+	•	解决问题：
+	•	相同密码在不同设备/用户下得到不同 E1
+	•	分区泄露后，提高离线撞库的门槛（防止直接彩虹表秒杀）
 
-    if (ip != 0) {
-        if (tracing->current_idx < tracing->max_depth) {
-            tracing->buffer[tracing->current_idx++] = (void *)ip;
-            return _URC_NO_REASON; // 继续回溯上一层
-        } else {
-            return _URC_END_OF_STACK; // 数组满了，停止
-        }
-    }
-    return _URC_NO_REASON;
-}
+可以放一句话总结：
 
-// 封装后的获取堆栈函数
-int capture_backtrace(void **buffer, int max_depth) {
-    struct trace_arg arg;
-    arg.buffer = buffer;
-    arg.current_idx = 0;
-    arg.max_depth = max_depth;
+激活前：RSA + AES 先把“秘密”安全建立起来
+激活后：salt + E1 + En 负责长期安全存储和每次登录的挑战-应答验证
 
-    _Unwind_Backtrace(unwind_callback, &arg);
+⸻
 
-    return arg.current_idx;
-}
+第 2 页：激活流程——为什么是“RSA + AES + SHA + salt”
 
-// --- 测试用的嵌套函数 ---
+标题：激活流程设计：从无密到有密
 
-void print_stack_trace() {
-    void *buffer[MAX_DEPTH];
-    int depth = capture_backtrace(buffer, MAX_DEPTH);
+要点：
+	•	阶段一：用 RSA 搭建安全通道
+	1.	客户端生成 RSA3072 公私钥 → 公钥 base64 发给设备（INTERCHANGE_CMD，Mode=1）
+	2.	设备：
+	•	base64 解码拿到公钥
+	•	生成随机串 A
+	•	用公钥对 A 做 RSA 加密 → 得到加密串 B → base64 → 放到 INTERCHANGE_ACK.Random string
+	3.	客户端用私钥解密 B，拿回随机串 A
 
-    printf("Stack trace (depth %d):\n", depth);
-    printf("------------------------\n");
-    for (int i = 0; i < depth; i++) {
-        // 打印原始地址
-        printf("[%02d] Address: %p\n", i, buffer[i]);
-    }
-    printf("------------------------\n");
-    printf("Use addr2line to verify: addr2line -e unwind_test -f <Address>\n");
-}
+目的：只让“真正握有私钥的客户端”知道 A，建立起一个共享密钥 A。
 
-void func_c() {
-    printf("Inside func_c, capturing backtrace...\n");
-    print_stack_trace();
-}
+	•	阶段二：用 AES 传输激活密码
+	1.	客户端用 A 作为 AES128-CBC 的 key & iv，加密“用户密码” → C
+	2.	C base64 后放入 ACTIVE_CMD.Encrypted string（24B）
+	3.	设备收到 ACTIVE_CMD：
+	•	先 base64 解码 C
+	•	用 A 解 AES128-CBC，得到明文密码
 
-void func_b() {
-    func_c();
-}
+目的：让设备在不暴露密码给网络的前提下，拿到明文做复杂合法性校验（长度 >= 8，至少 2 类字符等）。
 
-void func_a() {
-    func_b();
-}
+	•	阶段三：用 SHA256 + salt 做长期存储
+	1.	设备生成随机 salt[16]
+	2.	计算 E1（文档里写“利用 sha256 进行摘要计算的方法”，可理解为：
+E1 = SHA256(salt || password)
+	3.	把 salt + E1 写入固化分区（REDLINE_SOLIDIFY_PARAM_T）
+	4.	激活成功后，只保留 salt + E1，不再持久化明文密码
 
-int main() {
-    printf("Starting unwind test on ARM uClibc...\n");
-    func_a();
-    return 0;
-}
+目的：本地不存明文，只存密码指纹，防止分区被拷走后直接泄露密码。
 
-2. 编译指令
-请务必加上 -funwind-tables 选项，这对于 ARM 平台通过 _Unwind_Backtrace 获取堆栈至关重要（它会强制生成 .ARM.extab 和 .ARM.exidx 段）。同时也建议加上 -g 用于后续验证符号。
-# 你的交叉编译工具链
-CC=arm-ca9-linux-uclibcgnueabihf-gcc
+可以在页底加一个小时序图（伪码）：
 
-# 编译
-$CC -g -funwind-tables -o unwind_test unwind_test.c
+Client:  RSA keypair -> PubKey(Base64) --------> Device
+Device:  A = random()
+         B = RSA(PubKey, A)
+         INTERCHANGE_ACK(Random string = Base64(B)) ---> Client
+Client:  A = RSA_Decrypt(PrivKey, B)
+         C = AES128_CBC_Enc(key=A, iv=A, pwd)
+         ACTIVE_CMD(Encrypted string = Base64(C)) ----> Device
+Device:  pwd = AES128_CBC_Dec(key=A, iv=A, C)
+         salt = random16()
+         E1 = SHA256(salt || pwd)
+         保存 salt + E1，激活完成
 
-3. 如何在板子上验证
- * 运行程序：
-   将 unwind_test 拷贝到板子上运行：
-   ./unwind_test
 
- * 查看输出：
-   你会看到类似这样的输出：
-   Starting unwind test on ARM uClibc...
-Inside func_c, capturing backtrace...
-Stack trace (depth 5):
-------------------------
-[00] Address: 0x10548  <-- print_stack_trace 内的某处
-[01] Address: 0x1058c  <-- func_c 的返回地址
-[02] Address: 0x105a4  <-- func_b 的返回地址
-[03] Address: 0x105bc  <-- func_a 的返回地址
-[04] Address: 0x105e4  <-- main 的返回地址
-------------------------
+⸻
 
- * 验证准确性 (PC端操作)：
-   在开发机上，使用交叉工具链的 addr2line 来反解这些地址，确认是否对应正确的函数行号。
-   # 替换为你工具链里的 addr2line
-arm-ca9-linux-uclibcgnueabihf-addr2line -e unwind_test -f 0x1058c 0x105a4
+第 3 页：激活后交换码 & 登录——挑战-应答的 En + cookie
 
-   如果输出显示了 func_c 调用 print_stack_trace 的位置，以及 func_b 调用 func_c 的位置，那就说明移植成功了。
-4. 常见问题排查 (Troubleshooting)
- * 只能打出 1 层堆栈？
-   这通常是因为编译时缺少 unwind 信息。请确认 CFLAGS 中包含了 -funwind-tables 或者是 -fasynchronous-unwind-tables。对于 ARM 架构，这比 Frame Pointer 更重要。
- * 地址偏差？
-   _Unwind_GetIP 获取的是返回地址（Return Address）。在 addr2line 时，对应的代码行通常是“调用指令的下一行”。如果你想看精确的调用点，手动减去 4 字节（ARM指令集）通常能定位到 BL 指令那一行。
- * 链接错误？
-   如果提示找不到符号，尝试显式链接 libgcc_s：-lgcc_s。但在 uClibc 工具链中，通常 gcc 会自动处理好。
-你可以先跑一下这个 demo，如果能出结果，就可以放心地把这套逻辑集成到你的 memleak-finder.c 里替换掉原来的 glibc backtrace() 了。
+标题：激活后的交换码 & 登录：En + cookie 机制
+
+要点：
+	•	激活后 INTERCHANGE（Mode=2）里的 Random string / salt 设计
+	1.	客户端在 INTERCHANGE_CMD 里带上用户名，发给设备
+	2.	设备：
+	•	根据用户名读取对应 salt（激活时生成）
+	•	生成随机串 A（本次会话的 challenge）
+	•	在 INTERCHANGE_ACK 中返回：
+	•	Salt[16]（明文）
+	•	Random string = A（明文 16B）
+	•	Random E1（设备用 A+salt 对 E1 做一次计算取 8 字节摘要，用于客户端做一致性校验）
+
+这里 Random string 改成明文是正常的，因为真正的秘密已经是 E1 + 密码本身了，A 只做一次性挑战。
+
+	•	登录 / RESTORE / FORCEIP / UPGRADE 等操作的通用模板
+典型登录流程（LOGIN）：
+	1.	客户端拿到 salt + A
+	2.	客户端计算本地的 E1 / En（逻辑示意）：
+
+E1 = SHA256(salt || password)       // 激活时算法约定好的 E1
+En = SHA256(A || E1)                // 本次挑战-应答的摘要
+
+
+	3.	客户端在 LOGIN_CMD.En string 里带上 En 发给设备
+	4.	设备端：
+	•	从分区读出存储的 E1
+	•	自己算一遍 En’ = SHA256(A || E1)
+	•	比较 En’ 与 En：
+	•	相等 → 密码正确，登录通过
+	•	不等 → 失败计数 + 可能锁定（Login Fail Times / Remain Login attempts）
+
+这就是典型“挑战-应答”模式：设备永远不需要密码明文，只要比较 En 是否正确。
+
+	•	为什么 En 方案安全？
+	•	攻击者在网络上最多能看到：A、salt、En
+	•	他没有 E1、没有密码，只能暴力猜密码，每猜一次都要跑一遍 SHA256 链路
+	•	每次登录 A 都不一样 → 即使他录包，也只能重放“那次”的 En，不适用于下次登录
+	•	Cookie：随机串 A 的第二身份
+	•	LOGIN_ACK 里有 Cookie[16byte]，文档说明：
+“会话标识（通交换码阶段的随机串），有效期 5–60min”
+	•	实际就是把这次交换码里的 A：
+	•	首先用作 En 的 challenge（防重放）
+	•	登录成功后，重新命名为 cookie，作为本次会话 ID，后续 Write_reg 等操作要携带
+
+小结一句：
+激活后所有敏感操作前，都先来一发“交换码”：拿到 salt + A，用 En 证明“我知道密码”；
+登录成功后，用 A 延续成 cookie，减少反复输密码，但有时间窗口约束。
+
+⸻
+
+第 4 页：密码修改 / 恢复未激活 / FORCEIP / 升级——复用同一个安全模板
+
+标题：多个指令共用的一套鉴权模板
+
+要点：
+	•	共同点：流程模板基本一致
+以密码修改（CHANGEPWD）为例：
+	1.	客户端提示用户输入用户名 + 旧密码 + 新密码
+	2.	客户端先用 INTERCHANGE_CMD（Mode=2）拿到 salt + A
+	3.	客户端计算：
+	•	En1 = 基于 A + 旧密码的摘要（证明旧密码正确）
+	•	B = AES128_CBC_Enc(A, A, 新密码) → Base64(B)
+	4.	CHANGEPWD_CMD 里同时带上：
+	•	En1 string（64B）
+	•	Encrypted string（24B，新密码密文）
+	5.	设备端：
+	•	用本地 E1 + A 计算 En1’，对比 En1（旧密码验证）
+	•	解 AES 得到新密码明文，做复杂合法性校验
+	•	生成新 salt，对新密码做 E1 保存
+这样就同时满足：
+	•	旧密码验证（En1）：防止别人直接改成新密码
+	•	新密码安全传输（AES）：避免网络上出现明文新密码
+	•	恢复未激活（RESTORE）同样模板，但目标是“清空密码”
+	•	先 INTERCHANGE 拿到 salt + A
+	•	客户端根据密码算 En
+	•	设备读取本地 E1 再算 En’，比对通过后：
+	•	清空用户名 / 密码 / 盐值
+	•	置为未激活状态
+	•	同步清除 u-boot / kernel 登录密码
+	•	FORCEIP / 升级（UPGRADE）只是在“通过 En 验证后，执行不同业务”
+	•	FORCEIP：鉴权成功后才允许修改 IP（包含广播鉴权场景）
+	•	UPGRADE：
+	•	在 UPGRADE_CMD 里带上端口号 + En
+	•	鉴权通过后，进入原有升级流程（8000 端口），外加升级包解密 / 验签
+
+这几类命令都复用同一个“安全红线模板”：
+先交换码 → salt + A → En 验证用户 → 验证通过后才允许执行敏感操作（改密 / 清零 / 改 IP / 升级）。
+
+⸻
+
+第 5 页：密码重置——引入第三方 OA 的高安全流程
+
+标题：密码重置流程：防滥用的多方参与设计
+
+要点：
+	•	设计目标：
+	•	忘记密码时，提供一个“可控的重置通道”
+	•	防止任何一方（单个用户 / 单台设备）自己绕过重置机制
+	•	要求 OA、设备、客户端三方参与，才可能成功重置
+	•	阶段一：生成设备码（GETDEVINFO）
+	1.	客户端发 GETDEVINFO_CMD
+	2.	设备：
+	•	组合设备码 A（包含 SN、随机数等 TLV）
+	•	用内置公钥[1] 对 A 做 RSA 加密 → encryptedstring
+	•	再封装 TLV + base64，生成供 OA 使用的“设备码文件 C”
+	3.	技术支持导出文件 C，上传到 OA
+
+设备只存公钥[1]，私钥[1] 只在 OA 上，设备自己无法直接算出重置口令。
+
+	•	阶段二：OA 计算重置口令
+	1.	OA 解码文件 C，恢复设备码 A
+	2.	对 A 做 SHA256，取前 8 字节作为“重置口令”（8 位）
+	3.	技术支持拿这个重置口令给用户
+	•	阶段三：客户端 + 设备双向用 SHA256 派生 AES 密钥，安全传新密码
+	1.	客户端：
+	•	用户输入重置口令
+	•	生成随机串 D
+	•	计算 K = 前16字节(SHA256(D + 重置口令))
+	•	用 AES128_CBC(key=K, iv=D) 加密（D + 新密码） → F
+	•	F base64 → G，连同 D 一起发 RESETPWD_CMD（Encrypt string = G，random string = D）
+	2.	设备：
+	•	自己也能算出重置口令（通过内部随机数 + SHA256 策略，文档已有说明）
+	•	用同样的 K’ = 前16字节(SHA256(D + 重置口令))
+	•	解密 G → 得到 D’ + 新密码
+	•	校验 D’ == D，防篡改
+	•	对新密码做 En / E1 计算，写入分区
+
+这里再次同时用到了 SHA256（派生 K、计算重置口令）+ AES（传输新密码明文），并保证只有 OA 有权发放重置口令。
+
+	•	设备码有效期 & 使用次数限制（防止无限期利用旧设备码）：
+	•	重复获取不刷新设备码；
+	•	超过 24 小时未使用 → 设备码失效（根据 uptime 判断，不受校时影响）
+	•	实际触发重置（成功/失败）后，设备码立即失效；
+	•	掉电重启设备码失效。
+
+这相当于把“忘记密码重置”变成一个有审计、有时效、一次性使用的流程，符合安全红线对“敏感操作必须可控、可追踪”的要求。
+
+⸻
+
+第 6 页：安全红线视角的整体总结
+
+标题：从协议设计到安全红线落地
+
+要点（可以做成对照表）：
+	•	禁止明文密码上网 / 落盘
+	•	协议层：
+	•	激活 / 改密 / 重置：密码传输统一走 AES128-CBC（随机串 / K 派生密钥）
+	•	登录 / FORCEIP / 升级：只上传 En，不上传密码
+	•	存储层：
+	•	分区只保存 salt + E1，不保存明文
+	•	禁止重放 / 假登录
+	•	每次交换码都有新的随机串 A
+	•	登录 / 恢复 / FORCEIP / 升级都用 En(A, E1) 做挑战-应答
+	•	Cookie 有失效时间（5–60min），过期必须重新鉴权
+	•	密码操作必须有明确安全边界
+	•	修改密码：必须提供旧密码的 En1
+	•	重置密码：必须有 OA 生成的重置口令 + 设备码 + 有效期约束
+	•	恢复未激活：只能在“激活且未连接”的状态下，通过 En 验证后执行
+	•	所有敏感操作都前置鉴权
+	•	FORCEIP、升级、参数操作（Write/Read reg）都挂在登录 / 交换码鉴权之后
+	•	会话 ID(cookie) 写入寄存器，做二次校验
+
+你最后可以用一句话收尾：
+
+这份 PD-001 不是单纯的“协议变更”，而是把 “不传明文、不存明文、防重放、密码重置可控” 这些安全红线，具体落实到了每一条指令、每一个字段和每一次加解密调用里。
+
+⸻
+
+如果你愿意，下一步我还能帮你把 每一页对应的代码片段（比如结构体 / 关键函数骨架）挑几段出来，做成“注释版代码截图文案”，你贴到 PPT 再截屏展示就行。
