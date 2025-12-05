@@ -1,104 +1,98 @@
-// CIndustRecogModule.cpp
-
-int CIndustRecogModule::BuildAllPublishParamList()
 {
-    // 1. 清空聚合列表
-    memset(&m_stAllPublishParamList, 0, sizeof(m_stAllPublishParamList));
-
-    // 2. 先取静态发布参数
-    DYNAMIC_PUBLISH_PARAM_LIST stStaticList;
-    memset(&stStaticList, 0, sizeof(stStaticList));
-
-    int nErrCode = staticSubPub.GetDynamicPubParam(&stStaticList);
-    if (IMVS_EC_OK != nErrCode)
+  "EItems": [
     {
-        LOGE("staticSubPub.GetDynamicPubParam failed, %d\n", nErrCode);
-        return nErrCode;
-    }
-
-    // 3. 触发动态更新并获取动态数量
-    int nDynamicNum = m_subModuleManager.GetDynamicPublishParamNum();
-    // 注意：GetDynamicPublishParamNum 内部已经日志+失败返回0
-
-    // 4. 合并：静态在前，动态在后
-    const int nStaticNum = stStaticList.nNum;
-
-    // 防止数组越界（假设 pubParamList 固定数组）
-    const int nMax =
-        (int)(sizeof(m_stAllPublishParamList.pubParamList) / sizeof(m_stAllPublishParamList.pubParamList[0]));
-
-    int nWrite = 0;
-
-    // 4.1 拷贝静态
-    for (int i = 0; i < nStaticNum && nWrite < nMax; ++i)
-    {
-        m_stAllPublishParamList.pubParamList[nWrite++] = stStaticList.pubParamList[i];
-    }
-
-    // 4.2 拷贝动态
-    for (int i = 0; i < nDynamicNum && nWrite < nMax; ++i)
-    {
-        DYNAMIC_PUBLISH_PARAM stParam;
-        memset(&stParam, 0, sizeof(stParam));
-
-        int ret = m_subModuleManager.GetDynamicSinglePublishParam(i, &stParam);
-        if (IMVS_EC_OK != ret)
+      "Features": [
         {
-            LOGE("GetDynamicSinglePublishParam failed, idx=%d, ret=%d\n", i, ret);
-            // 动态部分有问题时，这里选择“跳过该项继续”
-            continue;
+          "Name": "PositionX",
+          "Mapping": "FIXTURE_algo_used_init_point_x",
+          "Value": "0",
+          "ValueType": "float"
+        },
+        {
+          "Name": "Count",
+          "Mapping": "NULL",
+          "Value": "0",
+          "ValueType": "int"
         }
+      ],
+      "Name": "Init Points",
+      "Type": "point",
+      "IsDisplay": "true",
+      "ControlType": "SupDispCtrl"
+    },
 
-        m_stAllPublishParamList.pubParamList[nWrite++] = stParam;
-    }
-
-    m_stAllPublishParamList.nNum = nWrite;
-
-    LOGI("BuildAllPublishParamList ok, static=%d, dynamic=%d, total=%d\n",
-         nStaticNum, nDynamicNum, m_stAllPublishParamList.nNum);
-
-    return IMVS_EC_OK;
-}
-
-int CIndustRecogModule::GetDynamicPublishParamNum()
-{
-    int nErrCode = BuildAllPublishParamList();
-    if (IMVS_EC_OK != nErrCode)
     {
-        LOGE("BuildAllPublishParamList failed, %d\n", nErrCode);
-        return 0;
-    }
-
-    LOGI("GetDynamicPublishParamNum (static+dynamic) is %d\r\n", m_stAllPublishParamList.nNum);
-    return m_stAllPublishParamList.nNum;
-}
-
-int CIndustRecogModule::GetDynamicSinglePublishParam(IN int nParamIdx,
-                                                     OUT DYNAMIC_PUBLISH_PARAM* pstPublishParam)
-{
-    if (pstPublishParam == NULL)
+      "SubModuleName":"charhorizontal",
+      "Type":"SubModuleDisplayJson",
+      "SubModuleDispJson": [
+      {
+          "Features": [
+            {
+              "Name": "CenterX",
+              "Mapping": "BOX_charhori_det_box_cx",
+              "Value": "0",
+              "ValueType": "float"
+            },
+            {
+              "Name": "Count",
+              "Mapping": "SINGLE_charhori_det_box_num",
+              "Value": "0",
+              "ValueType": "int"
+            }
+          ],
+          "Name": "Detect Rect",
+          "Type": "rect",
+          "IsDisplay": "true",
+          "ControlType": "SupDispCtrl"
+        },
+        {
+          "Features": [
+            {
+              "Name": "CenterX",
+              "Mapping": "BOX_charhori_flaw_box_cx",
+              "Value": "0",
+              "ValueType": "float"
+            },
+            {
+              "Name": "Count",
+              "Mapping": "SINGLE_charhori_total_flaw_box_num",
+              "Value": "0",
+              "ValueType": "int"
+            }
+          ],
+          "Name": "Flaw Recog Rect",
+          "Type": "rect",
+          "IsDisplay": "true",
+          "ControlType": "SupDispCtrl"
+        }
+      ]
+    },
     {
-        return IMVS_EC_PARAM;
+      "SubModuleName":"StringcomparePmShowEnable",
+      "Type":"SubModuleDisplayJson",
+      "SubModuleDispJson": [
+      {
+          "Features": [
+            {
+              "Name": "PositionX",
+              "Mapping": "SINGLE_str_com_str_out_cn_string_x",
+              "Value": "0",
+              "ValueType": "float"
+            },
+            {
+              "Name": "Status",
+              "Mapping": "SINGLE_param_status",
+              "Value": "1",
+              "ValueType": "int"
+            }
+          ],
+          "Name": "Algo Result Text",
+          "Type": "text",
+          "IsDisplay": "true",
+          "IsAlignDisplay": "true",
+          "ControlType": "SupDispCtrl"
+        }
+      ]
     }
-
-    int nErrCode = BuildAllPublishParamList();
-    if (IMVS_EC_OK != nErrCode)
-    {
-        LOGE("BuildAllPublishParamList failed, %d\n", nErrCode);
-        return nErrCode;
-    }
-
-    if (nParamIdx < 0 || nParamIdx >= m_stAllPublishParamList.nNum)
-    {
-        return IMVS_EC_PARAM_NOT_VALID;
-    }
-
-    memcpy(pstPublishParam, &m_stAllPublishParamList.pubParamList[nParamIdx],
-           sizeof(DYNAMIC_PUBLISH_PARAM));
-
-    LOGI("nParamIdx %d: pub(param_name[%s],type:%s))\r\n", nParamIdx,
-         m_stAllPublishParamList.pubParamList[nParamIdx].szName,
-         m_stAllPublishParamList.pubParamList[nParamIdx].szType);
-
-    return IMVS_EC_OK;
+  ]
 }
