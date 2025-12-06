@@ -1,282 +1,279 @@
 不需要单独创建新文件。
-这次改动只需要修改你这个 dispmanage.cpp 里的 UpdateJson（可以在同文件顶部加几个静态 helper），就能优雅同时支持：
-	•	EItems 普通节点：Name + IsDisplay
-	•	EItems 子模块容器节点：Type == SubModuleDisplayJson
-	•	容器自身可选 IsDisplay
-	•	子列表 SubModuleDispJson[] 中的子项有 Name + IsDisplay
+你可以把 UpdateJson 拆成**3 个“意图很清晰的静态函数”**放在同一个 dispmanage.cpp 里，这样长度会明显收敛，而且后续扩展也更舒服。
 
-你现在报错的核心点有两个：
-	1.	你的更新逻辑把 Name 当成 EItems 的必填字段
-但 SubModuleDisplayJson 容器项压根没有 Name。
-	2.	你在匹配时 先读 dstIsDisplayNode->valuestring 再判空
-这是潜在崩溃点。
+下面我给你一个可直接替换的重构版本（逻辑保持我上次给你的“按 default 重建 + 保留 work 的 IsDisplay（含子模块/子项）”）。
 
 ⸻
 
-目标语义（我按你“更新默认 -> 保留用户开关”的意图来实现）
-
-当 defaultJson 更新覆盖 workJson 时：
-	•	普通项：若 work 中同名项存在 IsDisplay，保留它。
-	•	子模块项：
-	•	若 work 的子模块容器有 IsDisplay，保留它。
-	•	若 work 的子模块子项有 IsDisplay，保留它。
-	•	其余字段以 default 为准。
-	•	最终 work 的 EItems 结构以 default 的 EItems 为“主清单”（新增/删除都跟随 default）。
+建议的拆分结构
+	•	BuildDisplayMapFromDst(...)
+从 workJson 的 EItems 收集所有需要保留的 IsDisplay
+	•	DuplicateSrcItemWithDisplayOverride(...)
+复制 default 的单个 EItem，并按 map 覆盖 IsDisplay
+	•	RebuildEItemsFromSrc(...)
+按 default 重建完整 EItems
 
 ⸻
 
-直接给你可合入的高质量实现
+你只需要把这些 helper + UpdateJson 放回同一个 cpp
 
-把下面代码替换你的 UpdateJson，并在 dispmanage.cpp 顶部（#include 后）加入这些 helper。
-
-1) 在 cpp 顶部新增 helper
+1) helper（放 includes 后）
 
 #include <unordered_map>
 
-// 用于区分普通项与子模块容器/子项的 key
+// ---------- key helpers ----------
 static std::string MakeNormalKey(const char* name)
 {
-    return name ? std::string("N:") + name : std::string();
+	return name ? std::string("N:") + name : std::string();
 }
 
 static std::string MakeSubModuleKey(const char* subName)
 {
-    return subName ? std::string("SM:") + subName : std::string();
+	return subName ? std::string("SM:") + subName : std::string();
 }
 
 static std::string MakeSubModuleChildKey(const char* subName, const char* childName)
 {
-    if (!subName || !childName) return std::string();
-    return std::string("SMC:") + subName + ":" + childName;
+	if (!subName || !childName) return std::string();
+	return std::string("SMC:") + subName + ":" + childName;
 }
 
+// ---------- safe getters ----------
 static const char* GetStringSafe(cJSON* obj, const char* key)
 {
-    if (!obj || !key) return nullptr;
-    cJSON* node = cJSON_GetObjectItem(obj, key);
-    if (!node || !cJSON_IsString(node) || !node->valuestring) return nullptr;
-    return node->valuestring;
+	if (!obj || !key) return nullptr;
+	cJSON* node = cJSON_GetObjectItem(obj, key);
+	if (!node || !cJSON_IsString(node) || !node->valuestring) return nullptr;
+	return node->valuestring;
 }
 
-// 仅当存在 IsDisplay 且为 string 时才返回
 static const char* GetIsDisplayStr(cJSON* obj)
 {
-    cJSON* node = cJSON_GetObjectItem(obj, "IsDisplay");
-    if (!node || !cJSON_IsString(node) || !node->valuestring)
-        return nullptr;
-    return node->valuestring;
+	cJSON* node = cJSON_GetObjectItem(obj, "IsDisplay");
+	if (!node || !cJSON_IsString(node) || !node->valuestring)
+		return nullptr;
+	return node->valuestring;
 }
 
-static void OverrideIsDisplayIfHas(cJSON* obj, const char* isDisplayStr)
+static void OverrideIsDisplay(cJSON* obj, const char* isDisplayStr)
 {
-    if (!obj || !isDisplayStr) return;
-    cJSON_DeleteItemFromObject(obj, "IsDisplay");
-    cJSON_AddStringToObject(obj, "IsDisplay", isDisplayStr);
+	if (!obj || !isDisplayStr) return;
+	cJSON_DeleteItemFromObject(obj, "IsDisplay");
+	cJSON_AddStringToObject(obj, "IsDisplay", isDisplayStr);
 }
 
 static bool IsSubModuleDisplayItem(cJSON* item)
 {
-    const char* type = GetStringSafe(item, "Type");
-    return (type && 0 == std::strncmp(type, "SubModuleDisplayJson", MAX_PARAM_NAME_LEN));
+	const char* type = GetStringSafe(item, "Type");
+	return (type && 0 == std::strncmp(type, "SubModuleDisplayJson", MAX_PARAM_NAME_LEN));
+}
+
+// ---------- 1) build map from dst(work) ----------
+static void BuildDisplayMapFromDst(cJSON* dstEItems,
+								  std::unordered_map<std::string, std::string>& outMap)
+{
+	outMap.clear();
+	if (!dstEItems || !cJSON_IsArray(dstEItems)) return;
+
+	const int n = cJSON_GetArraySize(dstEItems);
+	for (int i = 0; i < n; ++i)
+	{
+		cJSON* dstItem = cJSON_GetArrayItem(dstEItems, i);
+		if (!dstItem) continue;
+
+		if (IsSubModuleDisplayItem(dstItem))
+		{
+			const char* subName = GetStringSafe(dstItem, "SubModuleName");
+			if (!subName) continue;
+
+			// container IsDisplay
+			if (const char* v = GetIsDisplayStr(dstItem))
+			{
+				outMap[MakeSubModuleKey(subName)] = v;
+			}
+
+			// children IsDisplay
+			cJSON* subArr = cJSON_GetObjectItem(dstItem, "SubModuleDispJson");
+			if (subArr && cJSON_IsArray(subArr))
+			{
+				const int m = cJSON_GetArraySize(subArr);
+				for (int k = 0; k < m; ++k)
+				{
+					cJSON* child = cJSON_GetArrayItem(subArr, k);
+					if (!child) continue;
+
+					const char* childName = GetStringSafe(child, "Name");
+					if (!childName) continue;
+
+					if (const char* cv = GetIsDisplayStr(child))
+					{
+						outMap[MakeSubModuleChildKey(subName, childName)] = cv;
+					}
+				}
+			}
+		}
+		else
+		{
+			const char* name = GetStringSafe(dstItem, "Name");
+			if (!name) continue;
+
+			if (const char* v = GetIsDisplayStr(dstItem))
+			{
+				outMap[MakeNormalKey(name)] = v;
+			}
+		}
+	}
+}
+
+// ---------- 2) duplicate one src item + apply override ----------
+static cJSON* DuplicateSrcItemWithDisplayOverride(cJSON* srcItem,
+	const std::unordered_map<std::string, std::string>& displayMap)
+{
+	if (!srcItem) return nullptr;
+
+	cJSON* newItem = cJSON_Duplicate(srcItem, 1);
+	if (!newItem) return nullptr;
+
+	if (IsSubModuleDisplayItem(srcItem))
+	{
+		const char* subName = GetStringSafe(srcItem, "SubModuleName");
+		if (subName)
+		{
+			// override container
+			auto itParent = displayMap.find(MakeSubModuleKey(subName));
+			if (itParent != displayMap.end())
+			{
+				OverrideIsDisplay(newItem, itParent->second.c_str());
+			}
+
+			// override children
+			cJSON* newSubArr = cJSON_GetObjectItem(newItem, "SubModuleDispJson");
+			if (newSubArr && cJSON_IsArray(newSubArr))
+			{
+				const int m = cJSON_GetArraySize(newSubArr);
+				for (int k = 0; k < m; ++k)
+				{
+					cJSON* newChild = cJSON_GetArrayItem(newSubArr, k);
+					if (!newChild) continue;
+
+					const char* childName = GetStringSafe(newChild, "Name");
+					if (!childName) continue;
+
+					auto itChild = displayMap.find(MakeSubModuleChildKey(subName, childName));
+					if (itChild != displayMap.end())
+					{
+						OverrideIsDisplay(newChild, itChild->second.c_str());
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		const char* name = GetStringSafe(srcItem, "Name");
+		if (name)
+		{
+			auto it = displayMap.find(MakeNormalKey(name));
+			if (it != displayMap.end())
+			{
+				OverrideIsDisplay(newItem, it->second.c_str());
+			}
+		}
+	}
+
+	return newItem;
+}
+
+// ---------- 3) rebuild EItems from src(default) ----------
+static cJSON* RebuildEItemsFromSrc(cJSON* srcEItems,
+	const std::unordered_map<std::string, std::string>& displayMap)
+{
+	if (!srcEItems || !cJSON_IsArray(srcEItems)) return nullptr;
+
+	cJSON* newEItems = cJSON_CreateArray();
+	if (!newEItems) return nullptr;
+
+	const int n = cJSON_GetArraySize(srcEItems);
+	for (int i = 0; i < n; ++i)
+	{
+		cJSON* srcItem = cJSON_GetArrayItem(srcEItems, i);
+		if (!srcItem) continue;
+
+		cJSON* newItem = DuplicateSrcItemWithDisplayOverride(srcItem, displayMap);
+		if (!newItem)
+		{
+			cJSON_Delete(newEItems);
+			return nullptr;
+		}
+
+		cJSON_AddItemToArray(newEItems, newItem);
+	}
+
+	return newEItems;
 }
 
 
 ⸻
 
-2) 替换 UpdateJson（完整函数）
+2) 更短、更干净的 UpdateJson
 
 int CDispManage::UpdateJson(const std::string& srcJsonPath, const std::string& dstJsonPath)
 {
-    if (srcJsonPath.empty() || dstJsonPath.empty())
-    {
-        return IMVS_EC_FILE_NOT_FOUND;
-    }
+	if (srcJsonPath.empty() || dstJsonPath.empty())
+	{
+		return IMVS_EC_FILE_NOT_FOUND;
+	}
 
-    std::unique_ptr<cJSON, std::function<void(cJSON*)>> srcJsonRoot(
-        read_desc_js(srcJsonPath.c_str()),
-        [](cJSON* ptr) { if (ptr) cJSON_Delete(ptr); }
-    );
+	std::unique_ptr<cJSON, std::function<void(cJSON*)>> srcJsonRoot(
+		read_desc_js(srcJsonPath.c_str()),
+		[](cJSON* ptr) { if (ptr) cJSON_Delete(ptr); }
+	);
 
-    std::unique_ptr<cJSON, std::function<void(cJSON*)>> dstJsonRoot(
-        read_desc_js(dstJsonPath.c_str()),
-        [](cJSON* ptr) { if (ptr) cJSON_Delete(ptr); }
-    );
+	std::unique_ptr<cJSON, std::function<void(cJSON*)>> dstJsonRoot(
+		read_desc_js(dstJsonPath.c_str()),
+		[](cJSON* ptr) { if (ptr) cJSON_Delete(ptr); }
+	);
 
-    if (srcJsonRoot == nullptr || dstJsonRoot == nullptr)
-    {
-        return IMVS_EC_OUTOFMEMORY;
-    }
+	if (srcJsonRoot == nullptr || dstJsonRoot == nullptr)
+	{
+		return IMVS_EC_OUTOFMEMORY;
+	}
 
-    cJSON* srcParamNode = cJSON_GetObjectItem(srcJsonRoot.get(), "EItems");
-    cJSON* dstParamNode = cJSON_GetObjectItem(dstJsonRoot.get(), "EItems");
-    if (!srcParamNode || !cJSON_IsArray(srcParamNode) ||
-        !dstParamNode || !cJSON_IsArray(dstParamNode))
-    {
-        return IMVS_EC_JSON_NODE_NOEXIST;
-    }
+	cJSON* srcEItems = cJSON_GetObjectItem(srcJsonRoot.get(), "EItems");
+	cJSON* dstEItems = cJSON_GetObjectItem(dstJsonRoot.get(), "EItems");
+	if (!srcEItems || !cJSON_IsArray(srcEItems) ||
+		!dstEItems || !cJSON_IsArray(dstEItems))
+	{
+		return IMVS_EC_JSON_NODE_NOEXIST;
+	}
 
-    // ------------------------------------------------------------
-    // 1) 先从 dst(work) 收集所有可保留的 IsDisplay 状态
-    // ------------------------------------------------------------
-    std::unordered_map<std::string, std::string> dstDisplayMap;
+	// 1) collect IsDisplay from dst(work)
+	std::unordered_map<std::string, std::string> displayMap;
+	BuildDisplayMapFromDst(dstEItems, displayMap);
 
-    const int dstParamSize = cJSON_GetArraySize(dstParamNode);
-    for (int i = 0; i < dstParamSize; ++i)
-    {
-        cJSON* dstItem = cJSON_GetArrayItem(dstParamNode, i);
-        if (!dstItem) continue;
+	// 2) rebuild new EItems based on src(default) + override display
+	cJSON* newEItems = RebuildEItemsFromSrc(srcEItems, displayMap);
+	if (!newEItems)
+	{
+		return IMVS_EC_OUTOFMEMORY;
+	}
 
-        if (IsSubModuleDisplayItem(dstItem))
-        {
-            const char* subName = GetStringSafe(dstItem, "SubModuleName");
-            if (subName)
-            {
-                // 容器层 IsDisplay
-                if (const char* v = GetIsDisplayStr(dstItem))
-                {
-                    dstDisplayMap[MakeSubModuleKey(subName)] = v;
-                }
+	// 3) replace
+	cJSON_DeleteItemFromObject(dstJsonRoot.get(), "EItems");
+	cJSON_AddItemToObject(dstJsonRoot.get(), "EItems", newEItems);
 
-                // 子项层 IsDisplay
-                cJSON* subArr = cJSON_GetObjectItem(dstItem, "SubModuleDispJson");
-                if (subArr && cJSON_IsArray(subArr))
-                {
-                    const int subSize = cJSON_GetArraySize(subArr);
-                    for (int k = 0; k < subSize; ++k)
-                    {
-                        cJSON* child = cJSON_GetArrayItem(subArr, k);
-                        if (!child) continue;
-
-                        const char* childName = GetStringSafe(child, "Name");
-                        if (!childName) continue;
-
-                        if (const char* cv = GetIsDisplayStr(child))
-                        {
-                            dstDisplayMap[MakeSubModuleChildKey(subName, childName)] = cv;
-                        }
-                    }
-                }
-            }
-        }
-        else
-        {
-            // 普通 EItem: 用 Name
-            const char* name = GetStringSafe(dstItem, "Name");
-            if (!name) continue;
-
-            if (const char* v = GetIsDisplayStr(dstItem))
-            {
-                dstDisplayMap[MakeNormalKey(name)] = v;
-            }
-        }
-    }
-
-    // ------------------------------------------------------------
-    // 2) 按 src(default) 重建新的 EItems
-    //    并用 dstDisplayMap 覆盖 IsDisplay
-    // ------------------------------------------------------------
-    cJSON* newEItems = cJSON_CreateArray();
-    if (!newEItems)
-    {
-        return IMVS_EC_OUTOFMEMORY;
-    }
-
-    const int srcParamSize = cJSON_GetArraySize(srcParamNode);
-    for (int i = 0; i < srcParamSize; ++i)
-    {
-        cJSON* srcItem = cJSON_GetArrayItem(srcParamNode, i);
-        if (!srcItem) continue;
-
-        cJSON* newItem = cJSON_Duplicate(srcItem, 1);
-        if (!newItem)
-        {
-            cJSON_Delete(newEItems);
-            return IMVS_EC_OUTOFMEMORY;
-        }
-
-        if (IsSubModuleDisplayItem(srcItem))
-        {
-            const char* subName = GetStringSafe(srcItem, "SubModuleName");
-            if (subName)
-            {
-                // 2.1 容器层 override（若 dst 中存在）
-                auto itParent = dstDisplayMap.find(MakeSubModuleKey(subName));
-                if (itParent != dstDisplayMap.end())
-                {
-                    OverrideIsDisplayIfHas(newItem, itParent->second.c_str());
-                }
-
-                // 2.2 子项层 override（若 dst 中存在）
-                cJSON* newSubArr = cJSON_GetObjectItem(newItem, "SubModuleDispJson");
-                if (newSubArr && cJSON_IsArray(newSubArr))
-                {
-                    const int subSize = cJSON_GetArraySize(newSubArr);
-                    for (int k = 0; k < subSize; ++k)
-                    {
-                        cJSON* newChild = cJSON_GetArrayItem(newSubArr, k);
-                        if (!newChild) continue;
-
-                        const char* childName = GetStringSafe(newChild, "Name");
-                        if (!childName) continue;
-
-                        auto itChild = dstDisplayMap.find(MakeSubModuleChildKey(subName, childName));
-                        if (itChild != dstDisplayMap.end())
-                        {
-                            OverrideIsDisplayIfHas(newChild, itChild->second.c_str());
-                        }
-                    }
-                }
-            }
-        }
-        else
-        {
-            const char* name = GetStringSafe(srcItem, "Name");
-            if (name)
-            {
-                auto it = dstDisplayMap.find(MakeNormalKey(name));
-                if (it != dstDisplayMap.end())
-                {
-                    OverrideIsDisplayIfHas(newItem, it->second.c_str());
-                }
-            }
-        }
-
-        cJSON_AddItemToArray(newEItems, newItem);
-    }
-
-    // ------------------------------------------------------------
-    // 3) 用 newEItems 替换 dst 根里的 EItems
-    // ------------------------------------------------------------
-    cJSON_DeleteItemFromObject(dstJsonRoot.get(), "EItems");
-    cJSON_AddItemToObject(dstJsonRoot.get(), "EItems", newEItems);
-
-    // ------------------------------------------------------------
-    // 4) 保存
-    // ------------------------------------------------------------
-    return save_json_into_file(dstJsonPath.c_str(), dstJsonRoot.get());
+	return save_json_into_file(dstJsonPath.c_str(), dstJsonRoot.get());
 }
 
 
 ⸻
 
-这版改动能解决你现在的所有痛点
-	•	不再假设每个 EItem 必有 Name
-=> SubModuleDisplayJson 容器不会再触发 IMVS_EC_JSON_NODE_NOEXIST。
-	•	不会再出现 “先解引用 valuestring 后判空” 的崩溃风险。
-	•	保留逻辑更完整：
-容器层 IsDisplay 和 子项层 IsDisplay 都能保留。
-	•	更新策略更“干净”：
-直接按 default 重建清单，天然处理新增/删除，避免你原来那套
-DeleteItemFromArray + AddItemToArray 的索引错乱和复杂分支。
+这样拆的好处
+	•	UpdateJson 会变得非常短，主流程一眼能读懂。
+	•	子模块/普通项的复杂分支都封装到了 DuplicateSrcItemWithDisplayOverride。
+	•	BuildDisplayMapFromDst 专注收集“用户开关状态”，职责清晰。
+	•	未来你要新增第三种层级/新字段策略，也不需要动主函数结构。
 
 ⸻
 
-你后续如果还想更进一步
-
-如果将来 IsDisplay 可能变成 bool（不是 string），
-你可以把 GetIsDisplayStr 改成“兼容 bool/string/number 的统一转换为 string”，
-但就你现在的格式，这版已经足够稳。
-
-⸻
-
-如果你愿意，我也可以顺手把你这份 UpdateJson 的日志点补齐（比如打印具体缺失的字段路径），这样以后 JSON 结构再扩展，你能更快定位是哪一层出了问题。
+如果你愿意，我可以再帮你把这套 helper 的命名、日志与错误码策略对齐你们项目习惯（比如你们是否倾向 return IMVS_EC_JSON_NODE_NOEXIST 还是默认跳过并容错）。
