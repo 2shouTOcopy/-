@@ -1,279 +1,143 @@
-不需要单独创建新文件。
-你可以把 UpdateJson 拆成**3 个“意图很清晰的静态函数”**放在同一个 dispmanage.cpp 里，这样长度会明显收敛，而且后续扩展也更舒服。
-
-下面我给你一个可直接替换的重构版本（逻辑保持我上次给你的“按 default 重建 + 保留 work 的 IsDisplay（含子模块/子项）”）。
-
-⸻
-
-建议的拆分结构
-	•	BuildDisplayMapFromDst(...)
-从 workJson 的 EItems 收集所有需要保留的 IsDisplay
-	•	DuplicateSrcItemWithDisplayOverride(...)
-复制 default 的单个 EItem，并按 map 覆盖 IsDisplay
-	•	RebuildEItemsFromSrc(...)
-按 default 重建完整 EItems
-
-⸻
-
-你只需要把这些 helper + UpdateJson 放回同一个 cpp
-
-1) helper（放 includes 后）
-
-#include <unordered_map>
-
-// ---------- key helpers ----------
-static std::string MakeNormalKey(const char* name)
+void TcpsServerManager::TaskWorker()
 {
-	return name ? std::string("N:") + name : std::string();
+    int32_t sockfd = -1;
+    int32_t maxfd  = -1;
+    int32_t len    = 0;
+    fd_set rdSet, wrSet;
+    int32_t result = 0;
+    struct timeval timeout;
+
+    m_taskRun = true;
+
+    while (!m_end)
+    {
+        if (m_reCreate || m_conning || !m_moduleEnable)
+        {
+            usleep(100000);
+            continue;
+        }
+
+        if (m_taskLoopCallback)
+        {
+            m_taskLoopCallback();
+        }
+
+        timeout.tv_sec  = 0;
+        timeout.tv_usec = MSG_RECV_SELECT_TIME * 1000;
+
+        maxfd = -1;
+        FD_ZERO(&rdSet);
+        FD_ZERO(&wrSet);
+
+        // 取出一条广播消息（如果你希望一次发完队列，这里可以改成 while 出队）
+        TcpsMessage msg = {0};
+        {
+            std::lock_guard<std::mutex> lk(m_sendQueueMtx);
+            if (!m_sendQueue.empty())
+            {
+                msg = m_sendQueue.front();
+                m_sendQueue.pop();
+            }
+        }
+
+        // ✅ 遍历“所有槽位”，不要在 for 条件里用 m_conns[i]
+        const size_t n = m_conns.size(); // 建议 m_conns 预先 resize(MAX_CLIENT_NUM)
+        for (size_t idx = 0; idx < n; ++idx)
+        {
+            if (!m_conns[idx])
+                continue;
+
+            LOGE("111:%zu\n", idx);
+
+            sockfd = m_conns[idx]->GetSockFd();
+            if (sockfd < 0)
+                continue;
+
+            if (msg.len > 0)
+            {
+                m_conns[idx]->InsertSendMsg(msg);
+            }
+
+            if (sockfd > maxfd)
+                maxfd = sockfd;
+
+            FD_SET(sockfd, &rdSet);
+
+            if (!m_conns[idx]->IsSendQueueEmpty())
+            {
+                FD_SET(sockfd, &wrSet);
+            }
+        }
+
+        if (maxfd < 0)
+        {
+            usleep(MSG_RECV_SELECT_TIME * 1000);
+            continue;
+        }
+
+        result = select(maxfd + 1, &rdSet, &wrSet, nullptr, &timeout);
+
+        if (result > 0)
+        {
+            for (size_t idx = 0; idx < n; ++idx)
+            {
+                if (!m_conns[idx])
+                    continue;
+
+                LOGE("222:%zu\n", idx);
+
+                sockfd = m_conns[idx]->GetSockFd();
+                if (sockfd < 0)
+                    continue;
+
+                if (FD_ISSET(sockfd, &rdSet))
+                {
+                    // 如果 Recv 可能阻塞，这里会“卡住”
+                    len = m_conns[idx]->Recv();
+                    if (len <= 0)
+                    {
+                        LOGE("tcp client recv ret %d, [%zu], sockfd=%d\r\n", len, idx, sockfd);
+                        m_conns[idx]->Close();
+                        m_conns[idx].reset();
+                        continue;
+                    }
+                }
+
+                if (FD_ISSET(sockfd, &wrSet))
+                {
+                    LOGE("333:%zu\n", idx);
+                    len = m_conns[idx]->Send();
+                    if (len < 0 && (errno != EINTR && errno != EAGAIN))
+                    {
+                        LOGE("tcp client send error, [%zu]sockfd=%d\r\n", idx, sockfd);
+                        m_conns[idx]->Close();
+                        m_conns[idx].reset();
+                        continue;
+                    }
+                }
+            }
+        }
+        else if (result < 0)
+        {
+            // select 出错时，也不要用 “&& m_conns[i]” 这种写法
+            for (size_t idx = 0; idx < n; ++idx)
+            {
+                if (!m_conns[idx])
+                    continue;
+
+                LOGE("444:%zu\n", idx);
+
+                sockfd = m_conns[idx]->GetSockFd();
+                if (sockfd >= 0 && FD_ISSET(sockfd, &rdSet))
+                {
+                    LOGE("tcp client select error, [%zu]sockfd=%d\r\n", idx, sockfd);
+                    m_conns[idx]->Close();
+                    m_conns[idx].reset();
+                }
+            }
+        }
+        // result == 0: timeout，啥也不做，下一轮
+    }
+
+    m_taskRun = false;
 }
-
-static std::string MakeSubModuleKey(const char* subName)
-{
-	return subName ? std::string("SM:") + subName : std::string();
-}
-
-static std::string MakeSubModuleChildKey(const char* subName, const char* childName)
-{
-	if (!subName || !childName) return std::string();
-	return std::string("SMC:") + subName + ":" + childName;
-}
-
-// ---------- safe getters ----------
-static const char* GetStringSafe(cJSON* obj, const char* key)
-{
-	if (!obj || !key) return nullptr;
-	cJSON* node = cJSON_GetObjectItem(obj, key);
-	if (!node || !cJSON_IsString(node) || !node->valuestring) return nullptr;
-	return node->valuestring;
-}
-
-static const char* GetIsDisplayStr(cJSON* obj)
-{
-	cJSON* node = cJSON_GetObjectItem(obj, "IsDisplay");
-	if (!node || !cJSON_IsString(node) || !node->valuestring)
-		return nullptr;
-	return node->valuestring;
-}
-
-static void OverrideIsDisplay(cJSON* obj, const char* isDisplayStr)
-{
-	if (!obj || !isDisplayStr) return;
-	cJSON_DeleteItemFromObject(obj, "IsDisplay");
-	cJSON_AddStringToObject(obj, "IsDisplay", isDisplayStr);
-}
-
-static bool IsSubModuleDisplayItem(cJSON* item)
-{
-	const char* type = GetStringSafe(item, "Type");
-	return (type && 0 == std::strncmp(type, "SubModuleDisplayJson", MAX_PARAM_NAME_LEN));
-}
-
-// ---------- 1) build map from dst(work) ----------
-static void BuildDisplayMapFromDst(cJSON* dstEItems,
-								  std::unordered_map<std::string, std::string>& outMap)
-{
-	outMap.clear();
-	if (!dstEItems || !cJSON_IsArray(dstEItems)) return;
-
-	const int n = cJSON_GetArraySize(dstEItems);
-	for (int i = 0; i < n; ++i)
-	{
-		cJSON* dstItem = cJSON_GetArrayItem(dstEItems, i);
-		if (!dstItem) continue;
-
-		if (IsSubModuleDisplayItem(dstItem))
-		{
-			const char* subName = GetStringSafe(dstItem, "SubModuleName");
-			if (!subName) continue;
-
-			// container IsDisplay
-			if (const char* v = GetIsDisplayStr(dstItem))
-			{
-				outMap[MakeSubModuleKey(subName)] = v;
-			}
-
-			// children IsDisplay
-			cJSON* subArr = cJSON_GetObjectItem(dstItem, "SubModuleDispJson");
-			if (subArr && cJSON_IsArray(subArr))
-			{
-				const int m = cJSON_GetArraySize(subArr);
-				for (int k = 0; k < m; ++k)
-				{
-					cJSON* child = cJSON_GetArrayItem(subArr, k);
-					if (!child) continue;
-
-					const char* childName = GetStringSafe(child, "Name");
-					if (!childName) continue;
-
-					if (const char* cv = GetIsDisplayStr(child))
-					{
-						outMap[MakeSubModuleChildKey(subName, childName)] = cv;
-					}
-				}
-			}
-		}
-		else
-		{
-			const char* name = GetStringSafe(dstItem, "Name");
-			if (!name) continue;
-
-			if (const char* v = GetIsDisplayStr(dstItem))
-			{
-				outMap[MakeNormalKey(name)] = v;
-			}
-		}
-	}
-}
-
-// ---------- 2) duplicate one src item + apply override ----------
-static cJSON* DuplicateSrcItemWithDisplayOverride(cJSON* srcItem,
-	const std::unordered_map<std::string, std::string>& displayMap)
-{
-	if (!srcItem) return nullptr;
-
-	cJSON* newItem = cJSON_Duplicate(srcItem, 1);
-	if (!newItem) return nullptr;
-
-	if (IsSubModuleDisplayItem(srcItem))
-	{
-		const char* subName = GetStringSafe(srcItem, "SubModuleName");
-		if (subName)
-		{
-			// override container
-			auto itParent = displayMap.find(MakeSubModuleKey(subName));
-			if (itParent != displayMap.end())
-			{
-				OverrideIsDisplay(newItem, itParent->second.c_str());
-			}
-
-			// override children
-			cJSON* newSubArr = cJSON_GetObjectItem(newItem, "SubModuleDispJson");
-			if (newSubArr && cJSON_IsArray(newSubArr))
-			{
-				const int m = cJSON_GetArraySize(newSubArr);
-				for (int k = 0; k < m; ++k)
-				{
-					cJSON* newChild = cJSON_GetArrayItem(newSubArr, k);
-					if (!newChild) continue;
-
-					const char* childName = GetStringSafe(newChild, "Name");
-					if (!childName) continue;
-
-					auto itChild = displayMap.find(MakeSubModuleChildKey(subName, childName));
-					if (itChild != displayMap.end())
-					{
-						OverrideIsDisplay(newChild, itChild->second.c_str());
-					}
-				}
-			}
-		}
-	}
-	else
-	{
-		const char* name = GetStringSafe(srcItem, "Name");
-		if (name)
-		{
-			auto it = displayMap.find(MakeNormalKey(name));
-			if (it != displayMap.end())
-			{
-				OverrideIsDisplay(newItem, it->second.c_str());
-			}
-		}
-	}
-
-	return newItem;
-}
-
-// ---------- 3) rebuild EItems from src(default) ----------
-static cJSON* RebuildEItemsFromSrc(cJSON* srcEItems,
-	const std::unordered_map<std::string, std::string>& displayMap)
-{
-	if (!srcEItems || !cJSON_IsArray(srcEItems)) return nullptr;
-
-	cJSON* newEItems = cJSON_CreateArray();
-	if (!newEItems) return nullptr;
-
-	const int n = cJSON_GetArraySize(srcEItems);
-	for (int i = 0; i < n; ++i)
-	{
-		cJSON* srcItem = cJSON_GetArrayItem(srcEItems, i);
-		if (!srcItem) continue;
-
-		cJSON* newItem = DuplicateSrcItemWithDisplayOverride(srcItem, displayMap);
-		if (!newItem)
-		{
-			cJSON_Delete(newEItems);
-			return nullptr;
-		}
-
-		cJSON_AddItemToArray(newEItems, newItem);
-	}
-
-	return newEItems;
-}
-
-
-⸻
-
-2) 更短、更干净的 UpdateJson
-
-int CDispManage::UpdateJson(const std::string& srcJsonPath, const std::string& dstJsonPath)
-{
-	if (srcJsonPath.empty() || dstJsonPath.empty())
-	{
-		return IMVS_EC_FILE_NOT_FOUND;
-	}
-
-	std::unique_ptr<cJSON, std::function<void(cJSON*)>> srcJsonRoot(
-		read_desc_js(srcJsonPath.c_str()),
-		[](cJSON* ptr) { if (ptr) cJSON_Delete(ptr); }
-	);
-
-	std::unique_ptr<cJSON, std::function<void(cJSON*)>> dstJsonRoot(
-		read_desc_js(dstJsonPath.c_str()),
-		[](cJSON* ptr) { if (ptr) cJSON_Delete(ptr); }
-	);
-
-	if (srcJsonRoot == nullptr || dstJsonRoot == nullptr)
-	{
-		return IMVS_EC_OUTOFMEMORY;
-	}
-
-	cJSON* srcEItems = cJSON_GetObjectItem(srcJsonRoot.get(), "EItems");
-	cJSON* dstEItems = cJSON_GetObjectItem(dstJsonRoot.get(), "EItems");
-	if (!srcEItems || !cJSON_IsArray(srcEItems) ||
-		!dstEItems || !cJSON_IsArray(dstEItems))
-	{
-		return IMVS_EC_JSON_NODE_NOEXIST;
-	}
-
-	// 1) collect IsDisplay from dst(work)
-	std::unordered_map<std::string, std::string> displayMap;
-	BuildDisplayMapFromDst(dstEItems, displayMap);
-
-	// 2) rebuild new EItems based on src(default) + override display
-	cJSON* newEItems = RebuildEItemsFromSrc(srcEItems, displayMap);
-	if (!newEItems)
-	{
-		return IMVS_EC_OUTOFMEMORY;
-	}
-
-	// 3) replace
-	cJSON_DeleteItemFromObject(dstJsonRoot.get(), "EItems");
-	cJSON_AddItemToObject(dstJsonRoot.get(), "EItems", newEItems);
-
-	return save_json_into_file(dstJsonPath.c_str(), dstJsonRoot.get());
-}
-
-
-⸻
-
-这样拆的好处
-	•	UpdateJson 会变得非常短，主流程一眼能读懂。
-	•	子模块/普通项的复杂分支都封装到了 DuplicateSrcItemWithDisplayOverride。
-	•	BuildDisplayMapFromDst 专注收集“用户开关状态”，职责清晰。
-	•	未来你要新增第三种层级/新字段策略，也不需要动主函数结构。
-
-⸻
-
-如果你愿意，我可以再帮你把这套 helper 的命名、日志与错误码策略对齐你们项目习惯（比如你们是否倾向 return IMVS_EC_JSON_NODE_NOEXIST 还是默认跳过并容错）。
