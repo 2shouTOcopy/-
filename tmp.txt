@@ -1,45 +1,90 @@
-int CSecurity::enableSsh(bool enable)
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// 读取并把 PSH_TMOUT 改成指定值，原子写回
+static int UpdatePshTimeout(const char* path, int timeout_sec)
 {
-    int32_t pid[1] = {0};
-    int32_t pid_len = 1;
-
-    os_get_pid_by_name("dropbear", pid, &pid_len);
-    LOGI(" enable %d pid %d \r\n", enable, pid[0]);
-
-    // 1) 已经是期望状态：enable=true 仍然需要确保 PSH_TMOUT=0
-    if (enable && pid[0] > 0) {
-        (void)UpdatePshTimeout("/mnt/cfg/psh.conf", 0);
-        LOGI("ssh already enabled, psh timeout forced to 0\n");
-        return 0;
-    }
-    if (!enable && pid[0] == 0) {
-        LOGI("ssh already disabled\n");
-        return 0;
+    if (path == nullptr) {
+        return -1;
     }
 
-    // 2) 执行启动/关闭
-    std::string cmd = enable ? "/sbin/dropbear" : "killall -9 dropbear";
-    LOGI("ssh proc %s \r\n", cmd.c_str());
+    const std::string target_key = "PSH_TMOUT=";
+    const std::string new_line   = target_key + std::to_string(timeout_sec);
+    const std::string tmp_path   = std::string(path) + ".tmp";
 
-    int ret = utils_do_shell_cmd(const_cast<char*>(cmd.c_str()));
-    if (ret != 0) {
-        LOGE("ssh proc failed ret %d \n", ret);
-        return ret;
-    }
+    // 记录原文件权限/属主（如果文件存在）
+    struct stat st {};
+    bool has_old = (stat(path, &st) == 0);
 
-    // 3) 启动成功后更新 psh.conf
-    if (enable) {
-        int cfg_ret = UpdatePshTimeout("/mnt/cfg/psh.conf", 0);
-        if (cfg_ret != 0) {
-            // 这里按你业务决定：是“启动成功但配置失败也算失败”，还是仅告警
-            LOGE("update psh.conf failed\n");
-            // return -1;  // 若你希望失败则返回
+    // 读原文件（不存在也没关系，后面会创建新内容）
+    std::vector<std::string> lines;
+    {
+        std::ifstream ifs(path);
+        if (ifs.good()) {
+            std::string line;
+            while (std::getline(ifs, line)) {
+                // 去掉 '\r'（有些系统生成的配置可能是 CRLF）
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                lines.push_back(line);
+            }
         }
     }
 
+    bool replaced = false;
+    for (auto &l : lines) {
+        // 只处理以 PSH_TMOUT= 开头的行（忽略其他配置）
+        if (l.rfind(target_key, 0) == 0) {
+            l = new_line;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        lines.push_back(new_line);
+    }
+
+    // 写临时文件
+    {
+        std::ofstream ofs(tmp_path, std::ios::out | std::ios::trunc);
+        if (!ofs.good()) {
+            LOGE("open tmp failed: %s, errno=%d\n", tmp_path.c_str(), errno);
+            return -1;
+        }
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            ofs << lines[i] << "\n";
+        }
+        ofs.flush();
+        if (!ofs.good()) {
+            LOGE("write tmp failed: %s\n", tmp_path.c_str());
+            return -1;
+        }
+    }
+
+    // 恢复权限/属主（如果原文件存在）
+    if (has_old) {
+        (void)chmod(tmp_path.c_str(), st.st_mode);
+        (void)chown(tmp_path.c_str(), st.st_uid, st.st_gid);
+    }
+
+    // 原子替换
+    if (rename(tmp_path.c_str(), path) != 0) {
+        LOGE("rename failed: %s -> %s, errno=%d\n", tmp_path.c_str(), path, errno);
+        (void)unlink(tmp_path.c_str());
+        return -1;
+    }
+
+    LOGI("psh.conf updated: PSH_TMOUT=%d\n", timeout_sec);
     return 0;
 }
-
 int CSecurity::enableSsh(bool enable)
 {
     int32_t pid[1] = {0};
