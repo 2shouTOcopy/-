@@ -1,143 +1,83 @@
-void TcpsServerManager::TaskWorker()
+int CSecurity::enableSsh(bool enable)
 {
-    int32_t sockfd = -1;
-    int32_t maxfd  = -1;
-    int32_t len    = 0;
-    fd_set rdSet, wrSet;
-    int32_t result = 0;
-    struct timeval timeout;
+    int32_t pid[1] = {0};
+    int32_t pid_len = 1;
 
-    m_taskRun = true;
+    os_get_pid_by_name("dropbear", pid, &pid_len);
+    LOGI(" enable %d pid %d \r\n", enable, pid[0]);
 
-    while (!m_end)
-    {
-        if (m_reCreate || m_conning || !m_moduleEnable)
-        {
-            usleep(100000);
-            continue;
-        }
-
-        if (m_taskLoopCallback)
-        {
-            m_taskLoopCallback();
-        }
-
-        timeout.tv_sec  = 0;
-        timeout.tv_usec = MSG_RECV_SELECT_TIME * 1000;
-
-        maxfd = -1;
-        FD_ZERO(&rdSet);
-        FD_ZERO(&wrSet);
-
-        // 取出一条广播消息（如果你希望一次发完队列，这里可以改成 while 出队）
-        TcpsMessage msg = {0};
-        {
-            std::lock_guard<std::mutex> lk(m_sendQueueMtx);
-            if (!m_sendQueue.empty())
-            {
-                msg = m_sendQueue.front();
-                m_sendQueue.pop();
-            }
-        }
-
-        // ✅ 遍历“所有槽位”，不要在 for 条件里用 m_conns[i]
-        const size_t n = m_conns.size(); // 建议 m_conns 预先 resize(MAX_CLIENT_NUM)
-        for (size_t idx = 0; idx < n; ++idx)
-        {
-            if (!m_conns[idx])
-                continue;
-
-            LOGE("111:%zu\n", idx);
-
-            sockfd = m_conns[idx]->GetSockFd();
-            if (sockfd < 0)
-                continue;
-
-            if (msg.len > 0)
-            {
-                m_conns[idx]->InsertSendMsg(msg);
-            }
-
-            if (sockfd > maxfd)
-                maxfd = sockfd;
-
-            FD_SET(sockfd, &rdSet);
-
-            if (!m_conns[idx]->IsSendQueueEmpty())
-            {
-                FD_SET(sockfd, &wrSet);
-            }
-        }
-
-        if (maxfd < 0)
-        {
-            usleep(MSG_RECV_SELECT_TIME * 1000);
-            continue;
-        }
-
-        result = select(maxfd + 1, &rdSet, &wrSet, nullptr, &timeout);
-
-        if (result > 0)
-        {
-            for (size_t idx = 0; idx < n; ++idx)
-            {
-                if (!m_conns[idx])
-                    continue;
-
-                LOGE("222:%zu\n", idx);
-
-                sockfd = m_conns[idx]->GetSockFd();
-                if (sockfd < 0)
-                    continue;
-
-                if (FD_ISSET(sockfd, &rdSet))
-                {
-                    // 如果 Recv 可能阻塞，这里会“卡住”
-                    len = m_conns[idx]->Recv();
-                    if (len <= 0)
-                    {
-                        LOGE("tcp client recv ret %d, [%zu], sockfd=%d\r\n", len, idx, sockfd);
-                        m_conns[idx]->Close();
-                        m_conns[idx].reset();
-                        continue;
-                    }
-                }
-
-                if (FD_ISSET(sockfd, &wrSet))
-                {
-                    LOGE("333:%zu\n", idx);
-                    len = m_conns[idx]->Send();
-                    if (len < 0 && (errno != EINTR && errno != EAGAIN))
-                    {
-                        LOGE("tcp client send error, [%zu]sockfd=%d\r\n", idx, sockfd);
-                        m_conns[idx]->Close();
-                        m_conns[idx].reset();
-                        continue;
-                    }
-                }
-            }
-        }
-        else if (result < 0)
-        {
-            // select 出错时，也不要用 “&& m_conns[i]” 这种写法
-            for (size_t idx = 0; idx < n; ++idx)
-            {
-                if (!m_conns[idx])
-                    continue;
-
-                LOGE("444:%zu\n", idx);
-
-                sockfd = m_conns[idx]->GetSockFd();
-                if (sockfd >= 0 && FD_ISSET(sockfd, &rdSet))
-                {
-                    LOGE("tcp client select error, [%zu]sockfd=%d\r\n", idx, sockfd);
-                    m_conns[idx]->Close();
-                    m_conns[idx].reset();
-                }
-            }
-        }
-        // result == 0: timeout，啥也不做，下一轮
+    // 1) 已经是期望状态：enable=true 仍然需要确保 PSH_TMOUT=0
+    if (enable && pid[0] > 0) {
+        (void)UpdatePshTimeout("/mnt/cfg/psh.conf", 0);
+        LOGI("ssh already enabled, psh timeout forced to 0\n");
+        return 0;
+    }
+    if (!enable && pid[0] == 0) {
+        LOGI("ssh already disabled\n");
+        return 0;
     }
 
-    m_taskRun = false;
+    // 2) 执行启动/关闭
+    std::string cmd = enable ? "/sbin/dropbear" : "killall -9 dropbear";
+    LOGI("ssh proc %s \r\n", cmd.c_str());
+
+    int ret = utils_do_shell_cmd(const_cast<char*>(cmd.c_str()));
+    if (ret != 0) {
+        LOGE("ssh proc failed ret %d \n", ret);
+        return ret;
+    }
+
+    // 3) 启动成功后更新 psh.conf
+    if (enable) {
+        int cfg_ret = UpdatePshTimeout("/mnt/cfg/psh.conf", 0);
+        if (cfg_ret != 0) {
+            // 这里按你业务决定：是“启动成功但配置失败也算失败”，还是仅告警
+            LOGE("update psh.conf failed\n");
+            // return -1;  // 若你希望失败则返回
+        }
+    }
+
+    return 0;
+}
+
+int CSecurity::enableSsh(bool enable)
+{
+    int32_t pid[1] = {0};
+    int32_t pid_len = 1;
+
+    os_get_pid_by_name("dropbear", pid, &pid_len);
+    LOGI(" enable %d pid %d \r\n", enable, pid[0]);
+
+    // 1) 已经是期望状态：enable=true 仍然需要确保 PSH_TMOUT=0
+    if (enable && pid[0] > 0) {
+        (void)UpdatePshTimeout("/mnt/cfg/psh.conf", 0);
+        LOGI("ssh already enabled, psh timeout forced to 0\n");
+        return 0;
+    }
+    if (!enable && pid[0] == 0) {
+        LOGI("ssh already disabled\n");
+        return 0;
+    }
+
+    // 2) 执行启动/关闭
+    std::string cmd = enable ? "/sbin/dropbear" : "killall -9 dropbear";
+    LOGI("ssh proc %s \r\n", cmd.c_str());
+
+    int ret = utils_do_shell_cmd(const_cast<char*>(cmd.c_str()));
+    if (ret != 0) {
+        LOGE("ssh proc failed ret %d \n", ret);
+        return ret;
+    }
+
+    // 3) 启动成功后更新 psh.conf
+    if (enable) {
+        int cfg_ret = UpdatePshTimeout("/mnt/cfg/psh.conf", 0);
+        if (cfg_ret != 0) {
+            // 这里按你业务决定：是“启动成功但配置失败也算失败”，还是仅告警
+            LOGE("update psh.conf failed\n");
+            // return -1;  // 若你希望失败则返回
+        }
+    }
+
+    return 0;
 }
