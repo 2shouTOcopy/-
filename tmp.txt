@@ -1,144 +1,136 @@
-#include <stdio.h>
-#include <string.h>
-#include <ctype.h>
-#include <errno.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-
-/* 去掉行尾的 \r \n */
-static void trim_eol(char* s)
-{
-    if (s == NULL) return;
-    size_t n = strlen(s);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
-        s[n - 1] = '\0';
-        --n;
-    }
-}
-
-/* 跳过前导空格 */
-static const char* skip_spaces(const char* s)
-{
-    while (s && *s && isspace((unsigned char)*s)) s++;
-    return s;
-}
-
-/*
- * 判断一行是否是 key=... （允许：前导空格、key后空格、=左右空格）
- * 命中返回 1，否则 0
- */
-static int match_key_line(const char* line, const char* key)
-{
-    if (!line || !key) return 0;
-
-    const char* p = skip_spaces(line);
-
-    /* 注释行直接跳过 */
-    if (*p == '#' || *p == ';' || *p == '\0') return 0;
-
-    size_t klen = strlen(key);
-    if (strncmp(p, key, klen) != 0) return 0;
-
-    p += klen;
-    p = skip_spaces(p);
-
-    return (*p == '=');
-}
-
 /**
- * @brief 修改/写入配置文件的 key=value
- * @param path 文件路径，如 "/mnt/cfg/psh.conf"
- * @param key  key，如 "PSH_TMOUT"（不需要带 '='）
- * @param value value，如 "0"
- * @return 成功返回0，失败返回-1
+ * @brief      将json数据原子保存至文件
+ * @param[in]  file_path 保存文件的路径
+ * @param[in]  root json数据的根节点
+ * @return     成功:0.失败:相应的错误号(负值)
  */
-int32_t utils_update_kv_file(const char* path, const char* key, const char* value)
+int32_t save_json_into_file_atomic(const char *file_path, cJSON *root)
 {
-    if (path == NULL || key == NULL || value == NULL) {
-        LOGE("utils_update_kv_file invalid param\n");
-        return -1;
-    }
+	int32_t fd = -1;
+	int32_t dirfd = -1;
+	int32_t fsize = 0;
+	int32_t ret = 0;
+	int32_t error = 0;
+	char *disp_str = NULL;
+	char *tmp_path = NULL;
+	char *dir_path_buf = NULL;
+	const char *dir_path = ".";
+	int renamed = 0;
 
-    /* 如果 key 传进来是 "PSH_TMOUT=" 这种，容错处理一下 */
-    char key_buf[128] = {0};
-    snprintf(key_buf, sizeof(key_buf), "%s", key);
-    size_t key_len = strlen(key_buf);
-    if (key_len > 0 && key_buf[key_len - 1] == '=') {
-        key_buf[key_len - 1] = '\0';
-    }
+	if ((NULL == file_path) || (NULL == root))
+	{
+		LOGE("[%s] path or js_root is null\n", __func__);
+		LEAVE(SC_EC_NULLPTR, out);
+	}
 
-    /* 记录原文件权限/属主（若存在） */
-    struct stat st;
-    int has_old = (stat(path, &st) == 0);
+	tmp_path = (char *)malloc(strlen(file_path) + sizeof(".tmpXXXXXX"));
+	if (NULL == tmp_path)
+	{
+		LOGE("[%s] malloc tmp path fail\n", __func__);
+		LEAVE(SC_EC_MALLOC, out);
+	}
+	snprintf(tmp_path, strlen(file_path) + sizeof(".tmpXXXXXX"), "%s.tmpXXXXXX", file_path);
 
-    FILE* in = fopen(path, "r"); /* 文件不存在也没关系 */
+	fd = mkstemp(tmp_path);
+	if (fd < 0)
+	{
+		LOGE("[%s] mkstemp %s error\n", __func__, tmp_path);
+		LEAVE(SC_EC_OPEN, out);
+	}
+	(void)fchmod(fd, 0777);
 
-    /* 临时文件：同目录下 mkstemp，避免并发冲突 */
-    char tmp_path[512] = {0};
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmpXXXXXX", path);
+	disp_str = cJSON_Print(root);
+	if (NULL == disp_str)
+	{
+		LOGE("failed to cJSON_Print\n");
+		LEAVE(SC_EC_NULLPTR, out);
+	}
 
-    int tmp_fd = mkstemp(tmp_path);
-    if (tmp_fd < 0) {
-        LOGE("mkstemp failed %s errno=%d\n", tmp_path, errno);
-        if (in) fclose(in);
-        return -1;
-    }
+	fsize = strlen(disp_str);
+	if ((ret = write(fd, disp_str, fsize)) != fsize)
+	{
+		LOGE("write file %s error:\n", tmp_path);
+		LEAVE(SC_EC_WRITE, out);
+	}
 
-    FILE* out = fdopen(tmp_fd, "w");
-    if (out == NULL) {
-        LOGE("fdopen failed errno=%d\n", errno);
-        close(tmp_fd);
-        unlink(tmp_path);
-        if (in) fclose(in);
-        return -1;
-    }
+	if (fsync(fd) < 0)
+	{
+		LOGE("sync file %s error:\n", tmp_path);
+		LEAVE(SC_EC_READ, out);
+	}
 
-    int replaced = 0;
-    char line[1024];
+	if (close(fd) < 0)
+	{
+		fd = -1;
+		LEAVE(SC_EC_READ, out);
+	}
+	fd = -1;
 
-    if (in) {
-        while (fgets(line, sizeof(line), in) != NULL) {
-            trim_eol(line);
+	if (rename(tmp_path, file_path) < 0)
+	{
+		LOGE("rename %s to %s error:\n", tmp_path, file_path);
+		LEAVE(SC_EC_RENAME, out);
+	}
+	renamed = 1;
 
-            if (!replaced && match_key_line(line, key_buf)) {
-                fprintf(out, "%s=%s\n", key_buf, value);
-                replaced = 1;
-            } else {
-                fprintf(out, "%s\n", line);
-            }
-        }
-        fclose(in);
-        in = NULL;
-    }
+	{
+		const char *slash = strrchr(file_path, '/');
+		if (slash)
+		{
+			size_t dir_len = (size_t)(slash - file_path);
+			dir_path_buf = (char *)malloc(dir_len + 1);
+			if (NULL == dir_path_buf)
+			{
+				LOGE("[%s] malloc dir path fail\n", __func__);
+				LEAVE(SC_EC_MALLOC, out);
+			}
+			memcpy(dir_path_buf, file_path, dir_len);
+			dir_path_buf[dir_len] = '\0';
+			dir_path = dir_path_buf;
+		}
+	}
 
-    if (!replaced) {
-        fprintf(out, "%s=%s\n", key_buf, value);
-    }
+#ifdef O_DIRECTORY
+	dirfd = open(dir_path, O_RDONLY | O_DIRECTORY);
+#else
+	dirfd = open(dir_path, O_RDONLY);
+#endif
+	if (dirfd < 0)
+	{
+		LOGE("[%s] open dir %s error\n", __func__, dir_path);
+		LEAVE(SC_EC_OPEN, out);
+	}
 
-    fflush(out);
+	if (fsync(dirfd) < 0)
+	{
+		LOGE("sync dir %s error:\n", dir_path);
+		LEAVE(SC_EC_READ, out);
+	}
 
-    /* 尽量把数据刷到盘（对 flash/overlay 也更稳一点） */
-    int fd = fileno(out);
-    if (fd >= 0) {
-        (void)fsync(fd);
-    }
-
-    fclose(out); /* 这里也会 close(tmp_fd) */
-
-    /* 恢复权限/属主（若原文件存在） */
-    if (has_old) {
-        (void)chmod(tmp_path, st.st_mode);
-        (void)chown(tmp_path, st.st_uid, st.st_gid);
-    }
-
-    /* 原子替换 */
-    if (rename(tmp_path, path) != 0) {
-        LOGE("rename failed %s -> %s errno=%d\n", tmp_path, path, errno);
-        unlink(tmp_path);
-        return -1;
-    }
-
-    LOGI("update kv ok: %s=%s in %s\n", key_buf, value, path);
-    return 0;
+out:
+	if (fd >= 0)
+	{
+		close(fd);
+	}
+	if (dirfd >= 0)
+	{
+		close(dirfd);
+	}
+	if (error < 0 && tmp_path && !renamed)
+	{
+		unlink(tmp_path);
+	}
+	if (disp_str)
+	{
+		cJSON_free(disp_str);
+	}
+	if (tmp_path)
+	{
+		free(tmp_path);
+	}
+	if (dir_path_buf)
+	{
+		free(dir_path_buf);
+	}
+	return error;
 }
