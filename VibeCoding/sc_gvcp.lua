@@ -12,52 +12,65 @@ local sc_gvcp = Proto("sc_gvcp", "Smart Camera GVCP Protocol")
 -- ============================================================================
 local register_names = {}
 
--- CSV file path - you can modify this to absolute path if needed
-local csv_file_path = "Hikrobot_Smart_Device_Profile_addr.csv"
+-- Paths to check for the CSV file
+local csv_filename = "Hikrobot_Smart_Device_Profile_addr.csv"
+-- Windows absolute path (Target machine)
+local csv_abs_path = "C:\\Users\\zhoufeng20\\AppData\\Roaming\\Wireshark\\plugins\\" .. csv_filename
 
 local function load_csv_mapping()
     local file = nil
-    local tried_paths = {}
+    local load_path = ""
     
-    -- Method 1: Try current working directory
-    file = io.open(csv_file_path, "r")
-    table.insert(tried_paths, csv_file_path)
+    -- Method 1: Check explicit absolute path
+    file = io.open(csv_abs_path, "r")
+    if file then
+        load_path = csv_abs_path
+    end
     
-    -- Method 2: Try relative path from script directory
+    -- Method 2: Current directory
+    if not file then
+        file = io.open(csv_filename, "r")
+        if file then load_path = "cwd/" .. csv_filename end
+    end
+    
+    -- Method 3: Script directory (Relative)
     if not file then
         local info = debug.getinfo(1, "S")
         if info and info.source then
             local script_dir = info.source:match("@(.*/)")
             if script_dir then
-                local path = script_dir .. csv_file_path
+                local path = script_dir .. csv_filename
                 file = io.open(path, "r")
-                table.insert(tried_paths, path)
+                if file then load_path = path end
             end
         end
     end
-    
-    -- Method 3: Try Wireshark personal plugins directory (macOS)
+
+    -- Method 4: User plugins dir (macOS/Linux standard)
     if not file then
         local home = os.getenv("HOME")
         if home then
-            local path = home .. "/.local/lib/wireshark/plugins/" .. csv_file_path
+            local path = home .. "/.local/lib/wireshark/plugins/" .. csv_filename
             file = io.open(path, "r")
-            table.insert(tried_paths, path)
+            if file then load_path = path end
         end
     end
     
-    -- Method 4: Try hardcoded absolute path as fallback
+    -- Method 5: User plugins dir (Windows standard generic)
     if not file then
-        local path = "/Users/hanyue/Desktop/Code/smart_camera/smart1223/smart_camera/product/app_src/app/doc/" .. csv_file_path
-        file = io.open(path, "r")
-        table.insert(tried_paths, path)
+        local appdata = os.getenv("APPDATA")
+        if appdata then
+            local path = appdata .. "\\Wireshark\\plugins\\" .. csv_filename
+            file = io.open(path, "r")
+            if file then load_path = path end
+        end
     end
     
     if not file then
-        print("SC_GVCP: ERROR - Could not open CSV file. Tried paths:")
-        for _, p in ipairs(tried_paths) do
-            print("  - " .. p)
-        end
+        -- POPUP ERROR: This will definitely be seen by the user
+        local err = "SC_GVCP ERROR: Could not find CSV file!\nChecked absolute path:\n" ..
+                    csv_abs_path
+        report_failure(err)
         return
     end
     
@@ -66,13 +79,13 @@ local function load_csv_mapping()
     
     local count = 0
     for line in file:lines() do
-        -- Remove carriage return if present (Windows CRLF)
+        -- Remove carriage return (Windows CRLF)
         line = line:gsub("\r", "")
         
         local name, addr = line:match("([^,]+),([^,]+)")
         if name and addr then
-            -- Remove 0x prefix if present and convert to number
-            local addr_str = addr:gsub("^0[xX]", "")
+            -- Remove 0x prefix and whitespace
+            local addr_str = addr:gsub("^0[xX]", ""):gsub("%s+", "")
             local addr_num = tonumber(addr_str, 16)
             if addr_num then
                 register_names[addr_num] = name
@@ -82,7 +95,7 @@ local function load_csv_mapping()
     end
     
     file:close()
-    print("SC_GVCP: Successfully loaded " .. count .. " register mappings from CSV")
+    -- print("SC_GVCP: Successfully loaded " .. count .. " register mappings from CSV")
 end
 
 -- Load CSV on script initialization
