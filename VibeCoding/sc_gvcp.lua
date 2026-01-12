@@ -36,19 +36,22 @@ local function load_csv_mapping()
     -- Skip header line
     file:read("*line")
     
+    local count = 0
     for line in file:lines() do
         local name, addr = line:match("([^,]+),([^,]+)")
         if name and addr then
-            -- Convert hex string to number
-            local addr_num = tonumber(addr, 16) or tonumber(addr)
+            -- Remove 0x prefix if present and convert to number
+            local addr_str = addr:gsub("^0[xX]", "")
+            local addr_num = tonumber(addr_str, 16)
             if addr_num then
                 register_names[addr_num] = name
+                count = count + 1
             end
         end
     end
     
     file:close()
-    print("SC_GVCP: Loaded register mappings from CSV")
+    print("SC_GVCP: Loaded " .. count .. " register mappings from CSV")
 end
 
 -- Load CSV on script initialization
