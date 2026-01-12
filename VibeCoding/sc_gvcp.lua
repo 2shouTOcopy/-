@@ -113,8 +113,9 @@ local command_names = {
     [0x1013] = "GETUSERINFO_ACK",
 }
 
--- Status code definitions
+-- Status code definitions (from sc_gvcp_internal.h)
 local status_names = {
+    -- Standard GVCP status codes
     [0x0000] = "SUCCESS",
     [0x0100] = "PACKET_RESEND",
     [0x8001] = "NOT_IMPLEMENTED",
@@ -133,9 +134,32 @@ local status_names = {
     [0x800E] = "INVALID_HEADER",
     [0x800F] = "WRONG_CONFIG",
     [0x8010] = "PACKET_NOT_YET_AVAILABLE",
-    [0x8011] = "PACKET_AND_PREV_REMOVED",
-    [0x8012] = "PACKET_REMOVED",
+    [0x8011] = "PACKET_AND_PREV_REMOVED_FROM_MEMORY",
+    [0x8012] = "PACKET_REMOVED_FROM_MEMORY",
     [0x8FFF] = "ERROR",
+    
+    -- Private status codes (from sc_gvcp_internal.h)
+    [0x8601] = "PUBKEY_INVALID",
+    [0x8602] = "DEVICE_NOT_ACTIVE",
+    [0x8603] = "PWD_FMT_INVALID",
+    [0x8604] = "PWD_VERIFY_FAILED",
+    [0x8605] = "LOCKED_DENIED",
+    [0x8606] = "FILE_INVAID",
+    [0x8607] = "FILE_DATA_INVALID",
+    [0x8608] = "COOKIE_TIMEOUT",
+    [0x8609] = "DIGICAP_DECRY_NG",
+    [0x860A] = "INITRUN_VERIFY_NG",
+    [0x860B] = "PROGRAM_VERIFY_NG",
+    [0x860C] = "DIGICAP_VERIFY_NG",
+    [0x860D] = "NEED_AUTH",
+    [0x860E] = "REDLINE_DATA_RW_FAILED",
+    [0x860F] = "REDLINE_API_FAILED",
+    [0x8610] = "NETENV_INVALID",
+    [0x8611] = "DEVICE_ALREADY_ACTIVE",
+    [0x8612] = "BSP_SECURE_FAILED",
+    [0x8613] = "WIRELESS_NOT_CONNECT",
+    [0x8614] = "USERNAME_INVALID",
+
 }
 
 -- Safe action flags
@@ -233,7 +257,16 @@ local function get_command_name(cmd)
 end
 
 local function get_status_name(status)
-    return status_names[status] or string.format("UNKNOWN_0x%04X", status)
+    return status_names[status] or nil
+end
+
+local function get_status_display(status)
+    local name = status_names[status]
+    if name then
+        return name
+    else
+        return string.format("Unknown status (0x%04X)", status)
+    end
 end
 
 local function decode_safe_action(action)
@@ -307,7 +340,7 @@ local function dissect_discovery_ack(buffer, pinfo, tree, offset)
     payload_tree:add(f_serial, buffer(offset + 216, 16)):set_text("Serial Number: " .. serial)
     payload_tree:add(f_user_name, buffer(offset + 232, 16)):set_text("User Name: " .. user_name)
     
-    return string.format("Model=%s, SN=%s, Active=%s", model_name, serial, active_str)
+    return string.format("[Model=%s, SN=%s, Active=%s]", model_name, serial, active_str)
 end
 
 local function dissect_readreg_cmd(buffer, pinfo, tree, offset, length)
@@ -321,7 +354,7 @@ local function dissect_readreg_cmd(buffer, pinfo, tree, offset, length)
         table.insert(regs, name)
     end
     
-    return table.concat(regs, ", ")
+    return "[" .. table.concat(regs, ", ") .. "]"
 end
 
 local function dissect_readreg_ack(buffer, pinfo, tree, offset, length)
@@ -334,7 +367,7 @@ local function dissect_readreg_ack(buffer, pinfo, tree, offset, length)
         table.insert(values, string.format("0x%08X", value))
     end
     
-    return string.format("%d values", reg_count)
+    return "(" .. table.concat(values, ", ") .. ")"
 end
 
 local function dissect_writereg_cmd(buffer, pinfo, tree, offset, length)
@@ -350,19 +383,19 @@ local function dissect_writereg_cmd(buffer, pinfo, tree, offset, length)
         reg_tree:add(f_address, buffer(offset + i * 8, 4)):append_text(" (" .. name .. ")")
         reg_tree:add(f_value, buffer(offset + i * 8 + 4, 4))
         
-        table.insert(regs, string.format("%s=0x%X", name, value))
+        table.insert(regs, name)
     end
     
-    return table.concat(regs, ", ")
+    return "[" .. table.concat(regs, ", ") .. "]"
 end
 
 local function dissect_writereg_ack(buffer, pinfo, tree, offset, length)
     if length >= 4 then
         local index = buffer(offset + 2, 2):uint()
         tree:add(f_count, buffer(offset + 2, 2)):set_text("Registers Written: " .. index)
-        return string.format("%d regs", index)
+        return nil  -- Status will be shown separately
     end
-    return ""
+    return nil
 end
 
 local function dissect_readmem_cmd(buffer, pinfo, tree, offset)
@@ -373,7 +406,7 @@ local function dissect_readmem_cmd(buffer, pinfo, tree, offset)
     tree:add(f_address, buffer(offset, 4)):append_text(" (" .. name .. ")")
     tree:add(f_count, buffer(offset + 4, 4)):set_text("Size: " .. size .. " bytes")
     
-    return string.format("%s, %d bytes", name, size)
+    return "[" .. name .. "]"
 end
 
 local function dissect_readmem_ack(buffer, pinfo, tree, offset, length)
@@ -386,9 +419,9 @@ local function dissect_readmem_ack(buffer, pinfo, tree, offset, length)
             tree:add(f_data, buffer(offset + 4, length - 4))
         end
         
-        return string.format("%s, %d bytes", name, length - 4)
+        return "[" .. name .. "]"
     end
-    return ""
+    return nil
 end
 
 local function dissect_writemem_cmd(buffer, pinfo, tree, offset, length)
@@ -401,19 +434,23 @@ local function dissect_writemem_cmd(buffer, pinfo, tree, offset, length)
         tree:add(f_data, buffer(offset + 4, length - 4))
     end
     
-    return string.format("%s, %d bytes", name, length - 4)
+    return "[" .. name .. "]"
 end
 
-local function dissect_writemem_ack(buffer, pinfo, tree, offset)
-    local index = buffer(offset, 2):uint()
-    tree:add(f_count, buffer(offset, 2)):set_text("Bytes Written Index: " .. index)
-    return string.format("%d bytes", index)
+local function dissect_writemem_ack(buffer, pinfo, tree, offset, length, addr_from_cmd)
+    if length >= 4 then
+        local addr = buffer(offset, 4):uint()
+        local name = get_register_name(addr)
+        tree:add(f_address, buffer(offset, 4)):append_text(" (" .. name .. ")")
+        return "[" .. name .. "]"
+    end
+    return nil
 end
 
 local function dissect_pending_ack(buffer, pinfo, tree, offset)
     local timeout = buffer(offset + 2, 2):uint()
     tree:add(f_pending_timeout, buffer(offset + 2, 2))
-    return string.format("timeout=%dms", timeout)
+    return string.format("(timeout=%dms)", timeout)
 end
 
 local function dissect_packet_resend_cmd(buffer, pinfo, tree, offset)
@@ -427,7 +464,7 @@ local function dissect_packet_resend_cmd(buffer, pinfo, tree, offset)
     tree:add(f_first_packet, buffer(offset + 4, 4)):set_text("First Packet ID: " .. first_pkt)
     tree:add(f_last_packet, buffer(offset + 8, 4)):set_text("Last Packet ID: " .. last_pkt)
     
-    return string.format("Ch=%d, Block=%d, Pkts=%d-%d", ch_id, block_id, first_pkt, last_pkt)
+    return string.format("[Ch=%d, Block=%d, Pkts=%d-%d]", ch_id, block_id, first_pkt, last_pkt)
 end
 
 local function dissect_forceip_cmd(buffer, pinfo, tree, offset, length)
@@ -443,9 +480,9 @@ local function dissect_forceip_cmd(buffer, pinfo, tree, offset, length)
         tree:add(f_default_gw, buffer(offset + 52, 4))
         
         local ip = buffer(offset + 20, 4):ipv4()
-        return string.format("IP=%s", tostring(ip))
+        return string.format("[IP=%s]", tostring(ip))
     end
-    return ""
+    return nil
 end
 
 -- ============================================================================
@@ -473,24 +510,35 @@ function sc_gvcp.dissector(buffer, pinfo, tree)
     -- Header tree
     local header_tree = subtree:add(sc_gvcp, buffer(0, 8), "Header")
     
+    -- Direction indicator: > for CMD (request), < for ACK (response)
+    local direction = is_cmd and "> " or "< "
+    local status = 0
+    local status_str = nil
+    
     if is_cmd then
         -- Command packet
         header_tree:add(f_magic, buffer(0, 1))
         header_tree:add(f_flag, buffer(1, 1))
     else
         -- ACK packet
-        local status = buffer(0, 2):uint()
-        local status_name = get_status_name(status)
-        header_tree:add(f_status, buffer(0, 2)):append_text(" (" .. status_name .. ")")
+        status = buffer(0, 2):uint()
+        local status_display = get_status_display(status)
+        header_tree:add(f_status, buffer(0, 2)):append_text(" (" .. status_display .. ")")
+        
+        if status == 0 then
+            status_str = "(Success)"
+        else
+            status_str = get_status_display(status)
+        end
     end
     
     header_tree:add(f_command, buffer(2, 2)):append_text(" (" .. cmd_name .. ")")
     header_tree:add(f_length, buffer(4, 2))
     header_tree:add(f_req_id, buffer(6, 2))
     
-    -- Info column base
-    local info_str = string.format("%s [id=%d]", cmd_name, req_id)
-    local extra_info = ""
+    -- Build Info string
+    local info_str = direction .. cmd_name
+    local extra_info = nil
     
     -- Parse payload based on command
     if payload_len > 0 and length >= 8 + payload_len then
@@ -505,7 +553,8 @@ function sc_gvcp.dissector(buffer, pinfo, tree)
         elseif command == 0x0082 then  -- WRITEREG_CMD
             extra_info = dissect_writereg_cmd(buffer, pinfo, payload_tree, 8, payload_len)
         elseif command == 0x0083 then  -- WRITEREG_ACK
-            extra_info = dissect_writereg_ack(buffer, pinfo, payload_tree, 8, payload_len)
+            dissect_writereg_ack(buffer, pinfo, payload_tree, 8, payload_len)
+            -- For WRITEREG_ACK, show status only
         elseif command == 0x0084 then  -- READMEM_CMD
             extra_info = dissect_readmem_cmd(buffer, pinfo, payload_tree, 8)
         elseif command == 0x0085 then  -- READMEM_ACK
@@ -513,7 +562,7 @@ function sc_gvcp.dissector(buffer, pinfo, tree)
         elseif command == 0x0086 then  -- WRITEMEM_CMD
             extra_info = dissect_writemem_cmd(buffer, pinfo, payload_tree, 8, payload_len)
         elseif command == 0x0087 then  -- WRITEMEM_ACK
-            extra_info = dissect_writemem_ack(buffer, pinfo, payload_tree, 8)
+            extra_info = dissect_writemem_ack(buffer, pinfo, payload_tree, 8, payload_len)
         elseif command == 0x0089 then  -- PENDING_ACK
             extra_info = dissect_pending_ack(buffer, pinfo, payload_tree, 8)
         elseif command == 0x0004 then  -- FORCEIP_CMD
@@ -526,18 +575,45 @@ function sc_gvcp.dissector(buffer, pinfo, tree)
         end
     end
     
-    -- Add status to ACK info
+    -- Format Info column based on command type
     if not is_cmd then
-        local status = buffer(0, 2):uint()
-        local status_name = get_status_name(status)
-        if status ~= 0 then
-            info_str = info_str .. " " .. status_name
+        -- ACK packets: show status
+        if command == 0x0083 then  -- WRITEREG_ACK
+            if status == 0 then
+                info_str = info_str .. " (Success)"
+            else
+                info_str = info_str .. " " .. status_str
+            end
+        elseif command == 0x0087 then  -- WRITEMEM_ACK
+            if status == 0 then
+                if extra_info then
+                    info_str = info_str .. " " .. extra_info
+                end
+            else
+                info_str = info_str .. " " .. status_str
+                if extra_info then
+                    info_str = info_str .. " " .. extra_info
+                end
+            end
+        elseif command == 0x0081 then  -- READREG_ACK
+            if extra_info then
+                info_str = info_str .. " " .. extra_info
+            end
+        elseif command == 0x0085 then  -- READMEM_ACK
+            if extra_info then
+                info_str = info_str .. " " .. extra_info
+            end
+        else
+            -- Other ACKs
+            if extra_info then
+                info_str = info_str .. " " .. extra_info
+            end
         end
-    end
-    
-    -- Append extra info
-    if extra_info and extra_info ~= "" then
-        info_str = info_str .. " " .. extra_info
+    else
+        -- CMD packets: show register info
+        if extra_info then
+            info_str = info_str .. " " .. extra_info
+        end
     end
     
     pinfo.cols.info = info_str
