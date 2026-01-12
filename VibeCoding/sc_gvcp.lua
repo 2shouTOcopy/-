@@ -12,24 +12,52 @@ local sc_gvcp = Proto("sc_gvcp", "Smart Camera GVCP Protocol")
 -- ============================================================================
 local register_names = {}
 
--- CSV file path - modify this path according to your system
+-- CSV file path - you can modify this to absolute path if needed
 local csv_file_path = "Hikrobot_Smart_Device_Profile_addr.csv"
 
 local function load_csv_mapping()
-    local file = io.open(csv_file_path, "r")
+    local file = nil
+    local tried_paths = {}
+    
+    -- Method 1: Try current working directory
+    file = io.open(csv_file_path, "r")
+    table.insert(tried_paths, csv_file_path)
+    
+    -- Method 2: Try relative path from script directory
     if not file then
-        -- Try relative path from Wireshark plugins directory
         local info = debug.getinfo(1, "S")
         if info and info.source then
             local script_dir = info.source:match("@(.*/)")
             if script_dir then
-                file = io.open(script_dir .. csv_file_path, "r")
+                local path = script_dir .. csv_file_path
+                file = io.open(path, "r")
+                table.insert(tried_paths, path)
             end
         end
     end
     
+    -- Method 3: Try Wireshark personal plugins directory (macOS)
     if not file then
-        print("SC_GVCP: Warning - Could not open CSV file: " .. csv_file_path)
+        local home = os.getenv("HOME")
+        if home then
+            local path = home .. "/.local/lib/wireshark/plugins/" .. csv_file_path
+            file = io.open(path, "r")
+            table.insert(tried_paths, path)
+        end
+    end
+    
+    -- Method 4: Try hardcoded absolute path as fallback
+    if not file then
+        local path = "/Users/hanyue/Desktop/Code/smart_camera/smart1223/smart_camera/product/app_src/app/doc/" .. csv_file_path
+        file = io.open(path, "r")
+        table.insert(tried_paths, path)
+    end
+    
+    if not file then
+        print("SC_GVCP: ERROR - Could not open CSV file. Tried paths:")
+        for _, p in ipairs(tried_paths) do
+            print("  - " .. p)
+        end
         return
     end
     
@@ -38,6 +66,9 @@ local function load_csv_mapping()
     
     local count = 0
     for line in file:lines() do
+        -- Remove carriage return if present (Windows CRLF)
+        line = line:gsub("\r", "")
+        
         local name, addr = line:match("([^,]+),([^,]+)")
         if name and addr then
             -- Remove 0x prefix if present and convert to number
@@ -51,7 +82,7 @@ local function load_csv_mapping()
     end
     
     file:close()
-    print("SC_GVCP: Loaded " .. count .. " register mappings from CSV")
+    print("SC_GVCP: Successfully loaded " .. count .. " register mappings from CSV")
 end
 
 -- Load CSV on script initialization
@@ -65,6 +96,7 @@ local function get_register_name(addr)
         return string.format("0x%08X", addr)
     end
 end
+
 
 -- ============================================================================
 -- Command Definitions
