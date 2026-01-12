@@ -485,12 +485,13 @@ local function dissect_writemem_cmd(buffer, pinfo, tree, offset, length)
     return "[" .. name .. "]"
 end
 
-local function dissect_writemem_ack(buffer, pinfo, tree, offset, length, addr_from_cmd)
+local function dissect_writemem_ack(buffer, pinfo, tree, offset, length)
+    -- WRITEMEM_ACK payload: 2 bytes reserved + 2 bytes index (bytes written)
+    -- See gvcp_fill_write_memory_ack: n_size = htons(index & 0xffff) << 16
     if length >= 4 then
-        local addr = buffer(offset, 4):uint()
-        local name = get_register_name(addr)
-        tree:add(f_address, buffer(offset, 4)):append_text(" (" .. name .. ")")
-        return "[" .. name .. "]"
+        local index = buffer(offset, 2):uint()  -- First 2 bytes contain the index (big-endian after shift)
+        tree:add(f_count, buffer(offset, 2)):set_text("Bytes Written: " .. index)
+        return nil  -- Status will be shown separately
     end
     return nil
 end
