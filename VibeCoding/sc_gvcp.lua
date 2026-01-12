@@ -486,11 +486,12 @@ local function dissect_writemem_cmd(buffer, pinfo, tree, offset, length)
 end
 
 local function dissect_writemem_ack(buffer, pinfo, tree, offset, length)
-    -- WRITEMEM_ACK payload: 2 bytes reserved + 2 bytes index (bytes written)
-    -- See gvcp_fill_write_memory_ack: n_size = htons(index & 0xffff) << 16
+    -- WRITEMEM_ACK payload: 4 bytes total
+    -- n_size = htons(index & 0xffff) << 16, then memcpy 4 bytes
+    -- Network order: first 2 bytes = index, last 2 bytes = 0x0000
     if length >= 4 then
-        local index = buffer(offset, 2):uint()  -- First 2 bytes contain the index (big-endian after shift)
-        tree:add(f_count, buffer(offset, 2)):set_text("Bytes Written: " .. index)
+        local index = buffer(offset, 2):uint()  -- First 2 bytes contain the index
+        tree:add(f_count, buffer(offset, 4)):set_text("Bytes Written: " .. index)
         return nil  -- Status will be shown separately
     end
     return nil
