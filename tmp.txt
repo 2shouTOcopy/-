@@ -1,243 +1,121 @@
-// secure_log_export.cpp
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
-#include <vector>
-#include <fstream>
-#include <sstream>
+#include <regex>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 
-#include <unistd.h>     // access()
-#include <sys/stat.h>   // stat()
+// 你已有：LOGI/LOGE、SubParam、SUB_PARAM_REGULAR_EXP
 
-extern "C" {
-// 你提供的接口
-void generate_random_string(unsigned char *output, size_t len);
+// 仅允许非负 int 的安全解析：不抛异常
+static bool ParseNonNegIntSafe(const std::string& s, int& out)
+{
+    if (s.empty()) return false;
 
-int rsa_encrypt_by_keyfile(
-    const unsigned char *public_pem_file,
-    const unsigned char *inbuf,
-    size_t inlen,
-    unsigned char *outbuf,
-    size_t *outlen
-);
+    // 只允许纯数字
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+    }
 
-int32_t aes128_cbc_encrypt_hex(
-    const unsigned char *key,
-    const unsigned char *iv,
-    const unsigned char *inbuf,
-    size_t inlen,
-    unsigned char *outbuf,
-    size_t *outlen
-);
+    // 防御：数字位数过长基本一定溢出/脏数据
+    // INT_MAX=2147483647（10位），允许 10~11 位都可以，但过长没意义
+    if (s.size() > 11) return false;
+
+    errno = 0;
+    char* end = nullptr;
+    long long v = std::strtoll(s.c_str(), &end, 10);
+
+    if (end == nullptr || *end != '\0') return false;
+    if (errno == ERANGE) return false;
+    if (v < 0 || v > INT_MAX) return false;
+
+    out = static_cast<int>(v);
+    return true;
 }
 
-// ------------------------ 小工具函数 ------------------------
-
-static bool FileExists(const std::string& path)
+// suffix 校验：允许 "*" 或 非负 int（不抛异常）
+// 如果 suffix 是数字，会额外把它解析成 int 放到 outIndex（仅用于校验，调用者不需要保存也行）
+static bool ValidateSuffix(const std::string& suffix, bool& isAll, int& outIndex)
 {
-    struct stat st;
-    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+    isAll = false;
+    outIndex = -1;
+
+    if (suffix == "*")
+    {
+        isAll = true;
+        return true;
+    }
+
+    int idx = -1;
+    if (!ParseNonNegIntSafe(suffix, idx))
+        return false;
+
+    outIndex = idx;
+    return true;
 }
 
-static int ReadFileAll(const std::string& path, std::vector<uint8_t>& out)
+int CAlgoUtils::ParseSubscribeItem(const std::string &str, SubParam &item)
 {
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs.is_open()) return -1;
+    if (str.empty())
+        return -1;
 
-    ifs.seekg(0, std::ios::end);
-    std::streamoff sz = ifs.tellg();
-    if (sz < 0) return -2;
-    ifs.seekg(0, std::ios::beg);
-
-    out.resize(static_cast<size_t>(sz));
-    if (!out.empty())
+    try
     {
-        ifs.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()));
-        if (!ifs) return -3;
-    }
-    return 0;
-}
+        // 1) 使用 regex_match：要求整串符合格式（比 regex_search 更安全）
+        static const std::regex re(SUB_PARAM_REGULAR_EXP);
+        std::smatch match;
 
-static int WriteFileAll(const std::string& path, const void* data, size_t len)
-{
-    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-    if (!ofs.is_open()) return -1;
-    if (len > 0 && data)
+        // 你的正则有 5 个捕获组，所以 match.size() 必须是 6（含 group0）
+        if (!std::regex_match(str, match, re) || match.size() != 6)
+        {
+            LOGE("no match: %s\n", str.c_str());
+            return -2;
+        }
+
+        // 2) algoID 强校验：避免 stoi 抛异常导致进程 abort
+        {
+            int algoId = -1;
+            const std::string sAlgo = match.str(1);
+            if (!ParseNonNegIntSafe(sAlgo, algoId))
+            {
+                LOGE("invalid algoID: '%s', src='%s'\n", sAlgo.c_str(), str.c_str());
+                return -4;
+            }
+            item.algoID = algoId;
+        }
+
+        item.moduleName  = match.str(2);
+        item.paramName   = match.str(3);
+        item.printFormat = match.str(4);
+        item.suffix      = match.str(5); // 必有：数字 or "*"
+
+        // 3) suffix 强校验：必须是 "*" 或 非负 int，并且在 int 范围内
+        {
+            bool isAll = false;
+            int idx = -1;
+            if (!ValidateSuffix(item.suffix, isAll, idx))
+            {
+                LOGE("invalid suffix: '%s', src='%s'\n", item.suffix.c_str(), str.c_str());
+                return -5;
+            }
+
+            // 可选：如果你这里就知道 nCount（比如配置阶段已知），可以在此处做范围检查：
+            // if (!isAll && idx >= nCount) return -6;
+            // 但如果 nCount 只有运行时才知道，就不要在这里做。
+        }
+
+        LOGI("algoID: %d\n", item.algoID);
+        LOGI("moduleName: %s\n", item.moduleName.c_str());
+        LOGI("paramName: %s\n", item.paramName.c_str());
+        LOGI("printFormat: %s\n", item.printFormat.c_str());
+        LOGI("suffix: %s\n", item.suffix.c_str());
+
+        return 0;
+    }
+    catch (const std::regex_error& e)
     {
-        ofs.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
-        if (!ofs) return -2;
+        LOGE("regex_error caught: %s\n", e.what());
+        return -3;
     }
-    return 0;
-}
-
-static void SecureZero(void* p, size_t n)
-{
-    if (!p || n == 0) return;
-    volatile uint8_t* vp = reinterpret_cast<volatile uint8_t*>(p);
-    while (n--) *vp++ = 0;
-}
-
-// 使用系统 zip 打包（不压缩 -0，junk path -j）
-static int CreateZipBySystem(const std::string& outZipPath,
-                             const std::vector<std::string>& filesToAdd)
-{
-    // 你们环境可能 zip 在 /usr/bin/zip 或 /bin/zip
-    const char* zipCandidates[] = {"/usr/bin/zip", "/bin/zip", "zip"};
-    bool zipOk = false;
-    for (auto* z : zipCandidates)
-    {
-        if (std::string(z) == "zip") { zipOk = true; break; }
-        if (::access(z, X_OK) == 0) { zipOk = true; break; }
-    }
-    if (!zipOk) return -10;
-
-    std::ostringstream cmd;
-    // -0: store，不压缩；-j: 不保留路径
-    cmd << "zip -0 -j ";
-    cmd << "'" << outZipPath << "'";
-    for (const auto& f : filesToAdd)
-    {
-        cmd << " '" << f << "'";
-    }
-
-    int rc = ::system(cmd.str().c_str());
-    return (rc == 0) ? 0 : -11;
-}
-
-// ------------------------ 对外主函数 ------------------------
-
-struct SecureExportPaths
-{
-    std::string encFilePath;   // log.enc
-    std::string keyFilePath;   // key.b64
-    std::string metaFilePath;  // meta.json
-    std::string zipOutPath;    // final zip
-};
-
-/**
- * @brief  将已生成的日志zip文件进行二次加密，并打包导出（方案B）
- * @param[in]  inLogZipPath    输入：原始日志zip路径（明文zip）
- * @param[in]  publicKeyPem    输入：RSA公钥pem路径
- * @param[in]  outDir          输出：临时/输出目录（函数会在此目录写中间文件）
- * @param[in]  outZipPath      输出：最终导出zip路径
- * @param[out] outPaths        输出：生成的文件路径（可选）
- * @return 0成功，非0失败
- */
-int32_t EncryptAndPackLogZip_B(const std::string& inLogZipPath,
-                              const std::string& publicKeyPem,
-                              const std::string& outDir,
-                              const std::string& outZipPath,
-                              SecureExportPaths* outPaths)
-{
-    if (!FileExists(inLogZipPath) || !FileExists(publicKeyPem)) return -100;
-    if (outDir.empty() || outZipPath.empty()) return -101;
-
-    // 1) 读入原始zip
-    std::vector<uint8_t> plain;
-    int ret = ReadFileAll(inLogZipPath, plain);
-    if (ret != 0) return -102;
-
-    // 2) 生成 AES key/iv（16B + 16B）
-    unsigned char key[16] = {0};
-    unsigned char iv[16]  = {0};
-
-    // 注意：generate_random_string 的 len 是“目标长度+1”
-    unsigned char tmpKey[16 + 1] = {0};
-    unsigned char tmpIv[16 + 1]  = {0};
-    generate_random_string(tmpKey, sizeof(tmpKey));
-    generate_random_string(tmpIv, sizeof(tmpIv));
-    memcpy(key, tmpKey, 16);
-    memcpy(iv,  tmpIv,  16);
-
-    // 3) AES-CBC 加密（hex 输出：体积约 2 倍）
-    // 预估：hex 至少 2*inlen；若内部 padding，可能稍微多一点，预留 256 字节
-    size_t encCap = plain.size() * 2 + 256;
-    std::vector<uint8_t> encHex(encCap, 0);
-
-    size_t encLen = encCap;
-    int32_t aRet = aes128_cbc_encrypt_hex(key, iv,
-                                         plain.data(), plain.size(),
-                                         encHex.data(), &encLen);
-    if (aRet != 0) { ret = -200; goto CLEANUP; }
-    encHex.resize(encLen);
-
-    // 4) RSA 加密 key||iv（32字节），输出 base64
-    unsigned char keyIv[32] = {0};
-    memcpy(keyIv, key, 16);
-    memcpy(keyIv + 16, iv, 16);
-
-    // base64 输出长度给足：3072-bit RSA 密文 384B，base64 约 512B，预留到 1024
-    std::vector<unsigned char> rsaB64(2048, 0);
-    size_t rsaB64Len = rsaB64.size();
-    int rRet = rsa_encrypt_by_keyfile(
-        reinterpret_cast<const unsigned char*>(publicKeyPem.c_str()),
-        keyIv, sizeof(keyIv),
-        rsaB64.data(), &rsaB64Len);
-    if (rRet != 0) { ret = -201; goto CLEANUP; }
-
-    // 5) 写出三个文件到 outDir
-    const std::string encPath  = outDir + "/log.enc";
-    const std::string keyPath  = outDir + "/key.b64";
-    const std::string metaPath = outDir + "/meta.json";
-
-    ret = WriteFileAll(encPath, encHex.data(), encHex.size());
-    if (ret != 0) { ret = -300; goto CLEANUP; }
-
-    // key.b64 写入 base64 字符串（不强制加 '\n'，你需要的话可补）
-    ret = WriteFileAll(keyPath, rsaB64.data(), rsaB64Len);
-    if (ret != 0) { ret = -301; goto CLEANUP; }
-
-    // meta.json（可按你们格式调整）
-    {
-        std::ostringstream js;
-        js << "{\n";
-        js << "  \"version\": 1,\n";
-        js << "  \"content\": {\n";
-        js << "    \"src_file\": \"log.zip\",\n";
-        js << "    \"cipher_file\": \"log.enc\",\n";
-        js << "    \"cipher\": \"AES-128-CBC\",\n";
-        js << "    \"encoding\": \"HEX\",\n";
-        js << "    \"plain_size\": " << static_cast<unsigned long long>(plain.size()) << "\n";
-        js << "  },\n";
-        js << "  \"key\": {\n";
-        js << "    \"wrapped_file\": \"key.b64\",\n";
-        js << "    \"wrap\": \"RSA-PUB\",\n";
-        js << "    \"format\": \"base64\",\n";
-        js << "    \"material\": \"key16||iv16\"\n";
-        js << "  }\n";
-        js << "}\n";
-
-        const std::string s = js.str();
-        ret = WriteFileAll(metaPath, s.data(), s.size());
-        if (ret != 0) { ret = -302; goto CLEANUP; }
-    }
-
-    // 6) 打包 zip（store，不压缩）
-    {
-        std::vector<std::string> files = {encPath, keyPath, metaPath};
-        ret = CreateZipBySystem(outZipPath, files);
-        if (ret != 0) { ret = -400; goto CLEANUP; }
-    }
-
-    if (outPaths)
-    {
-        outPaths->encFilePath  = encPath;
-        outPaths->keyFilePath  = keyPath;
-        outPaths->metaFilePath = metaPath;
-        outPaths->zipOutPath   = outZipPath;
-    }
-
-    ret = 0;
-
-CLEANUP:
-    // 清理敏感数据
-    SecureZero(key, sizeof(key));
-    SecureZero(iv, sizeof(iv));
-    SecureZero(tmpKey, sizeof(tmpKey));
-    SecureZero(tmpIv, sizeof(tmpIv));
-    SecureZero(keyIv, sizeof(keyIv));
-    if (!plain.empty()) SecureZero(plain.data(), plain.size());
-    return ret;
 }
