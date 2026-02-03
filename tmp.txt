@@ -1,121 +1,116 @@
-#include <string>
-#include <regex>
-#include <cerrno>
-#include <climits>
-#include <cstdlib>
-
-// 你已有：LOGI/LOGE、SubParam、SUB_PARAM_REGULAR_EXP
-
-// 仅允许非负 int 的安全解析：不抛异常
-static bool ParseNonNegIntSafe(const std::string& s, int& out)
+int CAlgo::encMaskImg(const char *name,
+                      unsigned int srcWidth, unsigned int srcHeight, void *srcData,
+                      unsigned int dstWidth, unsigned int dstHeight,
+                      Infra::DataBufferPtr &pImg)
 {
-    if (s.empty()) return false;
-
-    // 只允许纯数字
-    for (size_t i = 0; i < s.size(); ++i)
+    if (!name || !srcData || srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0)
     {
-        if (s[i] < '0' || s[i] > '9')
-            return false;
+        LOGE("invalid args: name=%p srcData=%p src=%ux%u dst=%ux%u\n",
+             name, srcData, srcWidth, srcHeight, dstWidth, dstHeight);
+        return IMVS_EC_ALGO_IMAGE_VENC;
     }
 
-    // 防御：数字位数过长基本一定溢出/脏数据
-    // INT_MAX=2147483647（10位），允许 10~11 位都可以，但过长没意义
-    if (s.size() > 11) return false;
+    IspImgProImgInfoEx image_info = {0};
+    image_info.pixformat = ISP_IMG_FMT_PIXEL_FORMAT_YUV_400;
+    image_info.width = srcWidth;
+    image_info.height = srcHeight;
+    image_info.step[0] = srcWidth;
+    image_info.data[0] = srcData;
+    image_info.phy[0] = MMZmemGetPhyAddr(image_info.data[0]);
 
-    errno = 0;
-    char* end = nullptr;
-    long long v = std::strtoll(s.c_str(), &end, 10);
-
-    if (end == nullptr || *end != '\0') return false;
-    if (errno == ERANGE) return false;
-    if (v < 0 || v > INT_MAX) return false;
-
-    out = static_cast<int>(v);
-    return true;
-}
-
-// suffix 校验：允许 "*" 或 非负 int（不抛异常）
-// 如果 suffix 是数字，会额外把它解析成 int 放到 outIndex（仅用于校验，调用者不需要保存也行）
-static bool ValidateSuffix(const std::string& suffix, bool& isAll, int& outIndex)
-{
-    isAll = false;
-    outIndex = -1;
-
-    if (suffix == "*")
+    // 如果 phy 必须有效，可以直接强校验
+    if (image_info.phy[0] == 0)
     {
-        isAll = true;
-        return true;
+        LOGW("srcData has no valid phy addr, srcData=%p, maybe not MMZ\n", srcData);
+        // 如果你们 ISP 必须要 phy，这里建议 return error
+        // return IMVS_EC_ALGO_IMAGE_VENC;
     }
 
-    int idx = -1;
-    if (!ParseNonNegIntSafe(suffix, idx))
-        return false;
+    // 关键：把缩放后的 buffer 放在 if 外，保证生命周期覆盖到编码结束
+    Infra::DataBufferPtr scaledImgBuf;
 
-    outIndex = idx;
-    return true;
-}
-
-int CAlgoUtils::ParseSubscribeItem(const std::string &str, SubParam &item)
-{
-    if (str.empty())
-        return -1;
-
-    try
+    // 源图像尺寸大于目标图像尺寸时，需要先进行降采样处理
+    if (srcWidth > dstWidth || srcHeight > dstHeight)
     {
-        // 1) 使用 regex_match：要求整串符合格式（比 regex_search 更安全）
-        static const std::regex re(SUB_PARAM_REGULAR_EXP);
-        std::smatch match;
+        IspImgProImgInfo stImageInfo = {ISP_IMG_FMT_JPEG, 0};
+        stImageInfo.data[0] = srcData;
+        stImageInfo.width = srcWidth;
+        stImageInfo.height = srcHeight;
+        stImageInfo.step[0] = srcWidth;
+        stImageInfo.pixformat = static_cast<IspImgFormat>(ISP_IMG_FMT_PIXEL_FORMAT_YUV_400);
 
-        // 你的正则有 5 个捕获组，所以 match.size() 必须是 6（含 group0）
-        if (!std::regex_match(str, match, re) || match.size() != 6)
+        // 如果你的 scaler 有 stride 对齐要求，这里应改成 stride*dstHeight
+        unsigned int tmpImgLen = dstWidth * dstHeight;
+
+        scaledImgBuf = Infra::DataBufferPtr(new Adapter::MMZPoolBuffer(tmpImgLen, 8, name));
+        if (!scaledImgBuf || !scaledImgBuf->isValid())
         {
-            LOGE("no match: %s\n", str.c_str());
-            return -2;
+            LOGE("scaled buf invalid. size:%u align:%d name:%s\n", tmpImgLen, 8, name);
+            return IMVS_EC_ALGO_IMAGE_VENC;
         }
 
-        // 2) algoID 强校验：避免 stoi 抛异常导致进程 abort
+        IspImgFillImgInfo tmpfillInfo = {nullptr, 0};
+        tmpfillInfo.fill_width = dstWidth;
+        tmpfillInfo.fill_height = dstHeight;
+        tmpfillInfo.img_buf = scaledImgBuf->modifyBuffer();
+        tmpfillInfo.src_img_len = scaledImgBuf->capacity();
+
+        int ret = Parameter::IParamCtrl::getComponent()->getIspCtrl(0)->set(
+            ISP_PT_IMG_SCALE_REENTRANT, &stImageInfo, sizeof(stImageInfo), &tmpfillInfo);
+        if (ret < 0)
         {
-            int algoId = -1;
-            const std::string sAlgo = match.str(1);
-            if (!ParseNonNegIntSafe(sAlgo, algoId))
-            {
-                LOGE("invalid algoID: '%s', src='%s'\n", sAlgo.c_str(), str.c_str());
-                return -4;
-            }
-            item.algoID = algoId;
+            LOGE("raw scale fail ret:0x%x\n", ret);
+            return IMVS_EC_ALGO_IMAGE_SCALE;
         }
 
-        item.moduleName  = match.str(2);
-        item.paramName   = match.str(3);
-        item.printFormat = match.str(4);
-        item.suffix      = match.str(5); // 必有：数字 or "*"
+        image_info.pixformat = ISP_IMG_FMT_PIXEL_FORMAT_YUV_400;
+        image_info.width = dstWidth;
+        image_info.height = dstHeight;
+        image_info.step[0] = dstWidth;  // 若 scaler 输出 stride 对齐，这里也要同步
+        image_info.data[0] = scaledImgBuf->modifyBuffer();
+        image_info.phy[0] = MMZmemGetPhyAddr(image_info.data[0]);
 
-        // 3) suffix 强校验：必须是 "*" 或 非负 int，并且在 int 范围内
+        if (image_info.phy[0] == 0)
         {
-            bool isAll = false;
-            int idx = -1;
-            if (!ValidateSuffix(item.suffix, isAll, idx))
-            {
-                LOGE("invalid suffix: '%s', src='%s'\n", item.suffix.c_str(), str.c_str());
-                return -5;
-            }
-
-            // 可选：如果你这里就知道 nCount（比如配置阶段已知），可以在此处做范围检查：
-            // if (!isAll && idx >= nCount) return -6;
-            // 但如果 nCount 只有运行时才知道，就不要在这里做。
+            LOGE("scaled buffer has no valid phy addr, buf=%p\n", image_info.data[0]);
+            return IMVS_EC_ALGO_IMAGE_VENC;
         }
-
-        LOGI("algoID: %d\n", item.algoID);
-        LOGI("moduleName: %s\n", item.moduleName.c_str());
-        LOGI("paramName: %s\n", item.paramName.c_str());
-        LOGI("printFormat: %s\n", item.printFormat.c_str());
-        LOGI("suffix: %s\n", item.suffix.c_str());
-
-        return 0;
     }
-    catch (const std::regex_error& e)
+
+    // 输出 buffer：至少给 dstWidth*dstHeight 的下限，再加点冗余更安全（按你们 ISP 习惯调）
+    unsigned int minRaw = dstWidth * dstHeight;
+    unsigned int dstImgLen = minRaw + 64 * 1024; // 简单粗暴的安全余量（可按经验调整）
+
+    Infra::DataBufferPtr pImgBuf = Infra::DataBufferPtr(new Adapter::MMZPoolBuffer(dstImgLen, 8, name));
+    if (!pImgBuf || !pImgBuf->isValid())
     {
-        LOGE("regex_error caught: %s\n", e.what());
-        return -3;
+        LOGW("buf invalid. size:%u align:%d name:%s\n", dstImgLen, 8, name);
+        return IMVS_EC_ALGO_IMAGE_VENC;
     }
+
+    IspImgFillImgInfo fillInfo = {nullptr, 0};
+    fillInfo.img_buf = pImgBuf->modifyBuffer();
+    fillInfo.src_img_len = pImgBuf->capacity();
+    fillInfo.fill_width = dstWidth;
+    fillInfo.fill_height = dstHeight;
+    fillInfo.fill_img_len = 0;
+
+    int ret = Parameter::IParamCtrl::getComponent()->getIspCtrl(0)->set(
+        ISP_PT_IMG_ENC_JPG_EX, &image_info, sizeof(image_info), &fillInfo);
+
+    if (ret != 0)
+    {
+        LOGE("venc_jpeg fail ret:0x%x\n", ret);
+        return IMVS_EC_ALGO_IMAGE_VENC;
+    }
+
+    if (fillInfo.fill_img_len == 0 || fillInfo.fill_img_len > pImgBuf->capacity())
+    {
+        LOGE("invalid jpeg len:%u capacity:%u\n", fillInfo.fill_img_len, pImgBuf->capacity());
+        return IMVS_EC_ALGO_IMAGE_VENC;
+    }
+
+    pImgBuf->resize(fillInfo.fill_img_len);
+    pImg = pImgBuf;
+    return 0;
 }
