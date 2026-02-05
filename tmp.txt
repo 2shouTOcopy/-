@@ -1,116 +1,96 @@
-int CAlgo::encMaskImg(const char *name,
-                      unsigned int srcWidth, unsigned int srcHeight, void *srcData,
-                      unsigned int dstWidth, unsigned int dstHeight,
-                      Infra::DataBufferPtr &pImg)
+(gdb) disassemble
+Dump of assembler code for function _ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE:
+   0x0000007fbaae4420 <+0>:     stp     x29, x30, [sp, #-64]!
+   0x0000007fbaae4424 <+4>:     mov     x29, sp
+   0x0000007fbaae4428 <+8>:     str     x0, [sp, #56]
+   0x0000007fbaae442c <+12>:    str     x1, [sp, #48]
+   0x0000007fbaae4430 <+16>:    str     x2, [sp, #40]
+   0x0000007fbaae4434 <+20>:    str     x3, [sp, #32]
+   0x0000007fbaae4438 <+24>:    str     x4, [sp, #24]
+   0x0000007fbaae443c <+28>:    ldr     x0, [sp, #24]
+=> 0x0000007fbaae4440 <+32>:    ldr     x0, [x0, #72]
+   0x0000007fbaae4444 <+36>:    ldr     x1, [sp, #32]
+   0x0000007fbaae4448 <+40>:    cmp     x1, x0
+   0x0000007fbaae444c <+44>:    b.ne    0x7fbaae4488 <_ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE+104>  // b.any
+   0x0000007fbaae4450 <+48>:    ldr     x0, [sp, #24]
+   0x0000007fbaae4454 <+52>:    bl      0x7fbaa8f080 <_ZNSt8__detail21_Hash_node_value_baseISt4pairIKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_EE4_M_vEv@plt>
+   0x0000007fbaae4458 <+56>:    mov     x1, x0
+   0x0000007fbaae445c <+60>:    ldr     x0, [sp, #48]
+   0x0000007fbaae4460 <+64>:    bl      0x7fbaa8eca0 <_ZNKSt8__detail10_Select1stclIRSt4pairIKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_EEEDTcl3getILi0EEcl7forwardIT_Efp_EEEOSC_@plt>
+   0x0000007fbaae4464 <+68>:    mov     x2, x0
+   0x0000007fbaae4468 <+72>:    ldr     x1, [sp, #40]
+   0x0000007fbaae446c <+76>:    ldr     x0, [sp, #56]
+   0x0000007fbaae4470 <+80>:    bl      0x7fbaa996d0 <_ZNKSt8equal_toINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEEclERKS5_S8_@plt>
+   0x0000007fbaae4474 <+84>:    and     w0, w0, #0xff
+   0x0000007fbaae4478 <+88>:    cmp     w0, #0x0
+   0x0000007fbaae447c <+92>:    b.eq    0x7fbaae4488 <_ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE+104>  // b.none
+   0x0000007fbaae4480 <+96>:    mov     w0, #0x1                        // #1
+   0x0000007fbaae4484 <+100>:   b       0x7fbaae448c <_ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE+108>
+   0x0000007fbaae4488 <+104>:   mov     w0, #0x0                        // #0
+   0x0000007fbaae448c <+108>:   ldp     x29, x30, [sp], #64
+   0x0000007fbaae4490 <+112>:   ret
+End of assembler dump.
+
+(gdb) bt
+#0  0x0000007fbaae4440 in std::__detail::_Equal_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, unsigned long, true>::_S_equals(std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::__detail::_Select1st const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long, std::__detail::_Hash_node<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, true>*) () from /lib/libscheduler.so
+#1  0x0000007fbaae3590 in std::__detail::_Hashtable_base<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Hashtable_traits<true, false, true> >::_M_equals(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long, std::__detail::_Hash_node<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, true>*) const ()
+   from /lib/libscheduler.so
+#2  0x0000007fbaae1fd0 in std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_before_node(unsigned long, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long) const () from /lib/libscheduler.so
+#3  0x0000007fbaae03b8 in std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_node(unsigned long, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long) const () from /lib/libscheduler.so
+
+#4  0x0000007fbaadecc8 in std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) () from /lib/libscheduler.so
+
+#5  0x0000007f31f6e5ec in std::unordered_map<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > >::find (
+    __x=..., this=0x7f31a070c8) at /opt/aarch/aarch64-ca53-linux-gnueabihf-8.4/aarch64-ca53-linux-gnu/include/c++/8.4.0/bits/unordered_map.h:920
+
+#6  ThreadProcessScheduledTrans (argv=0x7f31a07010) at iomodule.cpp:227
+
+
+这是一个崩溃，帮我分析原因
+下面是代码逻辑
+void ThreadProcessScheduledTrans(IN void* argv)
 {
-    if (!name || !srcData || srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0)
-    {
-        LOGE("invalid args: name=%p srcData=%p src=%ux%u dst=%ux%u\n",
-             name, srcData, srcWidth, srcHeight, dstWidth, dstHeight);
-        return IMVS_EC_ALGO_IMAGE_VENC;
-    }
+	char szGetString[MAX_SCHEDULED_PAYLOAD_LEN] = {0};
+	int nErrCode = IMVS_EC_OK;
+	int nTriggerCount = 0;
+	int nTriggerMode = 0;
+	int nScheduledTransEnable = 0;
+	int nScheduledTransTime = 0;
+	int nMoudleEnable = 0;
+	uint64_t nCapImageTime = 0;
+	CIoModule* pUserModule = (CIoModule*)argv;
+	struct simple_fifo *q = &(pUserModule->m_struScheduledQueue);
+	scheduled_fifo_param param = {0};
+	
+	int i = 0;
+	int j = 0;
+	char buf[PARAM_VALUE_LEN] = {0};
+	int IOOutputEn = 0;
+	int nIOHoldType = 0;
+	int IOOutType = -1;
+	int nRelateIndex = 0;  			 //设给FPGA的IO index
+	cJSON *js_root = NULL;
+	cJSON *js_child = NULL;
+	char name[MAX_NAME_LEN] = {0};  //客户端上显示的参数名称
+	int index = 0;					//客户端上显示的IO index
 
-    IspImgProImgInfoEx image_info = {0};
-    image_info.pixformat = ISP_IMG_FMT_PIXEL_FORMAT_YUV_400;
-    image_info.width = srcWidth;
-    image_info.height = srcHeight;
-    image_info.step[0] = srcWidth;
-    image_info.data[0] = srcData;
-    image_info.phy[0] = MMZmemGetPhyAddr(image_info.data[0]);
+	snprintf(szGetString, sizeof(szGetString), "%s_io", SCHEDULED_NAME);
+	set_pthread_name(szGetString);
+	set_thread_core_bind(0);
 
-    // 如果 phy 必须有效，可以直接强校验
-    if (image_info.phy[0] == 0)
-    {
-        LOGW("srcData has no valid phy addr, srcData=%p, maybe not MMZ\n", srcData);
-        // 如果你们 ISP 必须要 phy，这里建议 return error
-        // return IMVS_EC_ALGO_IMAGE_VENC;
-    }
-
-    // 关键：把缩放后的 buffer 放在 if 外，保证生命周期覆盖到编码结束
-    Infra::DataBufferPtr scaledImgBuf;
-
-    // 源图像尺寸大于目标图像尺寸时，需要先进行降采样处理
-    if (srcWidth > dstWidth || srcHeight > dstHeight)
-    {
-        IspImgProImgInfo stImageInfo = {ISP_IMG_FMT_JPEG, 0};
-        stImageInfo.data[0] = srcData;
-        stImageInfo.width = srcWidth;
-        stImageInfo.height = srcHeight;
-        stImageInfo.step[0] = srcWidth;
-        stImageInfo.pixformat = static_cast<IspImgFormat>(ISP_IMG_FMT_PIXEL_FORMAT_YUV_400);
-
-        // 如果你的 scaler 有 stride 对齐要求，这里应改成 stride*dstHeight
-        unsigned int tmpImgLen = dstWidth * dstHeight;
-
-        scaledImgBuf = Infra::DataBufferPtr(new Adapter::MMZPoolBuffer(tmpImgLen, 8, name));
-        if (!scaledImgBuf || !scaledImgBuf->isValid())
-        {
-            LOGE("scaled buf invalid. size:%u align:%d name:%s\n", tmpImgLen, 8, name);
-            return IMVS_EC_ALGO_IMAGE_VENC;
-        }
-
-        IspImgFillImgInfo tmpfillInfo = {nullptr, 0};
-        tmpfillInfo.fill_width = dstWidth;
-        tmpfillInfo.fill_height = dstHeight;
-        tmpfillInfo.img_buf = scaledImgBuf->modifyBuffer();
-        tmpfillInfo.src_img_len = scaledImgBuf->capacity();
-
-        int ret = Parameter::IParamCtrl::getComponent()->getIspCtrl(0)->set(
-            ISP_PT_IMG_SCALE_REENTRANT, &stImageInfo, sizeof(stImageInfo), &tmpfillInfo);
-        if (ret < 0)
-        {
-            LOGE("raw scale fail ret:0x%x\n", ret);
-            return IMVS_EC_ALGO_IMAGE_SCALE;
-        }
-
-        image_info.pixformat = ISP_IMG_FMT_PIXEL_FORMAT_YUV_400;
-        image_info.width = dstWidth;
-        image_info.height = dstHeight;
-        image_info.step[0] = dstWidth;  // 若 scaler 输出 stride 对齐，这里也要同步
-        image_info.data[0] = scaledImgBuf->modifyBuffer();
-        image_info.phy[0] = MMZmemGetPhyAddr(image_info.data[0]);
-
-        if (image_info.phy[0] == 0)
-        {
-            LOGE("scaled buffer has no valid phy addr, buf=%p\n", image_info.data[0]);
-            return IMVS_EC_ALGO_IMAGE_VENC;
-        }
-    }
-
-    // 输出 buffer：至少给 dstWidth*dstHeight 的下限，再加点冗余更安全（按你们 ISP 习惯调）
-    unsigned int minRaw = dstWidth * dstHeight;
-    unsigned int dstImgLen = minRaw + 64 * 1024; // 简单粗暴的安全余量（可按经验调整）
-
-    Infra::DataBufferPtr pImgBuf = Infra::DataBufferPtr(new Adapter::MMZPoolBuffer(dstImgLen, 8, name));
-    if (!pImgBuf || !pImgBuf->isValid())
-    {
-        LOGW("buf invalid. size:%u align:%d name:%s\n", dstImgLen, 8, name);
-        return IMVS_EC_ALGO_IMAGE_VENC;
-    }
-
-    IspImgFillImgInfo fillInfo = {nullptr, 0};
-    fillInfo.img_buf = pImgBuf->modifyBuffer();
-    fillInfo.src_img_len = pImgBuf->capacity();
-    fillInfo.fill_width = dstWidth;
-    fillInfo.fill_height = dstHeight;
-    fillInfo.fill_img_len = 0;
-
-    int ret = Parameter::IParamCtrl::getComponent()->getIspCtrl(0)->set(
-        ISP_PT_IMG_ENC_JPG_EX, &image_info, sizeof(image_info), &fillInfo);
-
-    if (ret != 0)
-    {
-        LOGE("venc_jpeg fail ret:0x%x\n", ret);
-        return IMVS_EC_ALGO_IMAGE_VENC;
-    }
-
-    if (fillInfo.fill_img_len == 0 || fillInfo.fill_img_len > pImgBuf->capacity())
-    {
-        LOGE("invalid jpeg len:%u capacity:%u\n", fillInfo.fill_img_len, pImgBuf->capacity());
-        return IMVS_EC_ALGO_IMAGE_VENC;
-    }
-
-    pImgBuf->resize(fillInfo.fill_img_len);
-    pImg = pImgBuf;
-    return 0;
+	while(1)
+	{
+		auto iter = pUserModule->m_mapParam.find(IO_ENABLE);
+		if (iter != pUserModule->m_mapParam.end())
+		{ 
+			nMoudleEnable = strtol(iter->second.c_str(), NULL, 0);
+		}
+		//省略
+	}
 }
+崩溃在pUserModule->m_mapParam.find
+int CIoModule::Init()
+{
+		nRet = pthreadSpawnEx(&m_nThreadScheduledTrans, 1, SCHED_POLICY_OTHER, SCHED_PRI_NA, 10 * 1024, (void *)ThreadProcessScheduledTrans, 1, (void *)this);
+}
+这个是CIoModule类的一个线程，这个io类会创建，但实际没用上相关功能
