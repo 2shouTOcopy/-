@@ -1,96 +1,127 @@
-(gdb) disassemble
-Dump of assembler code for function _ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE:
-   0x0000007fbaae4420 <+0>:     stp     x29, x30, [sp, #-64]!
-   0x0000007fbaae4424 <+4>:     mov     x29, sp
-   0x0000007fbaae4428 <+8>:     str     x0, [sp, #56]
-   0x0000007fbaae442c <+12>:    str     x1, [sp, #48]
-   0x0000007fbaae4430 <+16>:    str     x2, [sp, #40]
-   0x0000007fbaae4434 <+20>:    str     x3, [sp, #32]
-   0x0000007fbaae4438 <+24>:    str     x4, [sp, #24]
-   0x0000007fbaae443c <+28>:    ldr     x0, [sp, #24]
-=> 0x0000007fbaae4440 <+32>:    ldr     x0, [x0, #72]
-   0x0000007fbaae4444 <+36>:    ldr     x1, [sp, #32]
-   0x0000007fbaae4448 <+40>:    cmp     x1, x0
-   0x0000007fbaae444c <+44>:    b.ne    0x7fbaae4488 <_ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE+104>  // b.any
-   0x0000007fbaae4450 <+48>:    ldr     x0, [sp, #24]
-   0x0000007fbaae4454 <+52>:    bl      0x7fbaa8f080 <_ZNSt8__detail21_Hash_node_value_baseISt4pairIKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_EE4_M_vEv@plt>
-   0x0000007fbaae4458 <+56>:    mov     x1, x0
-   0x0000007fbaae445c <+60>:    ldr     x0, [sp, #48]
-   0x0000007fbaae4460 <+64>:    bl      0x7fbaa8eca0 <_ZNKSt8__detail10_Select1stclIRSt4pairIKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_EEEDTcl3getILi0EEcl7forwardIT_Efp_EEEOSC_@plt>
-   0x0000007fbaae4464 <+68>:    mov     x2, x0
-   0x0000007fbaae4468 <+72>:    ldr     x1, [sp, #40]
-   0x0000007fbaae446c <+76>:    ldr     x0, [sp, #56]
-   0x0000007fbaae4470 <+80>:    bl      0x7fbaa996d0 <_ZNKSt8equal_toINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEEclERKS5_S8_@plt>
-   0x0000007fbaae4474 <+84>:    and     w0, w0, #0xff
-   0x0000007fbaae4478 <+88>:    cmp     w0, #0x0
-   0x0000007fbaae447c <+92>:    b.eq    0x7fbaae4488 <_ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE+104>  // b.none
-   0x0000007fbaae4480 <+96>:    mov     w0, #0x1                        // #1
-   0x0000007fbaae4484 <+100>:   b       0x7fbaae448c <_ZNSt8__detail13_Equal_helperINSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEESt4pairIKS6_S6_ENS_10_Select1stESt8equal_toIS6_EmLb1EE9_S_equalsERKSC_RKSA_RS8_mPNS_10_Hash_nodeIS9_Lb1EEE+108>
-   0x0000007fbaae4488 <+104>:   mov     w0, #0x0                        // #0
-   0x0000007fbaae448c <+108>:   ldp     x29, x30, [sp], #64
-   0x0000007fbaae4490 <+112>:   ret
-End of assembler dump.
+#include <cmath>
+#include <cctype>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <string>
 
-(gdb) bt
-#0  0x0000007fbaae4440 in std::__detail::_Equal_helper<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, unsigned long, true>::_S_equals(std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const&, std::__detail::_Select1st const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long, std::__detail::_Hash_node<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, true>*) () from /lib/libscheduler.so
-#1  0x0000007fbaae3590 in std::__detail::_Hashtable_base<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Hashtable_traits<true, false, true> >::_M_equals(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long, std::__detail::_Hash_node<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, true>*) const ()
-   from /lib/libscheduler.so
-#2  0x0000007fbaae1fd0 in std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_before_node(unsigned long, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long) const () from /lib/libscheduler.so
-#3  0x0000007fbaae03b8 in std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::_M_find_node(unsigned long, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned long) const () from /lib/libscheduler.so
-
-#4  0x0000007fbaadecc8 in std::_Hashtable<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >, std::__detail::_Select1st, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) () from /lib/libscheduler.so
-
-#5  0x0000007f31f6e5ec in std::unordered_map<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::hash<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::equal_to<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > >::find (
-    __x=..., this=0x7f31a070c8) at /opt/aarch/aarch64-ca53-linux-gnueabihf-8.4/aarch64-ca53-linux-gnu/include/c++/8.4.0/bits/unordered_map.h:920
-
-#6  ThreadProcessScheduledTrans (argv=0x7f31a07010) at iomodule.cpp:227
-
-
-这是一个崩溃，帮我分析原因
-下面是代码逻辑
-void ThreadProcessScheduledTrans(IN void* argv)
+class CFormatter
 {
-	char szGetString[MAX_SCHEDULED_PAYLOAD_LEN] = {0};
-	int nErrCode = IMVS_EC_OK;
-	int nTriggerCount = 0;
-	int nTriggerMode = 0;
-	int nScheduledTransEnable = 0;
-	int nScheduledTransTime = 0;
-	int nMoudleEnable = 0;
-	uint64_t nCapImageTime = 0;
-	CIoModule* pUserModule = (CIoModule*)argv;
-	struct simple_fifo *q = &(pUserModule->m_struScheduledQueue);
-	scheduled_fifo_param param = {0};
-	
-	int i = 0;
-	int j = 0;
-	char buf[PARAM_VALUE_LEN] = {0};
-	int IOOutputEn = 0;
-	int nIOHoldType = 0;
-	int IOOutType = -1;
-	int nRelateIndex = 0;  			 //设给FPGA的IO index
-	cJSON *js_root = NULL;
-	cJSON *js_child = NULL;
-	char name[MAX_NAME_LEN] = {0};  //客户端上显示的参数名称
-	int index = 0;					//客户端上显示的IO index
+protected:
+    std::string formatStr;
+    std::string sepStr;
+public:
+    CFormatter(const std::string& fmt, const std::string& sep) : formatStr(fmt), sepStr(sep) {}
+    virtual ~CFormatter() = default;
+    virtual std::string format() = 0;
+};
 
-	snprintf(szGetString, sizeof(szGetString), "%s_io", SCHEDULED_NAME);
-	set_pthread_name(szGetString);
-	set_thread_core_bind(0);
-
-	while(1)
-	{
-		auto iter = pUserModule->m_mapParam.find(IO_ENABLE);
-		if (iter != pUserModule->m_mapParam.end())
-		{ 
-			nMoudleEnable = strtol(iter->second.c_str(), NULL, 0);
-		}
-		//省略
-	}
-}
-崩溃在pUserModule->m_mapParam.find
-int CIoModule::Init()
+class FloatFormatter : public CFormatter
 {
-		nRet = pthreadSpawnEx(&m_nThreadScheduledTrans, 1, SCHED_POLICY_OTHER, SCHED_PRI_NA, 10 * 1024, (void *)ThreadProcessScheduledTrans, 1, (void *)this);
-}
-这个是CIoModule类的一个线程，这个io类会创建，但实际没用上相关功能
+    double value; // 用 double 做计算，避免 float 误差放大
+
+    static bool parseWidthPrecision(const std::string& fmt, int& width, int& precision)
+    {
+        // 支持 "1.3" / "%1.3f" / "%01.3f" / "  %8.2f " 等
+        std::string s;
+        s.reserve(fmt.size());
+        for (char c : fmt)
+        {
+            if (!std::isspace(static_cast<unsigned char>(c)))
+                s.push_back(c);
+        }
+
+        // 去掉开头 '%'
+        if (!s.empty() && s[0] == '%') s.erase(s.begin());
+
+        // 去掉末尾类型字符，比如 'f'
+        if (!s.empty() && (s.back() == 'f' || s.back() == 'F'))
+            s.pop_back();
+
+        // 允许前导 0（比如 01.3）
+        // 手写解析：读取 width（可为空），遇到 '.' 再读 precision（可为空）
+        width = 0;
+        precision = 0;
+
+        size_t i = 0;
+        bool hasWidth = false;
+
+        // width
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
+        {
+            hasWidth = true;
+            width = width * 10 + (s[i] - '0');
+            ++i;
+        }
+
+        if (i >= s.size() || s[i] != '.')
+        {
+            // 没有 '.' 就认为解析失败（你当前需求是 width.precision）
+            return false;
+        }
+        ++i; // skip '.'
+
+        bool hasPrec = false;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
+        {
+            hasPrec = true;
+            precision = precision * 10 + (s[i] - '0');
+            ++i;
+        }
+
+        return hasWidth && hasPrec;
+    }
+
+public:
+    FloatFormatter(float v, const std::string& fmt, const std::string& sep)
+        : CFormatter(fmt, sep), value(static_cast<double>(v)) {}
+
+    std::string format() override
+    {
+        int width = 0, precision = 0;
+        if (!parseWidthPrecision(formatStr, width, precision))
+        {
+            // 兜底：如果 formatStr 不是 "w.p" 格式，就给一个安全默认值
+            width = 1;
+            precision = 3;
+        }
+
+        // 特殊值处理
+        if (std::isnan(value)) return "nan";
+        if (std::isinf(value)) return (value < 0) ? "-inf" : "inf";
+
+        bool isNegative = std::signbit(value);
+        double absValue = std::fabs(value);
+
+        // 防止 precision 太大导致 10^precision 溢出
+        if (precision < 0) precision = 0;
+        if (precision > 18) precision = 18; // long long 安全范围内的实用上限
+
+        long long scale = 1;
+        for (int i = 0; i < precision; ++i) scale *= 10;
+
+        // 关键：这里做四舍五入，并自动处理 91.999 -> 92.000 的进位
+        long long scaled = llround(absValue * static_cast<double>(scale));
+        long long integerPart = (scale == 0) ? scaled : (scaled / scale);
+        long long fracPart = (scale == 0) ? 0 : (scaled % scale);
+
+        // 整数部分（左侧 0 填充）
+        std::ostringstream intStream;
+        intStream << std::setw(width) << std::setfill('0') << integerPart;
+        std::string intStr = intStream.str();
+
+        // 小数部分（固定 precision 位，左侧补 0）
+        std::ostringstream fracStream;
+        if (precision > 0)
+        {
+            fracStream << std::setw(precision) << std::setfill('0') << fracPart;
+        }
+
+        // 负号：注意 -0.xxx 也要带 '-'
+        if (isNegative && (integerPart != 0 || fracPart != 0))
+            intStr = "-" + intStr;
+
+        if (precision == 0) return intStr;
+        return intStr + "." + fracStream.str();
+    }
+};
