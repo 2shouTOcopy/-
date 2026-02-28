@@ -1,49 +1,73 @@
-// float_formatter_demo.cpp
 #include <cmath>
 #include <cctype>
-#include <cstdint>
-#include <cstdlib>
 #include <iomanip>
-#include <iostream>
 #include <limits>
 #include <sstream>
 #include <string>
-#include <vector>
 
-////////////////////////////////////////////////////////////////
-// Minimal base class (same idea as your code)
-////////////////////////////////////////////////////////////////
-class CFormatter
-{
-protected:
-    std::string formatStr; // e.g. "%1.3f"
-    std::string sepStr;
-
-public:
-    CFormatter(const std::string& fmt, const std::string& sep)
-        : formatStr(fmt), sepStr(sep) {}
-    virtual ~CFormatter() = default;
-
-    virtual std::string format() = 0;
-};
-
-////////////////////////////////////////////////////////////////
-// Fixed FloatFormatter: scaling + llround to handle carry
-////////////////////////////////////////////////////////////////
 class FloatFormatter : public CFormatter
 {
-    double value; // compute in double for stability
+public:
+    FloatFormatter(float v, const std::string& fmt, const std::string& sep)
+        : CFormatter(fmt, sep), value_(static_cast<double>(v))
+    {
+    }
 
+    std::string format() override
+    {
+        FmtSpec spec;
+        if (!ParseFmtSpec(formatStr, spec))
+        {
+            // Fallback: keep safe defaults if fmt is malformed
+            spec.width = 1;
+            spec.precision = 3;
+        }
+
+        if (std::isnan(value_)) return "nan";
+        if (std::isinf(value_)) return (value_ < 0) ? "-inf" : "inf";
+
+        const bool isNegative = std::signbit(value_);
+        const double absValue = std::fabs(value_);
+
+        const long long scale = Pow10(spec.precision);
+
+        // Core fix:
+        // Round after scaling so carry is correctly applied.
+        // Example: 91.999913 with precision=3:
+        // absValue*1000 = 91999.913 -> llround = 92000 -> 92.000
+        const long long scaled = llround(absValue * static_cast<double>(scale));
+
+        const long long integerPart = (spec.precision == 0) ? scaled : (scaled / scale);
+        const long long fracPart    = (spec.precision == 0) ? 0     : (scaled % scale);
+
+        std::string intStr = FormatInteger(integerPart, spec.width);
+
+        // If rounding leads to exact 0, avoid "-0.000"
+        if (isNegative && (integerPart != 0 || fracPart != 0))
+        {
+            intStr = "-" + intStr;
+        }
+
+        if (spec.precision == 0)
+        {
+            return intStr;
+        }
+
+        const std::string fracStr = FormatFraction(fracPart, spec.precision);
+        return intStr + "." + fracStr;
+    }
+
+private:
     struct FmtSpec
     {
         int width = 1;
         int precision = 3;
     };
 
-    // Parse "%<width>.<precision>f"
-    // Accept also "%01.3f", "%8.0f", spaces around.
-    static bool parseFmt(const std::string& fmt, FmtSpec& out)
+    // Parse format like: "%1.3f", "%05.2f", "%8.0f"
+    static bool ParseFmtSpec(const std::string& fmt, FmtSpec& out)
     {
+        // Remove spaces
         std::string s;
         s.reserve(fmt.size());
         for (char c : fmt)
@@ -51,281 +75,71 @@ class FloatFormatter : public CFormatter
             if (!std::isspace(static_cast<unsigned char>(c)))
                 s.push_back(c);
         }
-        if (s.empty()) return false;
-        if (s[0] != '%') return false;
+
+        if (s.size() < 4) return false;
+        if (s.front() != '%') return false;
         if (s.back() != 'f' && s.back() != 'F') return false;
 
-        // strip leading '%' and trailing 'f'
+        // Strip '%' and trailing 'f'
         s.erase(s.begin());
         s.pop_back();
 
-        // parse width
-        // allow leading '0' (zero pad flag), but we interpret it as:
-        // - still parse width digits
-        // - we always do zero fill for integer part in this formatter anyway.
+        // Parse width (digits until '.')
         size_t i = 0;
-
-        // optional flags: we only recognize '0' as "present", but still parse digits.
-        // if format is "01.3" -> width=1
-        // if format is "08.2" -> width=8
-        // We won't parse '+' '-' ' ' etc here (can extend if needed).
-        // If you need strictness, enforce only digits until '.'.
         int width = 0;
-        bool hasWidthDigits = false;
-
+        bool hasWidth = false;
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
         {
-            hasWidthDigits = true;
+            hasWidth = true;
             width = width * 10 + (s[i] - '0');
             ++i;
         }
-
-        if (!hasWidthDigits) return false;
+        if (!hasWidth) return false;
         if (i >= s.size() || s[i] != '.') return false;
-        ++i;
+        ++i; // skip '.'
 
+        // Parse precision (digits)
         int precision = 0;
-        bool hasPrecDigits = false;
+        bool hasPrecision = false;
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
         {
-            hasPrecDigits = true;
+            hasPrecision = true;
             precision = precision * 10 + (s[i] - '0');
             ++i;
         }
-        if (!hasPrecDigits) return false;
+        if (!hasPrecision) return false;
         if (i != s.size()) return false;
 
         if (width < 0) width = 0;
         if (precision < 0) precision = 0;
-        // For long long scale safety, cap precision (18 is practical).
-        if (precision > 18) precision = 18;
+        if (precision > 18) precision = 18; // keep scale in long long safe range
 
         out.width = width;
         out.precision = precision;
         return true;
     }
 
-public:
-    FloatFormatter(float v, const std::string& fmt, const std::string& sep)
-        : CFormatter(fmt, sep), value(static_cast<double>(v)) {}
-
-    // overload for double to help tests
-    FloatFormatter(double v, const std::string& fmt, const std::string& sep)
-        : CFormatter(fmt, sep), value(v) {}
-
-    std::string format() override
+    static long long Pow10(int n)
     {
-        FmtSpec spec;
-        if (!parseFmt(formatStr, spec))
-        {
-            // fallback if fmt invalid
-            spec.width = 1;
-            spec.precision = 3;
-        }
-
-        if (std::isnan(value)) return "nan";
-        if (std::isinf(value)) return (value < 0) ? "-inf" : "inf";
-
-        const bool isNeg = std::signbit(value);
-        const double absV = std::fabs(value);
-
-        long long scale = 1;
-        for (int i = 0; i < spec.precision; ++i) scale *= 10;
-
-        // core fix: round after scaling; carry handled naturally
-        // Example: 91.999913, precision=3 -> absV*1000=91999.913 -> llround -> 92000
-        const long long scaled = llround(absV * static_cast<double>(scale));
-        const long long intPart = (spec.precision == 0) ? scaled : (scaled / scale);
-        const long long fracPart = (spec.precision == 0) ? 0 : (scaled % scale);
-
-        // integer string with zero-padding to width (as your original logic)
-        std::ostringstream intStream;
-        intStream << std::setw(spec.width) << std::setfill('0') << intPart;
-        std::string intStr = intStream.str();
-
-        // fractional string with exactly precision digits
-        std::string fracStr;
-        if (spec.precision > 0)
-        {
-            std::ostringstream fracStream;
-            fracStream << std::setw(spec.precision) << std::setfill('0') << fracPart;
-            fracStr = fracStream.str();
-        }
-
-        // apply '-' only if value is negative and not exactly +0 after rounding
-        if (isNeg && (intPart != 0 || fracPart != 0))
-            intStr = "-" + intStr;
-
-        if (spec.precision == 0)
-            return intStr;
-        return intStr + "." + fracStr;
+        long long r = 1;
+        for (int i = 0; i < n; ++i) r *= 10;
+        return r;
     }
+
+    static std::string FormatInteger(long long v, int width)
+    {
+        std::ostringstream oss;
+        oss << std::setw(width) << std::setfill('0') << v; // keep your original behavior
+        return oss.str();
+    }
+
+    static std::string FormatFraction(long long frac, int precision)
+    {
+        std::ostringstream oss;
+        oss << std::setw(precision) << std::setfill('0') << frac;
+        return oss.str();
+    }
+
+private:
+    double value_;
 };
-
-////////////////////////////////////////////////////////////////
-// Minimal unit test framework (no gtest dependency)
-////////////////////////////////////////////////////////////////
-struct TestResult
-{
-    int passed = 0;
-    int failed = 0;
-};
-
-static bool assertEq(const std::string& name,
-                     const std::string& got,
-                     const std::string& expect,
-                     TestResult& tr)
-{
-    if (got == expect)
-    {
-        tr.passed++;
-        return true;
-    }
-    tr.failed++;
-    std::cerr << "[FAIL] " << name << "\n"
-              << "  expect: \"" << expect << "\"\n"
-              << "  got:    \"" << got << "\"\n";
-    return false;
-}
-
-static bool assertTrue(const std::string& name, bool cond, TestResult& tr)
-{
-    if (cond)
-    {
-        tr.passed++;
-        return true;
-    }
-    tr.failed++;
-    std::cerr << "[FAIL] " << name << " (condition false)\n";
-    return false;
-}
-
-////////////////////////////////////////////////////////////////
-// Unit tests
-////////////////////////////////////////////////////////////////
-static void runTests(TestResult& tr)
-{
-    // 1) Your bug repro: carry from fractional rounding
-    {
-        FloatFormatter f(91.999913, "%1.3f", "");
-        assertEq("carry_rounding_91.999913_%1.3f", f.format(), "92.000", tr);
-    }
-
-    // 2) Normal cases
-    {
-        FloatFormatter f(91.1234, "%1.3f", "");
-        assertEq("normal_round_91.1234_%1.3f", f.format(), "91.123", tr);
-    }
-    {
-        FloatFormatter f(91.1235, "%1.3f", "");
-        assertEq("normal_round_up_91.1235_%1.3f", f.format(), "91.124", tr);
-    }
-
-    // 3) Near-boundary below carry
-    {
-        FloatFormatter f(91.9994, "%1.3f", "");
-        assertEq("near_boundary_91.9994_%1.3f", f.format(), "91.999", tr);
-    }
-    // 4) Exact carry at 0.9995 with precision=3
-    {
-        FloatFormatter f(91.9995, "%1.3f", "");
-        assertEq("exact_boundary_91.9995_%1.3f", f.format(), "92.000", tr);
-    }
-
-    // 5) Negative numbers
-    {
-        FloatFormatter f(-12.3456, "%1.3f", "");
-        assertEq("negative_-12.3456_%1.3f", f.format(), "-12.346", tr);
-    }
-
-    // 6) Negative close to zero: ensure "-0.001" etc
-    {
-        FloatFormatter f(-0.0006, "%1.3f", "");
-        assertEq("neg_small_-0.0006_%1.3f", f.format(), "-0.001", tr);
-    }
-
-    // 7) Negative rounds to exactly 0: should not print "-0.000"
-    {
-        FloatFormatter f(-0.0004, "%1.3f", "");
-        assertEq("neg_round_to_zero_-0.0004_%1.3f", f.format(), "0.000", tr);
-    }
-
-    // 8) width padding (integer part): width=5 -> "00012.xxx"
-    {
-        FloatFormatter f(12.3, "%5.3f", "");
-        assertEq("width_padding_%5.3f", f.format(), "00012.300", tr);
-    }
-
-    // 9) width=1 should not truncate integer
-    {
-        FloatFormatter f(123.4, "%1.3f", "");
-        assertEq("width_no_truncate_%1.3f", f.format(), "123.400", tr);
-    }
-
-    // 10) precision=0
-    {
-        FloatFormatter f(12.6, "%1.0f", "");
-        // 12.6 rounds to 13
-        assertEq("precision0_round_%1.0f", f.format(), "13", tr);
-    }
-    {
-        FloatFormatter f(12.4, "%4.0f", "");
-        assertEq("precision0_width_%4.0f", f.format(), "0012", tr);
-    }
-
-    // 11) NaN/Inf handling
-    {
-        FloatFormatter f(std::numeric_limits<double>::quiet_NaN(), "%1.3f", "");
-        assertEq("nan", f.format(), "nan", tr);
-    }
-    {
-        FloatFormatter f(std::numeric_limits<double>::infinity(), "%1.3f", "");
-        assertEq("inf", f.format(), "inf", tr);
-    }
-    {
-        FloatFormatter f(-std::numeric_limits<double>::infinity(), "%1.3f", "");
-        assertEq("ninf", f.format(), "-inf", tr);
-    }
-
-    // 12) Random-ish regression: many values should match snprintf("%.3f") rounding semantics
-    // 注意：我们这里的width是“整数部分零填充”的自定义语义，不等同 printf 的 width；
-    // 所以只对 precision 的四舍五入行为做一致性校验。
-    auto checkVsSnprintfPrecision = [&](double v, int precision) {
-        char buf[128] = {0};
-        std::string fmt = "%." + std::to_string(precision) + "f";
-        std::snprintf(buf, sizeof(buf), fmt.c_str(), v);
-
-        // Our formatter requires %w.pf, choose width=1 so integer不会被截断
-        std::string myFmt = "%1." + std::to_string(precision) + "f";
-        FloatFormatter f(v, myFmt, "");
-        std::string got = f.format();
-
-        // snprintf outputs e.g. "-0.000" for -0.0004? depends; usually "-0.000".
-        // Our rule: if rounding becomes 0, we drop negative sign. 这里就只对“非零结果”对齐。
-        // 这个测试主要是验证 rounding/carry 行为正确。
-        if (std::string(buf) == "0" || std::string(buf) == "0.0" || std::string(buf).find("0.") == 0)
-        {
-            // skip strict compare for near-zero sign behavior
-            return;
-        }
-        assertEq("snprintf_precision_compare v=" + std::to_string(v) + " p=" + std::to_string(precision),
-                 got, std::string(buf), tr);
-    };
-
-    checkVsSnprintfPrecision(91.999913, 3);
-    checkVsSnprintfPrecision(1.23456, 3);
-    checkVsSnprintfPrecision(-12.3456, 3);
-    checkVsSnprintfPrecision(99999.9995, 3);
-}
-
-int main()
-{
-    TestResult tr;
-    runTests(tr);
-
-    std::cout << "\n=== TEST SUMMARY ===\n";
-    std::cout << "PASSED: " << tr.passed << "\n";
-    std::cout << "FAILED: " << tr.failed << "\n";
-
-    return (tr.failed == 0) ? 0 : 1;
-}
