@@ -1,5 +1,6 @@
-#include <cmath>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -18,7 +19,6 @@ public:
         FmtSpec spec;
         if (!ParseFmtSpec(formatStr, spec))
         {
-            // Fallback: keep safe defaults if fmt is malformed
             spec.width = 1;
             spec.precision = 3;
         }
@@ -26,35 +26,36 @@ public:
         if (std::isnan(value_)) return "nan";
         if (std::isinf(value_)) return (value_ < 0) ? "-inf" : "inf";
 
-        const bool isNegative = std::signbit(value_);
-        const double absValue = std::fabs(value_);
+        const bool isNeg = std::signbit(value_);
+        const double absV = std::fabs(value_);
 
-        const long long scale = Pow10(spec.precision);
+        // 1) Let libc do decimal rounding (matches printf semantics much better)
+        //    Format: "%.3f" -> "91.124", "92.000", etc.
+        std::string rounded = FormatBySnprintf(absV, spec.precision);
 
-        // Core fix:
-        // Round after scaling so carry is correctly applied.
-        // Example: 91.999913 with precision=3:
-        // absValue*1000 = 91999.913 -> llround = 92000 -> 92.000
-        const long long scaled = llround(absValue * static_cast<double>(scale));
+        // 2) Split integer/fractional part from the rounded decimal string
+        std::string intPartStr;
+        std::string fracPartStr;
+        SplitDecimal(rounded, spec.precision, intPartStr, fracPartStr);
 
-        const long long integerPart = (spec.precision == 0) ? scaled : (scaled / scale);
-        const long long fracPart    = (spec.precision == 0) ? 0     : (scaled % scale);
+        // 3) Apply your custom integer left-zero-padding by width
+        intPartStr = PadLeftZeros(intPartStr, spec.width);
 
-        std::string intStr = FormatInteger(integerPart, spec.width);
-
-        // If rounding leads to exact 0, avoid "-0.000"
-        if (isNegative && (integerPart != 0 || fracPart != 0))
+        // 4) Apply sign: avoid "-0.000" when rounded result is exactly zero
+        if (isNeg && !IsAllZero(intPartStr) /* after padding */)
         {
-            intStr = "-" + intStr;
+            intPartStr = "-" + intPartStr;
+        }
+        else if (isNeg && spec.precision > 0 && IsAllZero(intPartStr) && !IsAllZero(fracPartStr))
+        {
+            // e.g. -0.001 case: integer part is "0" but frac is non-zero
+            intPartStr = "-" + intPartStr;
         }
 
         if (spec.precision == 0)
-        {
-            return intStr;
-        }
+            return intPartStr;
 
-        const std::string fracStr = FormatFraction(fracPart, spec.precision);
-        return intStr + "." + fracStr;
+        return intPartStr + "." + fracPartStr;
     }
 
 private:
@@ -64,10 +65,9 @@ private:
         int precision = 3;
     };
 
-    // Parse format like: "%1.3f", "%05.2f", "%8.0f"
+    // Parse "%<width>.<precision>f" (e.g. "%1.3f", "%05.2f", "%8.0f")
     static bool ParseFmtSpec(const std::string& fmt, FmtSpec& out)
     {
-        // Remove spaces
         std::string s;
         s.reserve(fmt.size());
         for (char c : fmt)
@@ -80,12 +80,11 @@ private:
         if (s.front() != '%') return false;
         if (s.back() != 'f' && s.back() != 'F') return false;
 
-        // Strip '%' and trailing 'f'
-        s.erase(s.begin());
-        s.pop_back();
+        s.erase(s.begin()); // remove '%'
+        s.pop_back();       // remove 'f'
 
-        // Parse width (digits until '.')
         size_t i = 0;
+
         int width = 0;
         bool hasWidth = false;
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
@@ -96,48 +95,92 @@ private:
         }
         if (!hasWidth) return false;
         if (i >= s.size() || s[i] != '.') return false;
-        ++i; // skip '.'
+        ++i;
 
-        // Parse precision (digits)
         int precision = 0;
-        bool hasPrecision = false;
+        bool hasPrec = false;
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
         {
-            hasPrecision = true;
+            hasPrec = true;
             precision = precision * 10 + (s[i] - '0');
             ++i;
         }
-        if (!hasPrecision) return false;
+        if (!hasPrec) return false;
         if (i != s.size()) return false;
 
         if (width < 0) width = 0;
         if (precision < 0) precision = 0;
-        if (precision > 18) precision = 18; // keep scale in long long safe range
+        if (precision > 18) precision = 18;
 
         out.width = width;
         out.precision = precision;
         return true;
     }
 
-    static long long Pow10(int n)
+    static std::string FormatBySnprintf(double v, int precision)
     {
-        long long r = 1;
-        for (int i = 0; i < n; ++i) r *= 10;
-        return r;
+        // Build format string like "%.3f"
+        char fmt[32];
+        std::snprintf(fmt, sizeof(fmt), "%%.%df", precision);
+
+        // First try with a reasonable buffer; if not enough, resize.
+        char buf[128];
+        int n = std::snprintf(buf, sizeof(buf), fmt, v);
+        if (n >= 0 && n < static_cast<int>(sizeof(buf)))
+            return std::string(buf);
+
+        // Need bigger buffer
+        if (n < 0) return "0"; // very defensive fallback
+        std::string out;
+        out.resize(static_cast<size_t>(n) + 1);
+        std::snprintf(out.data(), out.size(), fmt, v);
+        out.pop_back(); // remove trailing '\0'
+        return out;
     }
 
-    static std::string FormatInteger(long long v, int width)
+    static void SplitDecimal(const std::string& s,
+                             int precision,
+                             std::string& intPart,
+                             std::string& fracPart)
     {
-        std::ostringstream oss;
-        oss << std::setw(width) << std::setfill('0') << v; // keep your original behavior
-        return oss.str();
+        const size_t dot = s.find('.');
+        if (dot == std::string::npos)
+        {
+            // precision==0 commonly lands here
+            intPart = s;
+            fracPart.clear();
+            return;
+        }
+
+        intPart = s.substr(0, dot);
+        fracPart = (dot + 1 < s.size()) ? s.substr(dot + 1) : std::string();
+
+        // Ensure exactly `precision` digits (printf should already do it, but keep safe)
+        if (precision <= 0)
+        {
+            fracPart.clear();
+            return;
+        }
+        if (fracPart.size() < static_cast<size_t>(precision))
+            fracPart.append(static_cast<size_t>(precision) - fracPart.size(), '0');
+        else if (fracPart.size() > static_cast<size_t>(precision))
+            fracPart.resize(static_cast<size_t>(precision));
     }
 
-    static std::string FormatFraction(long long frac, int precision)
+    static std::string PadLeftZeros(const std::string& s, int width)
     {
-        std::ostringstream oss;
-        oss << std::setw(precision) << std::setfill('0') << frac;
-        return oss.str();
+        if (width <= 0) return s;
+        if (static_cast<int>(s.size()) >= width) return s;
+        return std::string(static_cast<size_t>(width - s.size()), '0') + s;
+    }
+
+    static bool IsAllZero(const std::string& s)
+    {
+        for (char c : s)
+        {
+            if (c != '0') return false;
+        }
+        return !s.empty();
     }
 
 private:
