@@ -1,188 +1,303 @@
-#include <cctype>
-#include <cmath>
-#include <cstdio>
+/** @file
+ * @note    Hangzhou Hikvision Digital Technology Co., Ltd. All rights reserved.
+ * @brief   format algo main class
+ *
+ * @author  zhoufeng20
+ * @date    2023/11/27
+ *
+ * @version
+ *  date        |version |author              |message
+ *  :----       |:----   |:----               |:------
+ *  2023/11/27  |V1.0.0  |zhoufeng20           |创建代码文档
+ * @warning
+ */
+#include <assert.h>
 #include <iomanip>
-#include <limits>
-#include <sstream>
+#include <map>
+#include <memory>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <string>
 
-class FloatFormatter : public CFormatter
-{
+#include "Any.h"
+#include "VmModuleBase.h"
+#include "adapter/ScheErrorCodeDefine.h"
+#include "algo.h"
+#include "algo_common.h"
+#include "algoutils.h"
+#include "binaryFormat.h"
+#include "infra/DataBuffer.h"
+#include "json_tool.h"
+
+#define MAX_NAME_LEN (32)
+#define FORMAT_GABNORMAL_STRING_LEN (16)
+
+#define ALGO_PRIV_JSON_NAME "algo_private.json"
+#define ALGO_DIR ALGO_ROOT_DIR "format/json/"
+#define ALGO_ABI_JSON_PATH ALGO_DIR ALGO_ABI_JSON_NAME
+#define ALGO_IO_JSON_PATH ALGO_DIR ALGO_IO_JSON_NAME
+#define ALGO_PM_JSON_PATH ALGO_DIR ALGO_PM_JSON_NAME
+#define ALGO_DISP_JSON_PATH ALGO_DIR ALGO_DISP_JSON_NAME
+#define ALGO_PRIV_JSON_PATH ALGO_DIR ALGO_PRIV_JSON_NAME
+#define ALGO_NAME "format"
+
+typedef enum {
+  UNKNOW_DATA_TYPE = 0,
+  SUBSCRIBE_DATA_TYPE = 1,
+  SYMBOL_DATA_TYPE = 2,
+  ARRAY_DATA_TYPE = 3,
+  CUSTOM_DATA_TYPE = 4
+} FORMAT_DATA_TYPE;
+
+struct DataField {
 public:
-    FloatFormatter(float v, const std::string& fmt, const std::string& sep)
-        : CFormatter(fmt, sep), value_(static_cast<double>(v))
-    {
-    }
+  std::string paramValue;
+  CAlgoUtils::SubParam paramInfo;
+  int subscribeIndex;
+  std::string separator;
+  std::string showValue_CN;
+  std::string showValue_EN;
 
-    std::string format() override
-    {
-        FmtSpec spec;
-        if (!ParseFmtSpec(formatStr, spec))
-        {
-            spec.width = 1;
-            spec.precision = 3;
-        }
-
-        if (std::isnan(value_)) return "nan";
-        if (std::isinf(value_)) return (value_ < 0) ? "-inf" : "inf";
-
-        const bool isNeg = std::signbit(value_);
-        const double absV = std::fabs(value_);
-
-        // 1) Let libc do decimal rounding (matches printf semantics much better)
-        //    Format: "%.3f" -> "91.124", "92.000", etc.
-        std::string rounded = FormatBySnprintf(absV, spec.precision);
-
-        // 2) Split integer/fractional part from the rounded decimal string
-        std::string intPartStr;
-        std::string fracPartStr;
-        SplitDecimal(rounded, spec.precision, intPartStr, fracPartStr);
-
-        // 3) Apply your custom integer left-zero-padding by width
-        intPartStr = PadLeftZeros(intPartStr, spec.width);
-
-        // 4) Apply sign: avoid "-0.000" when rounded result is exactly zero
-        if (isNeg && !IsAllZero(intPartStr) /* after padding */)
-        {
-            intPartStr = "-" + intPartStr;
-        }
-        else if (isNeg && spec.precision > 0 && IsAllZero(intPartStr) && !IsAllZero(fracPartStr))
-        {
-            // e.g. -0.001 case: integer part is "0" but frac is non-zero
-            intPartStr = "-" + intPartStr;
-        }
-
-        if (spec.precision == 0)
-            return intPartStr;
-
-        return intPartStr + "." + fracPartStr;
-    }
-
-private:
-    struct FmtSpec
-    {
-        int width = 1;
-        int precision = 3;
-    };
-
-    // Parse "%<width>.<precision>f" (e.g. "%1.3f", "%05.2f", "%8.0f")
-    static bool ParseFmtSpec(const std::string& fmt, FmtSpec& out)
-    {
-        std::string s;
-        s.reserve(fmt.size());
-        for (char c : fmt)
-        {
-            if (!std::isspace(static_cast<unsigned char>(c)))
-                s.push_back(c);
-        }
-
-        if (s.size() < 4) return false;
-        if (s.front() != '%') return false;
-        if (s.back() != 'f' && s.back() != 'F') return false;
-
-        s.erase(s.begin()); // remove '%'
-        s.pop_back();       // remove 'f'
-
-        size_t i = 0;
-
-        int width = 0;
-        bool hasWidth = false;
-        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
-        {
-            hasWidth = true;
-            width = width * 10 + (s[i] - '0');
-            ++i;
-        }
-        if (!hasWidth) return false;
-        if (i >= s.size() || s[i] != '.') return false;
-        ++i;
-
-        int precision = 0;
-        bool hasPrec = false;
-        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
-        {
-            hasPrec = true;
-            precision = precision * 10 + (s[i] - '0');
-            ++i;
-        }
-        if (!hasPrec) return false;
-        if (i != s.size()) return false;
-
-        if (width < 0) width = 0;
-        if (precision < 0) precision = 0;
-        if (precision > 18) precision = 18;
-
-        out.width = width;
-        out.precision = precision;
-        return true;
-    }
-
-    static std::string FormatBySnprintf(double v, int precision)
-    {
-        // Build format string like "%.3f"
-        char fmt[32];
-        std::snprintf(fmt, sizeof(fmt), "%%.%df", precision);
-
-        // First try with a reasonable buffer; if not enough, resize.
-        char buf[128];
-        int n = std::snprintf(buf, sizeof(buf), fmt, v);
-        if (n >= 0 && n < static_cast<int>(sizeof(buf)))
-            return std::string(buf);
-
-        // Need bigger buffer
-        if (n < 0) return "0"; // very defensive fallback
-        std::string out;
-        out.resize(static_cast<size_t>(n) + 1);
-        std::snprintf(out.data(), out.size(), fmt, v);
-        out.pop_back(); // remove trailing '\0'
-        return out;
-    }
-
-    static void SplitDecimal(const std::string& s,
-                             int precision,
-                             std::string& intPart,
-                             std::string& fracPart)
-    {
-        const size_t dot = s.find('.');
-        if (dot == std::string::npos)
-        {
-            // precision==0 commonly lands here
-            intPart = s;
-            fracPart.clear();
-            return;
-        }
-
-        intPart = s.substr(0, dot);
-        fracPart = (dot + 1 < s.size()) ? s.substr(dot + 1) : std::string();
-
-        // Ensure exactly `precision` digits (printf should already do it, but keep safe)
-        if (precision <= 0)
-        {
-            fracPart.clear();
-            return;
-        }
-        if (fracPart.size() < static_cast<size_t>(precision))
-            fracPart.append(static_cast<size_t>(precision) - fracPart.size(), '0');
-        else if (fracPart.size() > static_cast<size_t>(precision))
-            fracPart.resize(static_cast<size_t>(precision));
-    }
-
-    static std::string PadLeftZeros(const std::string& s, int width)
-    {
-        if (width <= 0) return s;
-        if (static_cast<int>(s.size()) >= width) return s;
-        return std::string(static_cast<size_t>(width - s.size()), '0') + s;
-    }
-
-    static bool IsAllZero(const std::string& s)
-    {
-        for (char c : s)
-        {
-            if (c != '0') return false;
-        }
-        return !s.empty();
-    }
-
-private:
-    double value_;
+  DataField() : subscribeIndex(-1) {}
 };
+
+struct DataSection {
+public:
+  FORMAT_DATA_TYPE dataType;
+  std::string paramValue;
+  CAlgoUtils::SubParam paramInfo;
+  int subscribeIndex;
+  std::string resultNGCustom;
+  std::string resultOKCustom;
+  std::string separator;
+  std::string showValue_CN;
+  std::string showValue_EN;
+  std::vector<DataField> array; // 用于存储Array类型的参数
+
+  DataSection() : dataType(UNKNOW_DATA_TYPE), subscribeIndex(-1) {}
+};
+
+struct DataFormat {
+public:
+  int moduleID;
+  std::string moduleName;
+  std::vector<DataSection> subParamList;
+
+  DataFormat() : moduleID(-1) {}
+};
+
+class CFormatter {
+protected:
+  std::string formatStr; // 用于存储格式字符串
+  std::string separator; // 用于存储分隔符
+
+public:
+  CFormatter(const std::string &fmt, const std::string &sep)
+      : formatStr(fmt), separator(sep) {}
+
+  virtual ~CFormatter() {}
+
+  virtual std::string format() = 0;
+
+  const std::string &getSeparator() const { return separator; }
+};
+
+// int 类型的 CFormatter
+class IntFormatter : public CFormatter {
+  int value;
+
+public:
+  IntFormatter(int v, const std::string &fmt, const std::string &sep)
+      : CFormatter(fmt, sep), value(v) {}
+
+  std::string format() override {
+    int width = 0;
+    sscanf(formatStr.c_str(), "%%%dd", &width);
+    std::ostringstream oss;
+    oss << std::setw(width) << std::setfill('0') << value;
+    return oss.str();
+  }
+};
+// float 类型的 CFormatter
+class FloatFormatter : public CFormatter {
+  float value;
+
+public:
+  FloatFormatter(float v, const std::string &fmt, const std::string &sep)
+      : CFormatter(fmt, sep), value(v) {}
+
+  std::string format() override {
+    int width = 0, precision = 0;
+    sscanf(formatStr.c_str(), "%%%d.%d", &width, &precision);
+
+    bool isNegative = value < 0;
+    float absValue = std::abs(value);
+
+    long long integerPart = static_cast<long long>(absValue);
+
+    float fractional = absValue - integerPart;
+
+    std::ostringstream fracStream;
+    fracStream << std::fixed << std::setprecision(precision) << fractional;
+    std::string fracStr = fracStream.str();
+
+    size_t dotPos = fracStr.find('.');
+    if (dotPos != std::string::npos) {
+      // Detect carry from rounding (e.g., 0.9996 with precision 3 -> "1.000")
+      int fracIntPart = std::atoi(fracStr.substr(0, dotPos).c_str());
+      if (fracIntPart >= 1) {
+        integerPart += fracIntPart;
+      }
+      if (fracStr.length() > dotPos + 1) {
+        fracStr = fracStr.substr(dotPos + 1);
+      }
+    }
+
+    if (fracStr.length() > static_cast<size_t>(precision)) {
+      fracStr = fracStr.substr(0, precision);
+    } else {
+      fracStr.append(precision - fracStr.length(), '0');
+    }
+
+    // 格式化整数部分 (左侧零填充)
+    std::ostringstream intStream;
+    intStream << std::setw(width) << std::setfill('0') << integerPart;
+    std::string intStr = intStream.str();
+
+    if (isNegative) {
+      intStr = "-" + intStr;
+    }
+
+    return intStr + "." + fracStr;
+  }
+};
+
+// 字符串类型的 CFormatter
+class StringFormatter : public CFormatter {
+  std::string value;
+
+public:
+  StringFormatter(const std::string &v, const std::string &fmt,
+                  const std::string &sep)
+      : CFormatter(fmt, sep), value(v) {}
+  std::string format() override { return value; }
+};
+
+// 创建 CFormatter 的模板函数
+template <typename T>
+std::unique_ptr<CFormatter> createFormatter(T value, const std::string &fmt,
+                                            const std::string &sep);
+
+template <>
+std::unique_ptr<CFormatter> createFormatter<int>(int value,
+                                                 const std::string &fmt,
+                                                 const std::string &sep) {
+  return std::make_unique<IntFormatter>(value, fmt, sep);
+}
+
+template <>
+std::unique_ptr<CFormatter> createFormatter<float>(float value,
+                                                   const std::string &fmt,
+                                                   const std::string &sep) {
+  return std::make_unique<FloatFormatter>(value, fmt, sep);
+}
+
+template <>
+std::unique_ptr<CFormatter>
+createFormatter<std::string>(std::string value, const std::string &fmt,
+                             const std::string &sep) {
+  return std::make_unique<StringFormatter>(value, fmt, sep);
+}
+
+// This class is exported from the libformat.so
+class CFormatModule : public CAlgo {
+public:
+  CFormatModule();
+  ~CFormatModule();
+
+public:
+  int Process(IN void *hInput, IN void *hOutput);
+  int SetPwd(IN const char *szPwd);
+  void UpdatePwdPrivate(const char *szPwd) override { return; };
+  int GetParam(IN const char *szParamName, OUT char *pBuff, IN int nBuffSize,
+               OUT int *pDataLen);
+  int SetParam(IN const char *szParamName, IN const char *pData,
+               IN int nDataLen);
+  int GetDynamicSubScribeParamNum(void);
+  int GetDynamicSingleSubScribeParam(
+      IN int nParamIdx, OUT DYNAMIC_SUBSCRIBE_PARAM *pstSubScribeParam);
+
+private:
+  int InitAlgoPrivate();
+  int InitROI(int logId, std::string moduleName, std::string pwd) override {
+    return IMVS_EC_OK;
+  };
+  void DeInit();
+  int SetmoduParaHandle(IN const char *szParamName, IN const char *pData,
+                        IN int nDataLen);
+  int SendOutputParam(IN void *hOutput, IN const int nStatus,
+                      IN const std::string &strResult,
+                      IN const std::vector<uint8_t> &binaryResult);
+
+  int InitPrivJson();
+  int GetFormatList();
+  int ParsePrivJson(IN const char *strJson);
+  void parseSubParamList(IN cJSON *subParamList);
+
+  int UpdateDynamicSubInfo();
+  int FormatAbnormalOutputEnable(IN const std::string &sep);
+  int UpdateFormatOutputNgSubParam();
+
+  bool IsResultCustomParam(IN const std::string &strName);
+  int FormatFillCustomResult(IN void *hInput, IN const std::string &strName,
+                             IN const DataSection &stData);
+  void SpecialCharReplace(OUT std::string &str, IN const std::string &from,
+                          IN const std::string &to);
+
+  int FormatSingleOutputArrayData(IN void *hInput, IN const DataField &stField,
+                                  OUT std::vector<Any> &vecFetcher,
+                                  OUT int &nDataCnt);
+
+  int FormatOutputByInt(IN void *hInput, IN const DataSection &stData);
+  int FormatOutputByFloat(IN void *hInput, IN const DataSection &stData);
+  int FormatOutputByString(IN void *hInput, IN const DataSection &stData);
+
+  int AssembleSubscribeData(IN void *hInput, IN const DataSection &stData);
+  int AssembleArrayData(IN void *hInput, IN const DataSection &stData);
+  int AssembleCustomData(IN const DataSection &stData);
+  void AssembleSymbolData(IN const DataSection &stData);
+
+  std::string FormatAndCombine(
+      IN const std::vector<std::unique_ptr<CFormatter>> &formatters);
+
+  bool m_bGlobalHexSendEnable; /* 十六进制发送使能*/
+  bool m_bDebugEnable;         /* 调试使能 */
+  bool m_bIrregularFormat;     /* 非规则格式化（仅自定义） */
+  bool m_bConditionEnable;     /* 条件判断输出使能      */
+  int m_nOutputStrategy;       /* 条件判断输出策略  */
+  int m_nOutputNgStringType;   /* 条件输出NG字符串类型 */
+
+  CBinaryFormat m_binaryFormat;
+
+  DataSection m_strFormatOutputNgSubParam;
+
+  DataFormat m_strFormatParam;
+
+  std::vector<std::unique_ptr<CFormatter>> m_vecFormatters;
+
+  DYNAMIC_SUBSCRIBE_PARAM_LIST m_stDynamicSubScribeParamList;
+};
+
+/////////////////////////////模块须导出的接口（实现开始）//////////////////////////////////////////
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+CAbstractUserModule *CreateModule(void *hModule);
+void DestroyModule(void *hModule, CAbstractUserModule *pUserModule);
+
+#ifdef __cplusplus
+};
+#endif
+/////////////////////////////模块须导出的接口（实现结束）//////////////////////////////////////////
