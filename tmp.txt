@@ -1,184 +1,30 @@
-#include <cmath>
-#include <cctype>
-#include <cstdio>
-#include <limits>
-#include <string>
-
-class FloatFormatter : public CFormatter
-{
-public:
-    FloatFormatter(float v, const std::string& fmt, const std::string& sep)
-        : CFormatter(fmt, sep), value_(v) {}
-
-    std::string format() override
-    {
-        FmtSpec spec;
-        if (!ParseFmtSpec(formatStr, spec))
-        {
-            spec.width = 1;
-            spec.precision = 3;
-        }
-
-        if (std::isnan(value_)) return "nan";
-        if (std::isinf(value_)) return (value_ < 0) ? "-inf" : "inf";
-
-        const bool isNeg = std::signbit(value_);
-        const double absV = std::fabs(static_cast<double>(value_));
-
-        // 1) let snprintf handle rounding and formatting to fixed decimal digits
-        const std::string rounded = ToFixed(absV, spec.precision); // e.g. "12.000" / "91.124"
-
-        // 2) split integer/fraction
-        std::string intPart, fracPart;
-        SplitFixed(rounded, spec.precision, intPart, fracPart);
-
-        // 3) decide if we should print '-' (avoid "-0.000")
-        const bool isZero = IsAllZeros(intPart) && IsAllZeros(fracPart);
-        const bool printNeg = isNeg && !isZero;
-
-        // 4) integer padding:
-        // width is for "integer area including sign" in your expected behavior.
-        const int padWidth = printNeg ? (spec.width - 1) : spec.width;
-        const std::string paddedInt = PadLeftZeros(intPart, padWidth);
-
-        // 5) combine
-        std::string out;
-        out.reserve(32);
-
-        if (printNeg) out.push_back('-');
-        out += paddedInt;
-
-        if (spec.precision > 0)
-        {
-            out.push_back('.');
-            out += fracPart;
-        }
-
-        return out;
-    }
-
-private:
-    struct FmtSpec
-    {
-        int width = 1;      // integer area width INCLUDING sign if negative
-        int precision = 3;  // digits after '.'
-    };
-
-    // Parse "%<width>.<precision>f" (e.g. "%8.3f", "%1.0f", "%05.2f")
-    static bool ParseFmtSpec(const std::string& fmt, FmtSpec& out)
-    {
-        std::string s;
-        s.reserve(fmt.size());
-        for (char c : fmt)
-        {
-            if (!std::isspace(static_cast<unsigned char>(c)))
-                s.push_back(c);
-        }
-
-        if (s.size() < 4) return false;
-        if (s.front() != '%') return false;
-        if (s.back() != 'f' && s.back() != 'F') return false;
-
-        s.erase(s.begin()); // remove '%'
-        s.pop_back();       // remove 'f'
-
-        size_t i = 0;
-
-        int width = 0;
-        bool hasWidth = false;
-        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
-        {
-            hasWidth = true;
-            width = width * 10 + (s[i] - '0');
-            ++i;
-        }
-        if (!hasWidth) return false;
-        if (i >= s.size() || s[i] != '.') return false;
-        ++i;
-
-        int precision = 0;
-        bool hasPrec = false;
-        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
-        {
-            hasPrec = true;
-            precision = precision * 10 + (s[i] - '0');
-            ++i;
-        }
-        if (!hasPrec) return false;
-        if (i != s.size()) return false;
-
-        if (width < 0) width = 0;
-        if (precision < 0) precision = 0;
-        if (precision > 18) precision = 18;
-
-        out.width = width;
-        out.precision = precision;
-        return true;
-    }
-
-    static std::string ToFixed(double v, int precision)
-    {
-        char fmt[32];
-        std::snprintf(fmt, sizeof(fmt), "%%.%df", precision);
-
-        char buf[128];
-        int n = std::snprintf(buf, sizeof(buf), fmt, v);
-        if (n >= 0 && n < static_cast<int>(sizeof(buf)))
-            return std::string(buf);
-
-        if (n < 0) return "0";
-
-        std::string out;
-        out.resize(static_cast<size_t>(n) + 1);
-        std::snprintf(out.data(), out.size(), fmt, v);
-        out.pop_back(); // remove '\0'
-        return out;
-    }
-
-    static void SplitFixed(const std::string& s, int precision,
-                           std::string& intPart, std::string& fracPart)
-    {
-        const size_t dot = s.find('.');
-        if (dot == std::string::npos)
-        {
-            intPart = s;
-            fracPart.clear();
-            if (precision > 0) fracPart.assign(static_cast<size_t>(precision), '0');
-            return;
-        }
-
-        intPart = s.substr(0, dot);
-        fracPart = (dot + 1 < s.size()) ? s.substr(dot + 1) : "";
-
-        // keep exactly `precision` digits as a safety net
-        if (precision <= 0)
-        {
-            fracPart.clear();
-            return;
-        }
-        if (fracPart.size() < static_cast<size_t>(precision))
-            fracPart.append(static_cast<size_t>(precision) - fracPart.size(), '0');
-        else if (fracPart.size() > static_cast<size_t>(precision))
-            fracPart.resize(static_cast<size_t>(precision));
-    }
-
-    static std::string PadLeftZeros(const std::string& s, int width)
-    {
-        if (width <= 0) return s;
-        if (static_cast<int>(s.size()) >= width) return s;
-        return std::string(static_cast<size_t>(width - static_cast<int>(s.size())), '0') + s;
-    }
-
-    static bool IsAllZeros(const std::string& s)
-    {
-        if (s.empty()) return true;
-        for (char c : s)
-        {
-            if (c != '0') return false;
-        }
-        return true;
-    }
-
-private:
-    float value_;
-};
+非常清晰！这些业务边界的界定极其关键，去除了“数据双向迁移”、“写满回退”以及“高频防抖”这几个最容易引发系统死锁和状态机混乱的坑，极大降低了底层文件系统管理的复杂度。
+既然目前仅支持 Linux 权限的 TF 卡（这意味着底层基本上是跑 ext3/ext4 等原生文件系统，可以直接沿用 chown/chmod 等权限控制机制），架构设计会纯粹很多。
+您可以直接使用以下这份 DR（Detailed Requirements）需求分解报告 与产品经理进行澄清和对齐。
+TF卡存储扩展 DR 需求分解报告
+DR-1. 存储介质挂载与状态管理 (Storage & Mount Management)
+ * DR-1.1 热插拔检测与自动挂载： * 系统需通过 udev 或 mdev 监听底层总线事件，实现 TF 卡的动态识别。
+   * 规定固定的挂载点（如 /mnt/sdcard 或 /media/tf）。
+ * DR-1.2 文件系统格式校验： * 【关键澄清点】 由于明确限定仅支持 Linux 权限的 TF 卡（如 ext4），当检测到用户插入 FAT32/exFAT/NTFS 格式的 TF 卡时，系统应拒绝挂载，并向上层抛出“文件系统不支持”的错误状态，禁止写入。
+ * DR-1.3 容量监控与状态统计： * 底层需通过 statfs 或 statvfs 实时/定时获取 TF 卡的状态。
+   * 必须向上层提供 API 接口，输出包含：挂载状态（在线/离线/异常）、总容量、剩余可用容量。
+DR-2. 读写路由与策略控制 (Read/Write Routing Policy)
+ * DR-2.1 写入目标选择策略： * 默认策略： 当检测到 TF 卡在线且文件系统合法时，新产生的“方案”和“相机图片”的落盘路径默认指向 TF 卡。
+   * UI自主选择： 底层需提供保存路径的配置接口，支持 UI 层下发指令，强制覆盖默认策略，将单次或全局的保存路径指向 eMMC。
+ * DR-2.2 容量阈值拦截： * 在执行写入动作前，必须进行可用空间校验。若剩余空间不足以保存当前方案或图片，直接阻断写入，并抛出“空间不足”错误（不执行向 eMMC 的回退操作）。
+ * DR-2.3 联合读取与去重策略 (Aggregation & Deduplication)： * 联合展示： 上层请求获取列表时，中间件需同时遍历 eMMC 和 TF 卡的目录，将两者的结果聚合后返回给 UI。
+   * 优先级去重： 在聚合过程中，若发现“相同名称”的方案或图片同时存在于两端，以 eMMC 中的文件为最高优先级，屏蔽/抛弃 TF 卡中的同名文件索引。
+DR-3. 异常处理机制 (Exception Handling)
+ * DR-3.1 写入中途拔卡处理： * 当在文件 write 或 sync 过程中发生物理拔卡，底层捕获到 I/O 错误（如 EIO）后，直接向应用层返回写入失败状态，由 UI 进行弹窗提示。
+   * 底层需确保立即释放相关的文件描述符 (fd)，并执行 umount -l（懒卸载）强制清理挂载点，避免进程挂起 (Hang) 或出现僵尸节点。
+ * DR-3.2 损坏或只读保护： * 如果 TF 卡存在物理坏块导致系统将其挂载为只读 (Read-Only) 模式，需能够识别该状态并上报，阻止后续的写操作。
+DR-4. UI 接口与交互需求 (UI & API Integration)
+ * DR-4.1 状态展示组件： 界面需新增 TF 卡状态展示区，实时反映卡的存在与否，以及剩余可用量。
+ * DR-4.2 保存路径选择器： 在产生方案和相机图片保存动作时（或在系统设置中），提供“保存至设备”和“保存至TF卡”的选项。
+ * DR-4.3 异常提示词规范： 需定义标准的错误提示语，例如：“TF卡写入失败”、“TF卡已满”、“不支持的TF卡格式（非Linux文件系统）”等。
+建议与产品经理澄清的议题 (Action Items)
+在进入代码架构设计前，建议您在需求评审会议上与产品经理再次确认以下几个小细节，以防后续扯皮：
+ * 非Linux文件系统的处理： 产品是否接受“用户自己买的 TF 卡插进去因为是 FAT32 格式而无法使用”？是否需要在设备端提供一个**“格式化 TF 卡为 ext4”**的功能？（这点非常重要，通常消费级 TF 卡出厂默认都是 exFAT/FAT32）。
+ * “相同名称”的定义： DR-2.3 中提到的同名去重，是以纯粹的“文件名+后缀”作为唯一主键，还是需要解析方案文件内部的 UUID？
+ * 图片与方案的关联性： 如果某一个“方案”保存在 eMMC，但它引用的“图片”保存在了 TF 卡（或者反之），拔出 TF 卡后，该方案是否展示为“图片缺失”或“损坏”？
+您可以先拿着这份 DR 与产品进行沟通。待产品确认边界彻底锁死后，我们可以进一步探讨 C++ 侧的虚拟文件路由类 (Virtual File Router) 设计以及基于 inotify/udev 的状态机解耦方案。需要我为您补充什么具体的技术论证吗？
