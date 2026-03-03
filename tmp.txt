@@ -1,30 +1,106 @@
-非常清晰！这些业务边界的界定极其关键，去除了“数据双向迁移”、“写满回退”以及“高频防抖”这几个最容易引发系统死锁和状态机混乱的坑，极大降低了底层文件系统管理的复杂度。
-既然目前仅支持 Linux 权限的 TF 卡（这意味着底层基本上是跑 ext3/ext4 等原生文件系统，可以直接沿用 chown/chmod 等权限控制机制），架构设计会纯粹很多。
-您可以直接使用以下这份 DR（Detailed Requirements）需求分解报告 与产品经理进行澄清和对齐。
-TF卡存储扩展 DR 需求分解报告
-DR-1. 存储介质挂载与状态管理 (Storage & Mount Management)
- * DR-1.1 热插拔检测与自动挂载： * 系统需通过 udev 或 mdev 监听底层总线事件，实现 TF 卡的动态识别。
-   * 规定固定的挂载点（如 /mnt/sdcard 或 /media/tf）。
- * DR-1.2 文件系统格式校验： * 【关键澄清点】 由于明确限定仅支持 Linux 权限的 TF 卡（如 ext4），当检测到用户插入 FAT32/exFAT/NTFS 格式的 TF 卡时，系统应拒绝挂载，并向上层抛出“文件系统不支持”的错误状态，禁止写入。
- * DR-1.3 容量监控与状态统计： * 底层需通过 statfs 或 statvfs 实时/定时获取 TF 卡的状态。
-   * 必须向上层提供 API 接口，输出包含：挂载状态（在线/离线/异常）、总容量、剩余可用容量。
-DR-2. 读写路由与策略控制 (Read/Write Routing Policy)
- * DR-2.1 写入目标选择策略： * 默认策略： 当检测到 TF 卡在线且文件系统合法时，新产生的“方案”和“相机图片”的落盘路径默认指向 TF 卡。
-   * UI自主选择： 底层需提供保存路径的配置接口，支持 UI 层下发指令，强制覆盖默认策略，将单次或全局的保存路径指向 eMMC。
- * DR-2.2 容量阈值拦截： * 在执行写入动作前，必须进行可用空间校验。若剩余空间不足以保存当前方案或图片，直接阻断写入，并抛出“空间不足”错误（不执行向 eMMC 的回退操作）。
- * DR-2.3 联合读取与去重策略 (Aggregation & Deduplication)： * 联合展示： 上层请求获取列表时，中间件需同时遍历 eMMC 和 TF 卡的目录，将两者的结果聚合后返回给 UI。
-   * 优先级去重： 在聚合过程中，若发现“相同名称”的方案或图片同时存在于两端，以 eMMC 中的文件为最高优先级，屏蔽/抛弃 TF 卡中的同名文件索引。
-DR-3. 异常处理机制 (Exception Handling)
- * DR-3.1 写入中途拔卡处理： * 当在文件 write 或 sync 过程中发生物理拔卡，底层捕获到 I/O 错误（如 EIO）后，直接向应用层返回写入失败状态，由 UI 进行弹窗提示。
-   * 底层需确保立即释放相关的文件描述符 (fd)，并执行 umount -l（懒卸载）强制清理挂载点，避免进程挂起 (Hang) 或出现僵尸节点。
- * DR-3.2 损坏或只读保护： * 如果 TF 卡存在物理坏块导致系统将其挂载为只读 (Read-Only) 模式，需能够识别该状态并上报，阻止后续的写操作。
-DR-4. UI 接口与交互需求 (UI & API Integration)
- * DR-4.1 状态展示组件： 界面需新增 TF 卡状态展示区，实时反映卡的存在与否，以及剩余可用量。
- * DR-4.2 保存路径选择器： 在产生方案和相机图片保存动作时（或在系统设置中），提供“保存至设备”和“保存至TF卡”的选项。
- * DR-4.3 异常提示词规范： 需定义标准的错误提示语，例如：“TF卡写入失败”、“TF卡已满”、“不支持的TF卡格式（非Linux文件系统）”等。
-建议与产品经理澄清的议题 (Action Items)
-在进入代码架构设计前，建议您在需求评审会议上与产品经理再次确认以下几个小细节，以防后续扯皮：
- * 非Linux文件系统的处理： 产品是否接受“用户自己买的 TF 卡插进去因为是 FAT32 格式而无法使用”？是否需要在设备端提供一个**“格式化 TF 卡为 ext4”**的功能？（这点非常重要，通常消费级 TF 卡出厂默认都是 exFAT/FAT32）。
- * “相同名称”的定义： DR-2.3 中提到的同名去重，是以纯粹的“文件名+后缀”作为唯一主键，还是需要解析方案文件内部的 UUID？
- * 图片与方案的关联性： 如果某一个“方案”保存在 eMMC，但它引用的“图片”保存在了 TF 卡（或者反之），拔出 TF 卡后，该方案是否展示为“图片缺失”或“损坏”？
-您可以先拿着这份 DR 与产品进行沟通。待产品确认边界彻底锁死后，我们可以进一步探讨 C++ 侧的虚拟文件路由类 (Virtual File Router) 设计以及基于 inotify/udev 的状态机解耦方案。需要我为您补充什么具体的技术论证吗？
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+
+static int safe_strcpy(char *dst, size_t dstsz, const char *src)
+{
+    size_t n;
+    if (!dst || dstsz == 0 || !src) return -1;
+
+    n = strnlen(src, dstsz - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    return (src[n] == '\0') ? 0 : -1; /* 截断则返回 -1 */
+}
+
+static int safe_copy_range(char *dst, size_t dstsz, const char *begin, const char *end)
+{
+    size_t len;
+    if (!dst || dstsz == 0 || !begin || !end || end < begin) return -1;
+
+    len = (size_t)(end - begin);
+    if (len >= dstsz) len = dstsz - 1;
+
+    memcpy(dst, begin, len);
+    dst[len] = '\0';
+    return ((size_t)(end - begin) < dstsz) ? 0 : -1;
+}
+
+static int split_whole_name_s(const char *whole_name,
+                             char *fname, size_t fnamesz,
+                             char *ext,   size_t extsz)
+{
+    const char *p_ext;
+
+    if (!whole_name || !fname || !ext || fnamesz == 0 || extsz == 0)
+        return -1;
+
+    p_ext = strrchr(whole_name, '.');
+    if (p_ext != NULL)
+    {
+        if (safe_strcpy(ext, extsz, p_ext) != 0) return -1;                 /* ".jpg" */
+        if (safe_copy_range(fname, fnamesz, whole_name, p_ext) != 0) return -1; /* "abc" */
+    }
+    else
+    {
+        ext[0] = '\0';
+        if (safe_strcpy(fname, fnamesz, whole_name) != 0) return -1;
+    }
+    return 0;
+}
+
+int splitpath_s(const char *path,
+                char *drive, size_t drivesz,
+                char *dir,   size_t dirsz,
+                char *fname, size_t fnamesz,
+                char *ext,   size_t extsz)
+{
+    const char *p_slash;
+    size_t len;
+
+    if (!drive || drivesz == 0 || !dir || dirsz == 0 ||
+        !fname || fnamesz == 0 || !ext || extsz == 0)
+        return -1;
+
+    drive[0] = '\0';
+
+    if (path == NULL)
+    {
+        dir[0] = '\0'; fname[0] = '\0'; ext[0] = '\0';
+        return 0;
+    }
+
+    len = strlen(path);
+    if (len == 0)
+    {
+        dir[0] = '\0'; fname[0] = '\0'; ext[0] = '\0';
+        return 0;
+    }
+
+    /* 修复原 bug：最后一个字符是否 '/' */
+    if (path[len - 1] == '/')
+    {
+        if (safe_strcpy(dir, dirsz, path) != 0) return -1;
+        fname[0] = '\0';
+        ext[0] = '\0';
+        return 0;
+    }
+
+    p_slash = strrchr(path, '/');
+    if (p_slash != NULL)
+    {
+        const char *whole = p_slash + 1;
+
+        if (split_whole_name_s(whole, fname, fnamesz, ext, extsz) != 0) return -1;
+
+        /* dir: 拷贝到 whole 之前（包含 '/'） */
+        if (safe_copy_range(dir, dirsz, path, whole) != 0) return -1;
+    }
+    else
+    {
+        if (split_whole_name_s(path, fname, fnamesz, ext, extsz) != 0) return -1;
+        dir[0] = '\0';
+    }
+
+    return 0;
+}
