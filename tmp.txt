@@ -1,106 +1,126 @@
-#include <stddef.h>
-#include <string.h>
-#include <stdio.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <string>
+#include <cstring>
+#include <algorithm>
 
-static int safe_strcpy(char *dst, size_t dstsz, const char *src)
+struct AsyncRecvExec
 {
-    size_t n;
-    if (!dst || dstsz == 0 || !src) return -1;
+    struct Result {
+        uint64_t seq = 0;
+        int ret = -1;
+        std::string text;
+        bool valid = false;
+    };
 
-    n = strnlen(src, dstsz - 1);
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-    return (src[n] == '\0') ? 0 : -1; /* 截断则返回 -1 */
-}
+    std::thread th;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stop = false;
 
-static int safe_copy_range(char *dst, size_t dstsz, const char *begin, const char *end)
-{
-    size_t len;
-    if (!dst || dstsz == 0 || !begin || !end || end < begin) return -1;
+    // 单槽任务（覆盖式）
+    bool hasTask = false;
+    uint64_t taskSeq = 0;
+    int taskModuleId = 0;
+    std::string taskCmd;
 
-    len = (size_t)(end - begin);
-    if (len >= dstsz) len = dstsz - 1;
+    // 单槽结果
+    Result result;
 
-    memcpy(dst, begin, len);
-    dst[len] = '\0';
-    return ((size_t)(end - begin) < dstsz) ? 0 : -1;
-}
+    std::atomic<uint64_t> seqGen{0};
+    std::atomic<uint64_t> cancelFloor{0};
 
-static int split_whole_name_s(const char *whole_name,
-                             char *fname, size_t fnamesz,
-                             char *ext,   size_t extsz)
-{
-    const char *p_ext;
-
-    if (!whole_name || !fname || !ext || fnamesz == 0 || extsz == 0)
-        return -1;
-
-    p_ext = strrchr(whole_name, '.');
-    if (p_ext != NULL)
+    AsyncRecvExec()
     {
-        if (safe_strcpy(ext, extsz, p_ext) != 0) return -1;                 /* ".jpg" */
-        if (safe_copy_range(fname, fnamesz, whole_name, p_ext) != 0) return -1; /* "abc" */
+        th = std::thread([this]{ loop(); });
     }
-    else
+    ~AsyncRecvExec()
     {
-        ext[0] = '\0';
-        if (safe_strcpy(fname, fnamesz, whole_name) != 0) return -1;
-    }
-    return 0;
-}
-
-int splitpath_s(const char *path,
-                char *drive, size_t drivesz,
-                char *dir,   size_t dirsz,
-                char *fname, size_t fnamesz,
-                char *ext,   size_t extsz)
-{
-    const char *p_slash;
-    size_t len;
-
-    if (!drive || drivesz == 0 || !dir || dirsz == 0 ||
-        !fname || fnamesz == 0 || !ext || extsz == 0)
-        return -1;
-
-    drive[0] = '\0';
-
-    if (path == NULL)
-    {
-        dir[0] = '\0'; fname[0] = '\0'; ext[0] = '\0';
-        return 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) th.join();
     }
 
-    len = strlen(path);
-    if (len == 0)
+    uint64_t Submit(int moduleId, const std::string& cmd)
     {
-        dir[0] = '\0'; fname[0] = '\0'; ext[0] = '\0';
-        return 0;
+        uint64_t seq = ++seqGen;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            hasTask = true;
+            taskSeq = seq;
+            taskModuleId = moduleId;
+            taskCmd = cmd;         // 覆盖旧任务：符合 PLC “只关心最新一次”
+        }
+        cv.notify_one();
+        return seq;
     }
 
-    /* 修复原 bug：最后一个字符是否 '/' */
-    if (path[len - 1] == '/')
+    void CancelAll()
     {
-        if (safe_strcpy(dir, dirsz, path) != 0) return -1;
-        fname[0] = '\0';
-        ext[0] = '\0';
-        return 0;
+        cancelFloor.store(seqGen.load(std::memory_order_acquire), std::memory_order_release);
     }
 
-    p_slash = strrchr(path, '/');
-    if (p_slash != NULL)
+    bool TryPop(Result& out)
     {
-        const char *whole = p_slash + 1;
-
-        if (split_whole_name_s(whole, fname, fnamesz, ext, extsz) != 0) return -1;
-
-        /* dir: 拷贝到 whole 之前（包含 '/'） */
-        if (safe_copy_range(dir, dirsz, path, whole) != 0) return -1;
-    }
-    else
-    {
-        if (split_whole_name_s(path, fname, fnamesz, ext, extsz) != 0) return -1;
-        dir[0] = '\0';
+        std::lock_guard<std::mutex> lk(mtx);
+        if (!result.valid) return false;
+        out = result;
+        result.valid = false;
+        return true;
     }
 
-    return 0;
-}
+    void loop()
+    {
+        for (;;)
+        {
+            uint64_t seq = 0;
+            int moduleId = 0;
+            std::string cmd;
+
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&]{ return stop || hasTask; });
+                if (stop) return;
+
+                seq = taskSeq;
+                moduleId = taskModuleId;
+                cmd = taskCmd;
+                hasTask = false;
+            }
+
+            if (seq <= cancelFloor.load(std::memory_order_acquire))
+                continue;
+
+            std::string resultText;
+            CCommProxy::MessageInfo mi{0};
+            mi.moduleId = moduleId;
+
+            mi.len = (int)std::min(cmd.size(), sizeof(mi.msg) - 1);
+            memcpy(mi.msg, cmd.data(), mi.len);
+            mi.msg[mi.len] = '\0';
+
+            int ret = CCommProxy::getInstance()->SyncRecv(mi, resultText);
+
+            if (seq <= cancelFloor.load(std::memory_order_acquire))
+                continue;
+
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                result.seq = seq;
+                result.ret = ret;
+                result.text = std::move(resultText);
+                result.valid = true;
+            }
+        }
+    }
+};
+
+// 文件内静态：全局唯一后台线程
+static AsyncRecvExec g_async_exec;
+static uint64_t g_pending_seq = 0;
+static int g_pending = 0;
