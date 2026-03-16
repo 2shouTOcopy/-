@@ -1,126 +1,99 @@
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
-#include <string>
-#include <cstring>
-#include <algorithm>
+define mp_print_used
+    if $argc == 0
+        set $mmif = (MMIF_HANDLE*)algo_mem_handle
+    else
+        set $mmif = (MMIF_HANDLE*)$arg0
+    end
 
-struct AsyncRecvExec
-{
-    struct Result {
-        uint64_t seq = 0;
-        int ret = -1;
-        std::string text;
-        bool valid = false;
-    };
+    if $mmif == 0
+        printf "algo_mem_handle/MMIF_HANDLE is NULL\n"
+        quit
+    end
 
-    std::thread th;
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool stop = false;
+    set $mp = (A_MP_RES*)$mmif->handle
 
-    // 单槽任务（覆盖式）
-    bool hasTask = false;
-    uint64_t taskSeq = 0;
-    int taskModuleId = 0;
-    std::string taskCmd;
+    if $mp == 0
+        printf "A_MP_RES handle is NULL\n"
+        quit
+    end
 
-    // 单槽结果
-    Result result;
+    if $mp->initialised == 0
+        printf "memory pool is not initialised\n"
+        quit
+    end
 
-    std::atomic<uint64_t> seqGen{0};
-    std::atomic<uint64_t> cancelFloor{0};
+    printf "-------- %s heap use info --------\n", $mp->heap_info.name
+    printf "heap_use_cnt=%u heap_used_cnt=%u freebytes_remaining=%zu max_free_blocksize=%zu\n", \
+        $mp->heap_use_cnt, $mp->heap_used_cnt, $mp->freebytes_remaining, $mp->max_free_blocksize
 
-    AsyncRecvExec()
-    {
-        th = std::thread([this]{ loop(); });
-    }
-    ~AsyncRecvExec()
-    {
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            stop = true;
-        }
-        cv.notify_all();
-        if (th.joinable()) th.join();
-    }
+    set $i = 0
+    set $used_cnt = 0
 
-    uint64_t Submit(int moduleId, const std::string& cmd)
-    {
-        uint64_t seq = ++seqGen;
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            hasTask = true;
-            taskSeq = seq;
-            taskModuleId = moduleId;
-            taskCmd = cmd;         // 覆盖旧任务：符合 PLC “只关心最新一次”
-        }
-        cv.notify_one();
-        return seq;
-    }
+    while $i < $mp->heap_use_cnt
+        if $mp->heap_use[$i].used
+            set $hu = &$mp->heap_use[$i]
 
-    void CancelAll()
-    {
-        cancelFloor.store(seqGen.load(std::memory_order_acquire), std::memory_order_release);
-    }
+            if $hu->addr != 0
+                set $blk = (A_BLOCK_LINK*)(*(size_t *)((size_t)$hu->addr - sizeof(void *)))
 
-    bool TryPop(Result& out)
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        if (!result.valid) return false;
-        out = result;
-        result.valid = false;
-        return true;
-    }
+                if $hu->bref
+                    printf "use block index %04u vir_addr %p phy_addr %p size %09zu ref_cnt %u ref_size[%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu] padding_size %03zu name %s\n", \
+                        $i, \
+                        $hu->addr, \
+                        $hu->phy, \
+                        $blk->size, \
+                        $hu->ref_cnt, \
+                        $hu->ref_size[0], \
+                        $hu->ref_size[1], \
+                        $hu->ref_size[2], \
+                        $hu->ref_size[3], \
+                        $hu->ref_size[4], \
+                        $hu->ref_size[5], \
+                        $hu->ref_size[6], \
+                        $hu->ref_size[7], \
+                        $blk->padding_size, \
+                        $hu->name
+                else
+                    printf "use block index %04u vir_addr %p phy_addr %p size %09zu padding_size %03zu name %s\n", \
+                        $i, \
+                        $hu->addr, \
+                        $hu->phy, \
+                        $blk->size, \
+                        $blk->padding_size, \
+                        $hu->name
+                end
+            else
+                printf "use block index %04u vir_addr NULL phy_addr %p size %09zu align %u name %s [WARN: addr is NULL]\n", \
+                    $i, \
+                    $hu->phy, \
+                    $hu->size, \
+                    $hu->align, \
+                    $hu->name
+            end
 
-    void loop()
-    {
-        for (;;)
-        {
-            uint64_t seq = 0;
-            int moduleId = 0;
-            std::string cmd;
+            set $used_cnt = $used_cnt + 1
+        end
 
-            {
-                std::unique_lock<std::mutex> lk(mtx);
-                cv.wait(lk, [&]{ return stop || hasTask; });
-                if (stop) return;
+        set $i = $i + 1
+    end
 
-                seq = taskSeq;
-                moduleId = taskModuleId;
-                cmd = taskCmd;
-                hasTask = false;
-            }
+    printf "-------- printed used block count: %u --------\n", $used_cnt
+    printf "-------- %s info end --------\n", $mp->heap_info.name
+end
 
-            if (seq <= cancelFloor.load(std::memory_order_acquire))
-                continue;
+document mp_print_used
+打印 MMIF_HANDLE -> A_MP_RES -> heap_use 中所有 used=1 的块信息。
 
-            std::string resultText;
-            CCommProxy::MessageInfo mi{0};
-            mi.moduleId = moduleId;
+用法:
+  source mp_print_used.gdb
+  mp_print_used
+或:
+  mp_print_used algo_mem_handle
+或:
+  mp_print_used 0x522c7a0
 
-            mi.len = (int)std::min(cmd.size(), sizeof(mi.msg) - 1);
-            memcpy(mi.msg, cmd.data(), mi.len);
-            mi.msg[mi.len] = '\0';
-
-            int ret = CCommProxy::getInstance()->SyncRecv(mi, resultText);
-
-            if (seq <= cancelFloor.load(std::memory_order_acquire))
-                continue;
-
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                result.seq = seq;
-                result.ret = ret;
-                result.text = std::move(resultText);
-                result.valid = true;
-            }
-        }
-    }
-};
-
-// 文件内静态：全局唯一后台线程
-static AsyncRecvExec g_async_exec;
-static uint64_t g_pending_seq = 0;
-static int g_pending = 0;
+说明:
+  1. 默认使用全局变量 algo_mem_handle
+  2. 也可以传入 MMIF_HANDLE* 地址
+  3. 输出内容参考 mp_print() 的 use info 部分
+end
