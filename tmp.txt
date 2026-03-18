@@ -1,99 +1,80 @@
-define mp_print_used
-    if $argc == 0
-        set $mmif = (MMIF_HANDLE*)algo_mem_handle
-    else
-        set $mmif = (MMIF_HANDLE*)$arg0
-    end
+#include <ctype.h>
 
-    if $mmif == 0
-        printf "algo_mem_handle/MMIF_HANDLE is NULL\n"
-        quit
-    end
+#define MP_DUMP_AROUND_BYTES 1024
+#define MP_DUMP_LINE_BYTES   16
 
-    set $mp = (A_MP_RES*)$mmif->handle
+static void mp_diag_hexdump_region(const char *tag, const void *addr, size_t len)
+{
+	const unsigned char *p = (const unsigned char *)addr;
+	size_t i = 0, j = 0;
 
-    if $mp == 0
-        printf "A_MP_RES handle is NULL\n"
-        quit
-    end
+	if (addr == NULL || len == 0)
+	{
+		LOGE("[%s] hexdump empty addr=%p len=%zu\r\n", tag, addr, len);
+		return;
+	}
 
-    if $mp->initialised == 0
-        printf "memory pool is not initialised\n"
-        quit
-    end
+	LOGE("[%s] hexdump addr=%p len=%zu\r\n", tag, addr, len);
 
-    printf "-------- %s heap use info --------\n", $mp->heap_info.name
-    printf "heap_use_cnt=%u heap_used_cnt=%u freebytes_remaining=%zu max_free_blocksize=%zu\n", \
-        $mp->heap_use_cnt, $mp->heap_used_cnt, $mp->freebytes_remaining, $mp->max_free_blocksize
+	for (i = 0; i < len; i += MP_DUMP_LINE_BYTES)
+	{
+		char hexbuf[MP_DUMP_LINE_BYTES * 3 + 1] = {0};
+		char ascbuf[MP_DUMP_LINE_BYTES + 1] = {0};
+		size_t line_len = ((i + MP_DUMP_LINE_BYTES) <= len) ? MP_DUMP_LINE_BYTES : (len - i);
+		size_t hexpos = 0;
 
-    set $i = 0
-    set $used_cnt = 0
+		for (j = 0; j < line_len; ++j)
+		{
+			unsigned char c = p[i + j];
+			hexpos += snprintf(hexbuf + hexpos, sizeof(hexbuf) - hexpos, "%02X ", c);
+			ascbuf[j] = isprint(c) ? (char)c : '.';
+		}
+		ascbuf[line_len] = '\0';
 
-    while $i < $mp->heap_use_cnt
-        if $mp->heap_use[$i].used
-            set $hu = &$mp->heap_use[$i]
+		LOGE("[%s] %p: %-48s |%s|\r\n",
+			tag, p + i, hexbuf, ascbuf);
+	}
+}
 
-            if $hu->addr != 0
-                set $blk = (A_BLOCK_LINK*)(*(size_t *)((size_t)$hu->addr - sizeof(void *)))
+static void mp_diag_dump_block_around(A_MP_RES *p_mp_res, const char *where, A_BLOCK_LINK *p_block)
+{
+	uintptr_t heap_start = 0;
+	uintptr_t heap_end = 0;
+	uintptr_t block_addr = 0;
+	uintptr_t dump_begin = 0;
+	uintptr_t dump_end = 0;
+	size_t dump_len = 0;
 
-                if $hu->bref
-                    printf "use block index %04u vir_addr %p phy_addr %p size %09zu ref_cnt %u ref_size[%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu] padding_size %03zu name %s\n", \
-                        $i, \
-                        $hu->addr, \
-                        $hu->phy, \
-                        $blk->size, \
-                        $hu->ref_cnt, \
-                        $hu->ref_size[0], \
-                        $hu->ref_size[1], \
-                        $hu->ref_size[2], \
-                        $hu->ref_size[3], \
-                        $hu->ref_size[4], \
-                        $hu->ref_size[5], \
-                        $hu->ref_size[6], \
-                        $hu->ref_size[7], \
-                        $blk->padding_size, \
-                        $hu->name
-                else
-                    printf "use block index %04u vir_addr %p phy_addr %p size %09zu padding_size %03zu name %s\n", \
-                        $i, \
-                        $hu->addr, \
-                        $hu->phy, \
-                        $blk->size, \
-                        $blk->padding_size, \
-                        $hu->name
-                end
-            else
-                printf "use block index %04u vir_addr NULL phy_addr %p size %09zu align %u name %s [WARN: addr is NULL]\n", \
-                    $i, \
-                    $hu->phy, \
-                    $hu->size, \
-                    $hu->align, \
-                    $hu->name
-            end
+	if (p_mp_res == NULL || p_block == NULL)
+	{
+		return;
+	}
 
-            set $used_cnt = $used_cnt + 1
-        end
+	heap_start = (uintptr_t)p_mp_res->heap_info.start;
+	heap_end   = (uintptr_t)p_mp_res->heap_info.end;
+	block_addr = (uintptr_t)p_block;
 
-        set $i = $i + 1
-    end
+	dump_begin = (block_addr > MP_DUMP_AROUND_BYTES) ? (block_addr - MP_DUMP_AROUND_BYTES) : heap_start;
+	if (dump_begin < heap_start)
+	{
+		dump_begin = heap_start;
+	}
 
-    printf "-------- printed used block count: %u --------\n", $used_cnt
-    printf "-------- %s info end --------\n", $mp->heap_info.name
-end
+	dump_end = block_addr + sizeof(A_BLOCK_LINK) + MP_DUMP_AROUND_BYTES;
+	if (dump_end > heap_end)
+	{
+		dump_end = heap_end;
+	}
 
-document mp_print_used
-打印 MMIF_HANDLE -> A_MP_RES -> heap_use 中所有 used=1 的块信息。
+	if (dump_end <= dump_begin)
+	{
+		return;
+	}
 
-用法:
-  source mp_print_used.gdb
-  mp_print_used
-或:
-  mp_print_used algo_mem_handle
-或:
-  mp_print_used 0x522c7a0
+	dump_len = dump_end - dump_begin;
 
-说明:
-  1. 默认使用全局变量 algo_mem_handle
-  2. 也可以传入 MMIF_HANDLE* 地址
-  3. 输出内容参考 mp_print() 的 use info 部分
-end
+	LOGE("heap %s %s block around dump: block=%p begin=%p end=%p len=%zu\r\n",
+		p_mp_res->heap_info.name, where, p_block, (void *)dump_begin, (void *)dump_end, dump_len);
+
+	mp_diag_hexdump_region("block_around", (const void *)dump_begin, dump_len);
+}
