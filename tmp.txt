@@ -1,80 +1,12 @@
-#include <ctype.h>
-
-#define MP_DUMP_AROUND_BYTES 1024
-#define MP_DUMP_LINE_BYTES   16
-
-static void mp_diag_hexdump_region(const char *tag, const void *addr, size_t len)
-{
-	const unsigned char *p = (const unsigned char *)addr;
-	size_t i = 0, j = 0;
-
-	if (addr == NULL || len == 0)
-	{
-		LOGE("[%s] hexdump empty addr=%p len=%zu\r\n", tag, addr, len);
-		return;
-	}
-
-	LOGE("[%s] hexdump addr=%p len=%zu\r\n", tag, addr, len);
-
-	for (i = 0; i < len; i += MP_DUMP_LINE_BYTES)
-	{
-		char hexbuf[MP_DUMP_LINE_BYTES * 3 + 1] = {0};
-		char ascbuf[MP_DUMP_LINE_BYTES + 1] = {0};
-		size_t line_len = ((i + MP_DUMP_LINE_BYTES) <= len) ? MP_DUMP_LINE_BYTES : (len - i);
-		size_t hexpos = 0;
-
-		for (j = 0; j < line_len; ++j)
-		{
-			unsigned char c = p[i + j];
-			hexpos += snprintf(hexbuf + hexpos, sizeof(hexbuf) - hexpos, "%02X ", c);
-			ascbuf[j] = isprint(c) ? (char)c : '.';
-		}
-		ascbuf[line_len] = '\0';
-
-		LOGE("[%s] %p: %-48s |%s|\r\n",
-			tag, p + i, hexbuf, ascbuf);
-	}
-}
-
-static void mp_diag_dump_block_around(A_MP_RES *p_mp_res, const char *where, A_BLOCK_LINK *p_block)
-{
-	uintptr_t heap_start = 0;
-	uintptr_t heap_end = 0;
-	uintptr_t block_addr = 0;
-	uintptr_t dump_begin = 0;
-	uintptr_t dump_end = 0;
-	size_t dump_len = 0;
-
-	if (p_mp_res == NULL || p_block == NULL)
-	{
-		return;
-	}
-
-	heap_start = (uintptr_t)p_mp_res->heap_info.start;
-	heap_end   = (uintptr_t)p_mp_res->heap_info.end;
-	block_addr = (uintptr_t)p_block;
-
-	dump_begin = (block_addr > MP_DUMP_AROUND_BYTES) ? (block_addr - MP_DUMP_AROUND_BYTES) : heap_start;
-	if (dump_begin < heap_start)
-	{
-		dump_begin = heap_start;
-	}
-
-	dump_end = block_addr + sizeof(A_BLOCK_LINK) + MP_DUMP_AROUND_BYTES;
-	if (dump_end > heap_end)
-	{
-		dump_end = heap_end;
-	}
-
-	if (dump_end <= dump_begin)
-	{
-		return;
-	}
-
-	dump_len = dump_end - dump_begin;
-
-	LOGE("heap %s %s block around dump: block=%p begin=%p end=%p len=%zu\r\n",
-		p_mp_res->heap_info.name, where, p_block, (void *)dump_begin, (void *)dump_end, dump_len);
-
-	mp_diag_hexdump_region("block_around", (const void *)dump_begin, dump_len);
-}
+脚本算子需求修改：
+1、run函数不需要用入参出参input、output表示，改为通过提供的接口来实现。
+目前暂定假如按照:
+local result = GetModule(1).GetValue("FindNum");
+SetStringValue("out1", result);
+SetIntValue("out2", result);
+分别代表获取和设置参数的方式。当然有其他方式也欢迎提出
+这样的目的是方便用户基于使用文档给出的接口以及参数名，方便大模型直接编写lua脚本，更加易用。不需要通过订阅in0，out0这种方式进行使用
+2、因为不需要通过订阅之后，导致各个模块之间的拓扑连接关系，需要通过解析脚本中的run函数的GetModule中的模块号和参数名
+3、需要新增数组数据类型，包括获取数组和设置数组
+4、全局变量需要定义在init接口内，不然不允许使用，init接口不需要每次都执行
+先不着急编码，先聊好需求，编码开始前需要制定实现计划，按计划实现
