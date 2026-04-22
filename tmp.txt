@@ -1,12 +1,85 @@
-脚本算子需求修改：
-1、run函数不需要用入参出参input、output表示，改为通过提供的接口来实现。
-目前暂定假如按照:
-local result = GetModule(1).GetValue("FindNum");
-SetStringValue("out1", result);
-SetIntValue("out2", result);
-分别代表获取和设置参数的方式。当然有其他方式也欢迎提出
-这样的目的是方便用户基于使用文档给出的接口以及参数名，方便大模型直接编写lua脚本，更加易用。不需要通过订阅in0，out0这种方式进行使用
-2、因为不需要通过订阅之后，导致各个模块之间的拓扑连接关系，需要通过解析脚本中的run函数的GetModule中的模块号和参数名
-3、需要新增数组数据类型，包括获取数组和设置数组
-4、全局变量需要定义在init接口内，不然不允许使用，init接口不需要每次都执行
-先不着急编码，先聊好需求，编码开始前需要制定实现计划，按计划实现
+###############################################################################
+# open_library_layer/lua/Makefile
+###############################################################################
+
+# 当前目录
+CUR_DIR            := $(shell pwd)
+ROOT_DIR           := $(CUR_DIR)
+
+# Lua源码根目录
+LUA_VER_DIR        := $(ROOT_DIR)/src/lua-5.4.8
+LUA_SRC_DIR        := $(LUA_VER_DIR)/src
+
+# 输出目录
+OUT_LIB_DIR        := $(ROOT_DIR)/lib
+OUT_INC_DIR        := $(ROOT_DIR)/include
+
+# Lua原生输出静态库
+LUA_TARGET_LIB     := $(LUA_SRC_DIR)/liblua.a
+
+# 外层导出的目标库
+FINAL_TARGET_LIB   := $(OUT_LIB_DIR)/liblua.a
+
+# 工具链前缀，由最外层传入
+TOOL_PREFIX        ?=
+AR                 := $(TOOL_PREFIX)ar
+RANLIB             := $(TOOL_PREFIX)ranlib
+CC                 := $(TOOL_PREFIX)gcc
+
+# 默认目标
+.PHONY: all
+all: prepare $(FINAL_TARGET_LIB)
+
+# 创建输出目录
+.PHONY: prepare
+prepare:
+	@mkdir -p $(OUT_LIB_DIR)
+
+# 编译Lua并拷贝产物
+$(FINAL_TARGET_LIB):
+	@echo "================ build lua begin ================"
+	@echo "TOOL_PREFIX=$(TOOL_PREFIX)"
+	$(MAKE) -C $(LUA_VER_DIR) linux TOOL_PREFIX=$(TOOL_PREFIX)
+	@if [ ! -f "$(LUA_TARGET_LIB)" ]; then \
+		echo "[ERROR] lua target lib not found: $(LUA_TARGET_LIB)"; \
+		exit 1; \
+	fi
+	@cp -f $(LUA_TARGET_LIB) $(FINAL_TARGET_LIB)
+	@echo "copy $(LUA_TARGET_LIB) -> $(FINAL_TARGET_LIB)"
+	@echo "================ build lua end =================="
+
+# 清理
+.PHONY: clean
+clean:
+	@echo "================ clean lua begin ================"
+	$(MAKE) -C $(LUA_VER_DIR) clean
+	@rm -f $(FINAL_TARGET_LIB)
+	@echo "================ clean lua end =================="
+
+# 强制重编
+.PHONY: rebuild
+rebuild: clean all
+
+# 仅安装/刷新拷贝
+.PHONY: install
+install: prepare
+	@if [ ! -f "$(LUA_TARGET_LIB)" ]; then \
+		echo "[WARN] $(LUA_TARGET_LIB) not found, build first"; \
+		exit 1; \
+	fi
+	@cp -f $(LUA_TARGET_LIB) $(FINAL_TARGET_LIB)
+	@echo "install $(FINAL_TARGET_LIB)"
+
+# 调试查看变量
+.PHONY: info
+info:
+	@echo "CUR_DIR          = $(CUR_DIR)"
+	@echo "ROOT_DIR         = $(ROOT_DIR)"
+	@echo "LUA_VER_DIR      = $(LUA_VER_DIR)"
+	@echo "LUA_SRC_DIR      = $(LUA_SRC_DIR)"
+	@echo "LUA_TARGET_LIB   = $(LUA_TARGET_LIB)"
+	@echo "FINAL_TARGET_LIB = $(FINAL_TARGET_LIB)"
+	@echo "TOOL_PREFIX      = $(TOOL_PREFIX)"
+	@echo "CC               = $(CC)"
+	@echo "AR               = $(AR)"
+	@echo "RANLIB           = $(RANLIB)"
