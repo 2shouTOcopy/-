@@ -1,85 +1,62 @@
-###############################################################################
-# open_library_layer/lua/Makefile
-###############################################################################
+FTP文本传输优化
+1. 新增文本文件格式类型
+FTP文本传输新增支持以下格式：
+TXT、CSV、JSON
+默认格式为：TXT
 
-# 当前目录
-CUR_DIR            := $(shell pwd)
-ROOT_DIR           := $(CUR_DIR)
 
-# Lua源码根目录
-LUA_VER_DIR        := $(ROOT_DIR)/src/lua-5.4.8
-LUA_SRC_DIR        := $(LUA_VER_DIR)/src
+2. 新增时间戳使能参数
+新增参数：时间戳使能
+功能说明：
+关闭时：仅输出用户订阅内容
+开启时：在每条结果中增加时间戳信息
+不同文件格式下的表现：
+TXT：时间戳作为每条文本记录前缀
+CSV：时间戳作为第一列
+JSON：时间戳作为对象中的字段
 
-# 输出目录
-OUT_LIB_DIR        := $(ROOT_DIR)/lib
-OUT_INC_DIR        := $(ROOT_DIR)/include
 
-# Lua原生输出静态库
-LUA_TARGET_LIB     := $(LUA_SRC_DIR)/liblua.a
+3. CSV/JSON内容组装规则
+对用户订阅得到的文本内容，以分号（;）作为分隔符进行拆分。
+示例订阅文本：content1;content2;content3
+CSV组装方式：每条结果对应一行，分号拆分后的各段分别映射为不同列，列名默认使用 col1、col2、col3…
+若启用时间戳，则时间戳列名固定为 timestamp
+JSON组装方式：每条结果对应一个对象，分号拆分后的各段分别映射为不同字段、字段名默认使用 item1、item2、item3…
+若启用时间戳，则增加 timestamp 字段
 
-# 外层导出的目标库
-FINAL_TARGET_LIB   := $(OUT_LIB_DIR)/liblua.a
 
-# 工具链前缀，由最外层传入
-TOOL_PREFIX        ?=
-AR                 := $(TOOL_PREFIX)ar
-RANLIB             := $(TOOL_PREFIX)ranlib
-CC                 := $(TOOL_PREFIX)gcc
+4. 新增结果缓存保留策略
+系统支持缓存最近结果，并基于缓存内容生成FTP文件。
+支持的保留策略：
+按最近N条结果保留
+按最近时间范围保留
+缓存存在上限限制，避免内存无限增长。
+示例：上限为10000条时，仅保留最新的10000条结果，超出部分按先进先出淘汰。
 
-# 默认目标
-.PHONY: all
-all: prepare $(FINAL_TARGET_LIB)
 
-# 创建输出目录
-.PHONY: prepare
-prepare:
-	@mkdir -p $(OUT_LIB_DIR)
+5. 新增刷新上传策略
+系统支持按条件对FTP文件进行覆盖上传。
+上传策略：
+每累计新增M条结果，执行一次覆盖上传
+在停流事件中执行一次最终刷新上传
+示例：
+缓存上限：10000条
+刷新步长：100条
+每新增100条结果时，对FTP文件执行一次覆盖更新（文件内容为当前缓存窗口中的结果集合）。
 
-# 编译Lua并拷贝产物
-$(FINAL_TARGET_LIB):
-	@echo "================ build lua begin ================"
-	@echo "TOOL_PREFIX=$(TOOL_PREFIX)"
-	$(MAKE) -C $(LUA_VER_DIR) linux TOOL_PREFIX=$(TOOL_PREFIX)
-	@if [ ! -f "$(LUA_TARGET_LIB)" ]; then \
-		echo "[ERROR] lua target lib not found: $(LUA_TARGET_LIB)"; \
-		exit 1; \
-	fi
-	@cp -f $(LUA_TARGET_LIB) $(FINAL_TARGET_LIB)
-	@echo "copy $(LUA_TARGET_LIB) -> $(FINAL_TARGET_LIB)"
-	@echo "================ build lua end =================="
 
-# 清理
-.PHONY: clean
-clean:
-	@echo "================ clean lua begin ================"
-	$(MAKE) -C $(LUA_VER_DIR) clean
-	@rm -f $(FINAL_TARGET_LIB)
-	@echo "================ clean lua end =================="
+6. 新增自定义文件名
+新增参数：文件名
+默认值：result
+规则：用户仅配置主文件名，不包含扩展名、系统根据当前文件格式自动追加后缀
+示例：
+TXT → result.txt
+CSV → result.csv
+JSON → result.json
 
-# 强制重编
-.PHONY: rebuild
-rebuild: clean all
 
-# 仅安装/刷新拷贝
-.PHONY: install
-install: prepare
-	@if [ ! -f "$(LUA_TARGET_LIB)" ]; then \
-		echo "[WARN] $(LUA_TARGET_LIB) not found, build first"; \
-		exit 1; \
-	fi
-	@cp -f $(LUA_TARGET_LIB) $(FINAL_TARGET_LIB)
-	@echo "install $(FINAL_TARGET_LIB)"
+7.启动与文本格式切换行为定义
+清空缓存与发送状态
+删除当前目标文件
+等结果达到发送条件后生成新文件
 
-# 调试查看变量
-.PHONY: info
-info:
-	@echo "CUR_DIR          = $(CUR_DIR)"
-	@echo "ROOT_DIR         = $(ROOT_DIR)"
-	@echo "LUA_VER_DIR      = $(LUA_VER_DIR)"
-	@echo "LUA_SRC_DIR      = $(LUA_SRC_DIR)"
-	@echo "LUA_TARGET_LIB   = $(LUA_TARGET_LIB)"
-	@echo "FINAL_TARGET_LIB = $(FINAL_TARGET_LIB)"
-	@echo "TOOL_PREFIX      = $(TOOL_PREFIX)"
-	@echo "CC               = $(CC)"
-	@echo "AR               = $(AR)"
-	@echo "RANLIB           = $(RANLIB)"
