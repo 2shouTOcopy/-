@@ -1,0 +1,711 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Module Name="ftptrans">
+    <Category Name="ftptrans" NameSpace="Custom">
+        <ToolTip>ftptrans.</ToolTip>
+        <Description>ftptrans.</Description>
+        <DisplayName>ftptrans</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <ImposedAccessMode>RO</ImposedAccessMode>
+        <pFeature>FtptransHostIp</pFeature>
+        <pFeature>FtptransHostPort</pFeature>
+        <pFeature>FtptransAnonymousLoginsEnable</pFeature>
+        <pFeature>FtptransUserName</pFeature>
+        <pFeature>FtptransPassword</pFeature>
+        <pFeature>FtptransSaveStrategy</pFeature>
+        <pFeature>FtptransFrameIdEnable</pFeature>
+        <pFeature>FtptransProcessStatusEnable</pFeature>
+        <pFeature>FtptransStartEndText</pFeature>
+        <pFeature>FtptransSeperatorText</pFeature>
+        <pFeature>FtptransAlgoEnable</pFeature>
+        <pFeature>FtptransSINGLE_ftp_sub_status</pFeature>
+        <pFeature>FtptransFtpLinkCheck</pFeature>
+        <pFeature>FtptransDirectoryType</pFeature>
+        <pFeature>FtptransTransportType</pFeature>
+        <pFeature>FtptransTimeStampEnable</pFeature>
+        <pFeature>FtptransParamPermissionFlag</pFeature>
+        <pFeature>FtptransFileNameStrategy</pFeature>
+        <pFeature>FtptransSINGLE_ftp_sub_filename</pFeature>
+        <pFeature>FtptransCustomFileName</pFeature>
+        <pFeature>FtptransRootDirectory</pFeature>
+        <pFeature>FtptransCustomDirName</pFeature>
+        <pFeature>FtptransSINGLE_ftp_sub_dirname</pFeature>
+        <pFeature>FtptransLogTransferEnable</pFeature>
+        <pFeature>FtptransTxtTransferEnable</pFeature>
+        <pFeature>FtptransTextFileFormat</pFeature>
+        <pFeature>FtptransTextTimestampEnable</pFeature>
+        <pFeature>FtptransTextFileName</pFeature>
+        <pFeature>FtptransTextRetentionPolicy</pFeature>
+        <pFeature>FtptransTextRetentionCount</pFeature>
+        <pFeature>FtptransTextRetentionTimeRangeSec</pFeature>
+        <pFeature>FtptransTextRefreshStep</pFeature>
+        <pFeature>FtptransSINGLE_ftp_sub_txt_info</pFeature>
+        </Category>
+    <Group Comment="ftptrans">
+        <Group Comment="ftptrans Inq">
+            <StringReg Name="FtptransHostIp" NameSpace="Custom">
+                <ToolTip>Ftptrans Host Ip.</ToolTip>
+                <Description>Ftptrans Host Ip.</Description>
+                <DisplayName>Ftptrans Host Ip</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransHostIp_RegAddr</pAddress>
+                <Length>16</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <Integer Name="FtptransHostPort" NameSpace="Custom">
+                <ToolTip>Ftptrans Host Port.</ToolTip>
+                <Description>Ftptrans Host Port.</Description>
+                <DisplayName>Ftptrans Host Port</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransHostPort_Reg</pValue>
+                <Min>1</Min>
+                <Max>65535</Max>
+                <Representation>Linear</Representation>
+                </Integer>
+            <IntReg Name="FtptransHostPort_Reg" NameSpace="Custom">
+                <pAddress>FtptransHostPort_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransAnonymousLoginsEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Anonymous Logins Enable.</ToolTip>
+                <Description>Ftptrans Anonymous Logins Enable.</Description>
+                <DisplayName>Ftptrans Anonymous Logins Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransAnonymousLoginsEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransAnonymousLoginsEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransAnonymousLoginsEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <StringReg Name="FtptransUserName" NameSpace="Custom">
+                <ToolTip>Ftptrans User Name.</ToolTip>
+                <Description>Ftptrans User Name.</Description>
+                <DisplayName>Ftptrans User Name</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransUserName_RegAddr</pAddress>
+                <Length>16</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransPassword" NameSpace="Custom">
+                <ToolTip>Ftptrans Password.</ToolTip>
+                <Description>Ftptrans Password.</Description>
+                <DisplayName>Ftptrans Password</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransPassword_RegAddr</pAddress>
+                <Length>16</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <Enumeration Name="FtptransSaveStrategy" NameSpace="Standard">
+                <ToolTip>Ftptrans Save Strategy.</ToolTip>
+                <Description>Ftptrans Save Strategy.</Description>
+                <DisplayName>Ftptrans Save Strategy</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <EnumEntry Name="Enum1" NameSpace="Standard">
+                    <DisplayName>不存图</DisplayName>
+                    <Value>0</Value>
+                    </EnumEntry>
+                <EnumEntry Name="OK" NameSpace="Standard">
+                    <DisplayName>OK存图</DisplayName>
+                    <Value>1</Value>
+                    </EnumEntry>
+                <EnumEntry Name="NG" NameSpace="Standard">
+                    <DisplayName>NG存图</DisplayName>
+                    <Value>2</Value>
+                    </EnumEntry>
+                <EnumEntry Name="OKNG" NameSpace="Standard">
+                    <DisplayName>OK&amp;NG存图</DisplayName>
+                    <Value>3</Value>
+                    </EnumEntry>
+                <pValue>FtptransSaveStrategy_Reg</pValue>
+                </Enumeration>
+            <IntReg Name="FtptransSaveStrategy_Reg" NameSpace="Custom">
+                <pAddress>FtptransSaveStrategy_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransFrameIdEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Frame Id Enable.</ToolTip>
+                <Description>Ftptrans Frame Id Enable.</Description>
+                <DisplayName>Ftptrans Frame Id Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransFrameIdEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransFrameIdEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransFrameIdEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransProcessStatusEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Process Status Enable.</ToolTip>
+                <Description>Ftptrans Process Status Enable.</Description>
+                <DisplayName>Ftptrans Process Status Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransProcessStatusEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransProcessStatusEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransProcessStatusEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <StringReg Name="FtptransStartEndText" NameSpace="Custom">
+                <ToolTip>Ftptrans Start End Text.</ToolTip>
+                <Description>Ftptrans Start End Text.</Description>
+                <DisplayName>Ftptrans Start End Text</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransStartEndText_RegAddr</pAddress>
+                <Length>16</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransSeperatorText" NameSpace="Custom">
+                <ToolTip>Ftptrans Seperator Text.</ToolTip>
+                <Description>Ftptrans Seperator Text.</Description>
+                <DisplayName>Ftptrans Seperator Text</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransSeperatorText_RegAddr</pAddress>
+                <Length>16</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <Boolean Name="FtptransAlgoEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Algo Enable.</ToolTip>
+                <Description>Ftptrans Algo Enable.</Description>
+                <DisplayName>Ftptrans Algo Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransAlgoEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransAlgoEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransAlgoEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <StringReg Name="FtptransSINGLE_ftp_sub_status" NameSpace="Custom">
+                <ToolTip>Ftptrans SINGLE ftp sub status.</ToolTip>
+                <Description>Ftptrans SINGLE ftp sub status.</Description>
+                <DisplayName>Ftptrans SINGLE ftp sub status</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransSINGLE_ftp_sub_status_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransFtpLinkCheck" NameSpace="Custom">
+                <ToolTip>Ftptrans Ftp Link Check.</ToolTip>
+                <Description>Ftptrans Ftp Link Check.</Description>
+                <DisplayName>Ftptrans Ftp Link Check</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransFtpLinkCheck_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <Enumeration Name="FtptransDirectoryType" NameSpace="Standard">
+                <ToolTip>Ftptrans Directory Type.</ToolTip>
+                <Description>Ftptrans Directory Type.</Description>
+                <DisplayName>Ftptrans Directory Type</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <EnumEntry Name="Enum1" NameSpace="Standard">
+                    <DisplayName>不创建</DisplayName>
+                    <Value>0</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Enum2" NameSpace="Standard">
+                    <DisplayName>默认创建</DisplayName>
+                    <Value>1</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Enum3" NameSpace="Standard">
+                    <DisplayName>自定义创建</DisplayName>
+                    <Value>2</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Enum4" NameSpace="Standard">
+                    <DisplayName>订阅创建</DisplayName>
+                    <Value>3</Value>
+                    </EnumEntry>
+                <pValue>FtptransDirectoryType_Reg</pValue>
+                </Enumeration>
+            <IntReg Name="FtptransDirectoryType_Reg" NameSpace="Custom">
+                <pAddress>FtptransDirectoryType_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Enumeration Name="FtptransTransportType" NameSpace="Standard">
+                <ToolTip>Ftptrans Transport Type.</ToolTip>
+                <Description>Ftptrans Transport Type.</Description>
+                <DisplayName>Ftptrans Transport Type</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <EnumEntry Name="jpg" NameSpace="Standard">
+                    <DisplayName>jpg</DisplayName>
+                    <Value>0</Value>
+                    </EnumEntry>
+                <EnumEntry Name="bmp" NameSpace="Standard">
+                    <DisplayName>bmp</DisplayName>
+                    <Value>1</Value>
+                    </EnumEntry>
+                <pValue>FtptransTransportType_Reg</pValue>
+                </Enumeration>
+            <IntReg Name="FtptransTransportType_Reg" NameSpace="Custom">
+                <pAddress>FtptransTransportType_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransTimeStampEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Time Stamp Enable.</ToolTip>
+                <Description>Ftptrans Time Stamp Enable.</Description>
+                <DisplayName>Ftptrans Time Stamp Enable</DisplayName>
+                <Visibility>Expert</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransTimeStampEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransTimeStampEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransTimeStampEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransParamPermissionFlag" NameSpace="Standard">
+                <ToolTip>Ftptrans Param Permission Flag.</ToolTip>
+                <Description>Ftptrans Param Permission Flag.</Description>
+                <DisplayName>Ftptrans Param Permission Flag</DisplayName>
+                <Visibility>Expert</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransParamPermissionFlag_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransParamPermissionFlag_Reg" NameSpace="Custom">
+                <pAddress>FtptransParamPermissionFlag_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Enumeration Name="FtptransFileNameStrategy" NameSpace="Standard">
+                <ToolTip>Ftptrans File Name Strategy.</ToolTip>
+                <Description>Ftptrans File Name Strategy.</Description>
+                <DisplayName>Ftptrans File Name Strategy</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <EnumEntry Name="Enum1" NameSpace="Standard">
+                    <DisplayName>默认</DisplayName>
+                    <Value>0</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Enum2" NameSpace="Standard">
+                    <DisplayName>订阅</DisplayName>
+                    <Value>1</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Enum3" NameSpace="Standard">
+                    <DisplayName>自定义</DisplayName>
+                    <Value>2</Value>
+                    </EnumEntry>
+                <pValue>FtptransFileNameStrategy_Reg</pValue>
+                </Enumeration>
+            <IntReg Name="FtptransFileNameStrategy_Reg" NameSpace="Custom">
+                <pAddress>FtptransFileNameStrategy_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <StringReg Name="FtptransSINGLE_ftp_sub_filename" NameSpace="Custom">
+                <ToolTip>Ftptrans SINGLE ftp sub filename.</ToolTip>
+                <Description>Ftptrans SINGLE ftp sub filename.</Description>
+                <DisplayName>Ftptrans SINGLE ftp sub filename</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransSINGLE_ftp_sub_filename_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransCustomFileName" NameSpace="Custom">
+                <ToolTip>Ftptrans Custom File Name.</ToolTip>
+                <Description>Ftptrans Custom File Name.</Description>
+                <DisplayName>Ftptrans Custom File Name</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransCustomFileName_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransRootDirectory" NameSpace="Custom">
+                <ToolTip>Ftptrans Root Directory.</ToolTip>
+                <Description>Ftptrans Root Directory.</Description>
+                <DisplayName>Ftptrans Root Directory</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransRootDirectory_RegAddr</pAddress>
+                <Length>32</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransCustomDirName" NameSpace="Custom">
+                <ToolTip>Ftptrans Custom Dir Name.</ToolTip>
+                <Description>Ftptrans Custom Dir Name.</Description>
+                <DisplayName>Ftptrans Custom Dir Name</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransCustomDirName_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <StringReg Name="FtptransSINGLE_ftp_sub_dirname" NameSpace="Custom">
+                <ToolTip>Ftptrans SINGLE ftp sub dirname.</ToolTip>
+                <Description>Ftptrans SINGLE ftp sub dirname.</Description>
+                <DisplayName>Ftptrans SINGLE ftp sub dirname</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransSINGLE_ftp_sub_dirname_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <Boolean Name="FtptransLogTransferEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Log Transfer Enable.</ToolTip>
+                <Description>Ftptrans Log Transfer Enable.</Description>
+                <DisplayName>Ftptrans Log Transfer Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransLogTransferEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransLogTransferEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransLogTransferEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransTxtTransferEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Txt Transfer Enable.</ToolTip>
+                <Description>Ftptrans Txt Transfer Enable.</Description>
+                <DisplayName>Ftptrans Txt Transfer Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransTxtTransferEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransTxtTransferEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransTxtTransferEnable_Reg_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Enumeration Name="FtptransTextFileFormat" NameSpace="Standard">
+                <ToolTip>Ftptrans Text File Format.</ToolTip>
+                <Description>Ftptrans Text File Format.</Description>
+                <DisplayName>Ftptrans Text File Format</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <EnumEntry Name="Txt" NameSpace="Standard">
+                    <DisplayName>TXT</DisplayName>
+                    <Value>0</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Csv" NameSpace="Standard">
+                    <DisplayName>CSV</DisplayName>
+                    <Value>1</Value>
+                    </EnumEntry>
+                <EnumEntry Name="Json" NameSpace="Standard">
+                    <DisplayName>JSON</DisplayName>
+                    <Value>2</Value>
+                    </EnumEntry>
+                <pValue>FtptransTextFileFormat_Reg</pValue>
+                </Enumeration>
+            <IntReg Name="FtptransTextFileFormat_Reg" NameSpace="Custom">
+                <pAddress>FtptransTextFileFormat_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Boolean Name="FtptransTextTimestampEnable" NameSpace="Standard">
+                <ToolTip>Ftptrans Text Timestamp Enable.</ToolTip>
+                <Description>Ftptrans Text Timestamp Enable.</Description>
+                <DisplayName>Ftptrans Text Timestamp Enable</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransTextTimestampEnable_Reg</pValue>
+                </Boolean>
+            <IntReg Name="FtptransTextTimestampEnable_Reg" NameSpace="Custom">
+                <pAddress>FtptransTextTimestampEnable_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <StringReg Name="FtptransTextFileName" NameSpace="Custom">
+                <ToolTip>Ftptrans Text File Name.</ToolTip>
+                <Description>Ftptrans Text File Name.</Description>
+                <DisplayName>Ftptrans Text File Name</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransTextFileName_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            <Enumeration Name="FtptransTextRetentionPolicy" NameSpace="Standard">
+                <ToolTip>Ftptrans Text Retention Policy.</ToolTip>
+                <Description>Ftptrans Text Retention Policy.</Description>
+                <DisplayName>Ftptrans Text Retention Policy</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <EnumEntry Name="RecentCount" NameSpace="Standard">
+                    <DisplayName>按最近N条</DisplayName>
+                    <Value>0</Value>
+                    </EnumEntry>
+                <EnumEntry Name="RecentTimeRange" NameSpace="Standard">
+                    <DisplayName>按最近时间范围</DisplayName>
+                    <Value>1</Value>
+                    </EnumEntry>
+                <pValue>FtptransTextRetentionPolicy_Reg</pValue>
+                </Enumeration>
+            <IntReg Name="FtptransTextRetentionPolicy_Reg" NameSpace="Custom">
+                <pAddress>FtptransTextRetentionPolicy_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Integer Name="FtptransTextRetentionCount" NameSpace="Custom">
+                <ToolTip>Ftptrans Text Retention Count.</ToolTip>
+                <Description>Ftptrans Text Retention Count.</Description>
+                <DisplayName>Ftptrans Text Retention Count</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransTextRetentionCount_Reg</pValue>
+                <Min>1</Min>
+                <Max>10000</Max>
+                <Representation>Linear</Representation>
+                </Integer>
+            <IntReg Name="FtptransTextRetentionCount_Reg" NameSpace="Custom">
+                <pAddress>FtptransTextRetentionCount_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Integer Name="FtptransTextRetentionTimeRangeSec" NameSpace="Custom">
+                <ToolTip>Ftptrans Text Retention Time Range Sec.</ToolTip>
+                <Description>Ftptrans Text Retention Time Range Sec.</Description>
+                <DisplayName>Ftptrans Text Retention Time Range Sec</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransTextRetentionTimeRangeSec_Reg</pValue>
+                <Min>1</Min>
+                <Max>86400</Max>
+                <Representation>Linear</Representation>
+                </Integer>
+            <IntReg Name="FtptransTextRetentionTimeRangeSec_Reg" NameSpace="Custom">
+                <pAddress>FtptransTextRetentionTimeRangeSec_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <Integer Name="FtptransTextRefreshStep" NameSpace="Custom">
+                <ToolTip>Ftptrans Text Refresh Step.</ToolTip>
+                <Description>Ftptrans Text Refresh Step.</Description>
+                <DisplayName>Ftptrans Text Refresh Step</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <ImposedAccessMode>RW</ImposedAccessMode>
+                <pValue>FtptransTextRefreshStep_Reg</pValue>
+                <Min>1</Min>
+                <Max>10000</Max>
+                <Representation>Linear</Representation>
+                </Integer>
+            <IntReg Name="FtptransTextRefreshStep_Reg" NameSpace="Custom">
+                <pAddress>FtptransTextRefreshStep_RegAddr</pAddress>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+                </IntReg>
+            <StringReg Name="FtptransSINGLE_ftp_sub_txt_info" NameSpace="Custom">
+                <ToolTip>Ftptrans SINGLE ftp sub txt info.</ToolTip>
+                <Description>Ftptrans SINGLE ftp sub txt info.</Description>
+                <DisplayName>Ftptrans SINGLE ftp sub txt info</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <pAddress>FtptransSINGLE_ftp_sub_txt_info_RegAddr</pAddress>
+                <Length>64</Length>
+                <AccessMode>RW</AccessMode>
+                <pPort>Device</pPort>
+                <Cachable>NoCache</Cachable>
+                </StringReg>
+            </Group>
+        </Group>
+    <Group Comment="RegAddr">
+        <Group Comment="ftptrans RegAddr">
+            <Integer Name="FtptransHostIp_RegAddr">
+                <Value>0x20320000</Value>
+                </Integer>
+            <Integer Name="FtptransHostPort_RegAddr">
+                <Value>0x20320010</Value>
+                </Integer>
+            <Integer Name="FtptransAnonymousLoginsEnable_RegAddr">
+                <Value>0x20320014</Value>
+                </Integer>
+            <Integer Name="FtptransUserName_RegAddr">
+                <Value>0x20320018</Value>
+                </Integer>
+            <Integer Name="FtptransPassword_RegAddr">
+                <Value>0x20320028</Value>
+                </Integer>
+            <Integer Name="FtptransSaveStrategy_RegAddr">
+                <Value>0x20320038</Value>
+                </Integer>
+            <Integer Name="FtptransFrameIdEnable_RegAddr">
+                <Value>0x2032003c</Value>
+                </Integer>
+            <Integer Name="FtptransProcessStatusEnable_RegAddr">
+                <Value>0x20320040</Value>
+                </Integer>
+            <Integer Name="FtptransStartEndText_RegAddr">
+                <Value>0x20320044</Value>
+                </Integer>
+            <Integer Name="FtptransSeperatorText_RegAddr">
+                <Value>0x20320054</Value>
+                </Integer>
+            <Integer Name="FtptransAlgoEnable_RegAddr">
+                <Value>0x20320064</Value>
+                </Integer>
+            <Integer Name="FtptransSINGLE_ftp_sub_status_RegAddr">
+                <Value>0x20320068</Value>
+                </Integer>
+            <Integer Name="FtptransFtpLinkCheck_RegAddr">
+                <Value>0x203200a8</Value>
+                </Integer>
+            <Integer Name="FtptransDirectoryType_RegAddr">
+                <Value>0x203200ac</Value>
+                </Integer>
+            <Integer Name="FtptransTransportType_RegAddr">
+                <Value>0x203200b0</Value>
+                </Integer>
+            <Integer Name="FtptransTimeStampEnable_RegAddr">
+                <Value>0x203200b4</Value>
+                </Integer>
+            <Integer Name="FtptransParamPermissionFlag_RegAddr">
+                <Value>0x203200b8</Value>
+                </Integer>
+            <Integer Name="FtptransFileNameStrategy_RegAddr">
+                <Value>0x203200bc</Value>
+                </Integer>
+            <Integer Name="FtptransSINGLE_ftp_sub_filename_RegAddr">
+                <Value>0x203200c0</Value>
+                </Integer>
+            <Integer Name="FtptransCustomFileName_RegAddr">
+                <Value>0x20320100</Value>
+                </Integer>
+            <Integer Name="FtptransRootDirectory_RegAddr">
+                <Value>0x20320140</Value>
+                </Integer>
+            <Integer Name="FtptransCustomDirName_RegAddr">
+                <Value>0x20320160</Value>
+                </Integer>
+            <Integer Name="FtptransSINGLE_ftp_sub_dirname_RegAddr">
+                <Value>0x203201a0</Value>
+                </Integer>
+            <Integer Name="FtptransLogTransferEnable_RegAddr">
+                <Value>0x203201e0</Value>
+                </Integer>
+            <Integer Name="FtptransTxtTransferEnable_RegAddr">
+                <Value>0x203201e4</Value>
+                </Integer>
+            <Integer Name="FtptransSINGLE_ftp_sub_txt_info_RegAddr">
+                <Value>0x203201e8</Value>
+                </Integer>
+            <Integer Name="FtptransTextFileFormat_RegAddr">
+                <Value>0x20320228</Value>
+                </Integer>
+            <Integer Name="FtptransTextTimestampEnable_RegAddr">
+                <Value>0x2032022c</Value>
+                </Integer>
+            <Integer Name="FtptransTextFileName_RegAddr">
+                <Value>0x20320230</Value>
+                </Integer>
+            <Integer Name="FtptransTextRetentionPolicy_RegAddr">
+                <Value>0x20320270</Value>
+                </Integer>
+            <Integer Name="FtptransTextRetentionCount_RegAddr">
+                <Value>0x20320274</Value>
+                </Integer>
+            <Integer Name="FtptransTextRetentionTimeRangeSec_RegAddr">
+                <Value>0x20320278</Value>
+                </Integer>
+            <Integer Name="FtptransTextRefreshStep_RegAddr">
+                <Value>0x2032027c</Value>
+                </Integer>
+            </Group>
+        </Group>
+    </Module>
