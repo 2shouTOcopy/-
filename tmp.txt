@@ -1,62 +1,117 @@
-FTP文本传输优化
-1. 新增文本文件格式类型
-FTP文本传输新增支持以下格式：
-TXT、CSV、JSON
-默认格式为：TXT
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import struct
+
+MAGIC = 0x484b4e46
+
+SRC_FILE = "digicap.dav"
+DST_FILE = "2.bin"
+
+# FirmwareCryptHeader:
+# uint32_t magic;
+# uint32_t crc;
+# uint8_t  ver;
+# uint8_t  resv1[3];
+# uint8_t  iv[16];
+# uint32_t offset;
+# uint32_t uoffset;
+# uint32_t resv2;
+#
+# 总大小: 40 字节
+HEADER_FMT_LE = "<IIB3s16sIII"
+HEADER_FMT_BE = ">IIB3s16sIII"
+HEADER_SIZE = struct.calcsize(HEADER_FMT_LE)
 
 
-2. 新增时间戳使能参数
-新增参数：时间戳使能
-功能说明：
-关闭时：仅输出用户订阅内容
-开启时：在每条结果中增加时间戳信息
-不同文件格式下的表现：
-TXT：时间戳作为每条文本记录前缀
-CSV：时间戳作为第一列
-JSON：时间戳作为对象中的字段
+def parse_header(header_buf):
+    """
+    解析 FirmwareCryptHeader。
+    默认先按小端解析，如果 magic 不匹配，再尝试大端。
+    """
+
+    if len(header_buf) != HEADER_SIZE:
+        raise Exception("header size invalid, need %d bytes, got %d bytes" %
+                        (HEADER_SIZE, len(header_buf)))
+
+    fields = struct.unpack(HEADER_FMT_LE, header_buf)
+    magic = fields[0]
+
+    if magic == MAGIC:
+        endian = "little"
+        return endian, fields
+
+    fields = struct.unpack(HEADER_FMT_BE, header_buf)
+    magic = fields[0]
+
+    if magic == MAGIC:
+        endian = "big"
+        return endian, fields
+
+    raise Exception("invalid magic: little=0x%08x, big=0x%08x" %
+                    (struct.unpack(HEADER_FMT_LE, header_buf)[0],
+                     struct.unpack(HEADER_FMT_BE, header_buf)[0]))
 
 
-3. CSV/JSON内容组装规则
-对用户订阅得到的文本内容，以分号（;）作为分隔符进行拆分。
-示例订阅文本：content1;content2;content3
-CSV组装方式：每条结果对应一行，分号拆分后的各段分别映射为不同列，列名默认使用 col1、col2、col3…
-若启用时间戳，则时间戳列名固定为 timestamp
-JSON组装方式：每条结果对应一个对象，分号拆分后的各段分别映射为不同字段、字段名默认使用 item1、item2、item3…
-若启用时间戳，则增加 timestamp 字段
+def copy_from_offset(src_file, dst_file, start_offset):
+    """
+    从 src_file 的 start_offset 偏移处开始复制数据到 dst_file。
+    """
+
+    file_size = os.path.getsize(src_file)
+
+    if start_offset > file_size:
+        raise Exception("start_offset %d > file_size %d" %
+                        (start_offset, file_size))
+
+    with open(src_file, "rb") as fin:
+        fin.seek(start_offset, os.SEEK_SET)
+
+        with open(dst_file, "wb") as fout:
+            while True:
+                buf = fin.read(1024 * 1024)
+                if not buf:
+                    break
+                fout.write(buf)
 
 
-4. 新增结果缓存保留策略
-系统支持缓存最近结果，并基于缓存内容生成FTP文件。
-支持的保留策略：
-按最近N条结果保留
-按最近时间范围保留
-缓存存在上限限制，避免内存无限增长。
-示例：上限为10000条时，仅保留最新的10000条结果，超出部分按先进先出淘汰。
+def main():
+    if not os.path.exists(SRC_FILE):
+        print("source file not found: %s" % SRC_FILE)
+        return 1
+
+    with open(SRC_FILE, "rb") as f:
+        header_buf = f.read(HEADER_SIZE)
+
+    endian, fields = parse_header(header_buf)
+
+    magic = fields[0]
+    crc = fields[1]
+    ver = fields[2]
+    iv = fields[4]
+    offset = fields[5]
+    uoffset = fields[6]
+    resv2 = fields[7]
+
+    start_offset = HEADER_SIZE + uoffset
+
+    print("header size : %d" % HEADER_SIZE)
+    print("endian      : %s" % endian)
+    print("magic       : 0x%08x" % magic)
+    print("crc         : 0x%08x" % crc)
+    print("ver         : %d" % ver)
+    print("offset      : %d" % offset)
+    print("uoffset     : %d" % uoffset)
+    print("resv2       : 0x%08x" % resv2)
+    print("start offset: %d" % start_offset)
+
+    copy_from_offset(SRC_FILE, DST_FILE, start_offset)
+
+    print("generate %s success" % DST_FILE)
+    return 0
 
 
-5. 新增刷新上传策略
-系统支持按条件对FTP文件进行覆盖上传。
-上传策略：
-每累计新增M条结果，执行一次覆盖上传
-在停流事件中执行一次最终刷新上传
-示例：
-缓存上限：10000条
-刷新步长：100条
-每新增100条结果时，对FTP文件执行一次覆盖更新（文件内容为当前缓存窗口中的结果集合）。
-
-
-6. 新增自定义文件名
-新增参数：文件名
-默认值：result
-规则：用户仅配置主文件名，不包含扩展名、系统根据当前文件格式自动追加后缀
-示例：
-TXT → result.txt
-CSV → result.csv
-JSON → result.json
-
-
-7.启动与文本格式切换行为定义
-清空缓存与发送状态
-删除当前目标文件
-等结果达到发送条件后生成新文件
-
+if __name__ == "__main__":
+    sys.exit(main())
